@@ -1,0 +1,319 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<title>MusicHub</title>
+<link rel="stylesheet" href="/web/style.css">
+</head>
+<body>
+<!-- 自定义标题栏(米哈游启动器风格) -->
+<div id="titlebar">
+  <div class="tb-left">
+    <span class="tb-name">MusicHub</span>
+  </div>
+  <div class="tb-drag"></div>
+  <div class="tb-btns">
+    <button class="tb-btn" id="tb-min" title="最小化">
+      <svg width="10" height="10" viewBox="0 0 10 10"><path d="M0 8h10" stroke="currentColor" stroke-width="1.2"/></svg>
+    </button>
+    <button class="tb-btn close" id="tb-close" title="关闭">
+      <svg width="10" height="10" viewBox="0 0 10 10"><path d="M1 1l8 8M9 1l-8 8" stroke="currentColor" stroke-width="1.2"/></svg>
+    </button>
+  </div>
+</div>
+<div id="app">
+  <!-- 左栏: 音源 + 我的 -->
+  <aside id="sidebar">
+    <nav class="sources">
+      <div class="nav-title">音源</div>
+      <div class="src-row"><button class="src-btn active" data-source="netease"><span class="dot" style="background:#ec4141"></span>网易云音乐</button><button class="src-pl" data-source="netease" title="网易云歌单"><img class="src-ic" src="/web/img/netease.png" alt=""></button></div>
+      <div class="src-row"><button class="src-btn" data-source="qq"><span class="dot" style="background:#31c27c"></span>QQ音乐</button><button class="src-pl" data-source="qq" title="QQ歌单"><img class="src-ic" src="/web/img/qq.png" alt=""></button></div>
+      <div class="src-row"><button class="src-btn" data-source="migu"><span class="dot" style="background:#ff5b77"></span>咪咕音乐</button><button class="src-pl" data-source="migu" title="咪咕歌单"><img class="src-ic" src="/web/img/migu.png" alt=""></button></div>
+      <div class="src-row"><button class="src-btn" data-source="bilibili"><span class="dot" style="background:#fb7299"></span>哔哩哔哩</button><button class="src-pl" data-source="bilibili" title="B站歌单"><img class="src-ic" src="/web/img/bilibili.png" alt=""></button></div>
+    </nav>
+    <nav class="mine">
+      <div class="nav-title">我的</div>
+      <button class="mine-btn" id="btn-mylists">我的歌单</button>
+      <button class="mine-btn" id="btn-queue">播放列表</button>
+      <button class="mine-btn" id="btn-downloads">下载管理</button>
+    </nav>
+    <div class="sidebar-foot">
+      <div class="acct-row">
+        <button class="acct-btn" id="btn-login" title="网易云账号"><img class="src-ic" src="/web/img/netease.png" alt=""></button>
+        <button class="acct-btn" id="btn-qqlogin" title="QQ音乐账号"><img class="src-ic" src="/web/img/qq.png" alt=""></button>
+        <button class="acct-btn" id="btn-bililogin" title="哔哩哔哩账号"><img class="src-ic" src="/web/img/bilibili.png" alt=""></button>
+      </div>
+    </div>
+  </aside>
+
+  <!-- 中栏: 搜索/结果/歌单 -->
+  <main id="main">
+    <header class="topbar">
+      <div class="searchbox">
+        <span class="search-ic"><svg viewBox="0 0 48 48" fill="none" stroke="currentColor" stroke-width="3.2" stroke-linecap="round"><circle cx="21" cy="21" r="13"/><path d="M31 31l10 10"/></svg></span>
+        <input id="search-input" type="search" placeholder="搜索歌曲 / 歌手 / 视频…" autocomplete="off">
+        <button id="search-clear" class="clear-btn" title="清除">✕</button>
+      </div>
+      <button id="btn-search" class="go-btn">搜索</button>
+    </header>
+    <div id="crumb" class="crumb hidden"></div>
+    <div id="content" class="content scroll-y">
+      <div id="list" class="song-list"></div>
+      <div id="empty" class="empty">
+        <div class="empty-ic src-logo-lg"><img src="/web/img/netease.png" alt="网易云音乐"></div>
+      </div>
+    </div>
+  </main>
+
+  <!-- 右栏: 播放列表 -->
+  <aside id="playlist-panel">
+    <div class="pl-head">
+      <div class="pl-tabs hidden" id="pl-tabs">
+        <button class="pl-tab active" data-v="feed">当前视频</button>
+        <button class="pl-tab" data-v="main">播放列表</button>
+      </div>
+      <span class="pl-title">播放列表</span>
+      <span class="pl-count" id="pl-count">0</span>
+      <button class="pl-clear" id="pl-clear" title="清空">清空</button>
+    </div>
+    <div id="pl-list" class="pl-list scroll-y"></div>
+    <div class="pl-hint">长按拖动排序 · 左滑删除</div>
+  </aside>
+</div>
+
+<!-- 底部播放条 -->
+<div id="playerbar">
+  <div class="pb-progress">
+    <span class="time" id="t-cur">0:00</span>
+    <div class="bar" id="seek-bar"><div class="bar-fill" id="seek-fill"><span class="knob"></span></div><div class="tip" id="seek-tip"></div></div>
+    <span class="time" id="t-dur">0:00</span>
+  </div>
+  <div class="pb-main">
+    <div class="pb-info">
+      <div class="pb-cover" id="pb-cover"><span>♪</span></div>
+      <div class="pb-meta">
+        <div class="pb-title" id="pb-title">未在播放</div>
+        <div class="pb-artist" id="pb-artist">— · —</div>
+      </div>
+    </div>
+    <div class="pb-controls">
+      <button class="pb-btn" id="btn-prev" title="上一首"><svg viewBox="0 0 48 48" fill="currentColor"><rect x="9" y="12" width="4" height="24" rx="1.5"/><path d="M38 13.5v21c0 1.6-1.8 2.5-3.1 1.6L17 25.6c-1.2-.8-1.2-2.4 0-3.2l17.9-10.5c1.3-.9 3.1 0 3.1 1.6z"/></svg></button>
+      <button class="pb-btn play" id="btn-play" title="播放/暂停"><svg viewBox="0 0 48 48" fill="currentColor"><path d="M16 10.5v27c0 1.2 1.3 1.9 2.3 1.3l20.6-13.5c1-.6 1-2 0-2.6L18.3 9.2c-1-.6-2.3.1-2.3 1.3z"/></svg></button>
+      <button class="pb-btn" id="btn-next" title="下一首"><svg viewBox="0 0 48 48" fill="currentColor"><rect x="35" y="12" width="4" height="24" rx="1.5"/><path d="M10 13.5v21c0 1.6 1.8 2.5 3.1 1.6L31 25.6c1.2-.8 1.2-2.4 0-3.2L13.1 11.9c-1.3-.9-3.1 0-3.1 1.6z"/></svg></button>
+    </div>
+    <div class="pb-right">
+      <button class="pb-btn" id="btn-mode" title="播放模式"></button>
+      <button class="pb-btn" id="btn-vol" title="音量"><svg viewBox="0 0 48 48" fill="currentColor"><path d="M24.5 9.8v28.4c0 1.7-2 2.6-3.2 1.4l-8.1-8.1H7.5c-1.7 0-3-1.3-3-3V19.5c0-1.7 1.3-3 3-3h5.7l8.1-8.1c1.2-1.2 3.2-.3 3.2 1.4z"/><path fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" d="M31 16.5c2.8 2 4.5 4.9 4.5 7.5s-1.7 5.5-4.5 7.5M36.5 11c4.7 3.2 7.5 7.9 7.5 13s-2.8 9.8-7.5 13"/></svg></button>
+    </div>
+  </div>
+</div>
+
+<!-- 音量浮层 -->
+<div id="vol-pop" class="vol-pop hidden">
+  <div class="vol-track" id="vol-track"><div class="vol-fill" id="vol-fill"></div></div>
+  <span class="vol-val" id="vol-val">80</span>
+</div>
+
+<!-- 长按上下文菜单 -->
+<div id="ctx-menu" class="ctx-menu hidden"></div>
+
+<!-- 歌单名称输入弹窗 -->
+<div id="plname-modal" class="modal hidden">
+  <div class="modal-box">
+    <button class="modal-close" id="plname-close">✕</button>
+    <h3 id="plname-title">新建歌单</h3>
+    <input id="plname-input" class="plname-input" type="text" maxlength="30" placeholder="输入歌单名称">
+    <div class="plname-actions">
+      <button class="go-btn ghost" id="plname-cancel">取消</button>
+      <button class="go-btn" id="plname-ok">确定</button>
+    </div>
+  </div>
+</div>
+
+<!-- 歌单封面选择弹窗 -->
+<div id="plicon-modal" class="modal hidden">
+  <div class="modal-box">
+    <button class="modal-close" id="plicon-close">✕</button>
+    <h3>选择歌单封面</h3>
+    <div class="icon-grid" id="plicon-grid"></div>
+    <input type="file" id="plicon-file" accept="image/*" class="hidden">
+    <div class="plname-actions">
+      <button class="go-btn ghost" id="plicon-none">清除封面</button>
+    </div>
+  </div>
+</div>
+
+<!-- 本地图片裁切弹窗 -->
+<div id="crop-modal" class="modal hidden">
+  <div class="modal-box crop-box">
+    <button class="modal-close" id="crop-close">✕</button>
+    <h3>拖动 / 缩放选择封面区域</h3>
+    <div class="crop-stage" id="crop-stage">
+      <canvas id="crop-canvas" width="280" height="280"></canvas>
+      <div class="crop-frame"></div>
+    </div>
+    <div class="crop-zoom">
+      <span>－</span>
+      <input type="range" id="crop-zoom" min="1" max="4" step="0.01" value="1">
+      <span>＋</span>
+    </div>
+    <div class="plname-actions">
+      <button class="go-btn ghost" id="crop-cancel">取消</button>
+      <button class="go-btn" id="crop-ok">确定</button>
+    </div>
+  </div>
+</div>
+
+<!-- 网易云登录弹窗 -->
+<div id="login-modal" class="modal hidden">
+  <div class="modal-box">
+    <button class="modal-close" id="login-close">✕</button>
+    <h3>网易云音乐登录</h3>
+    <div class="login-tabs">
+      <button class="lt active" data-tab="qr">扫码登录</button>
+      <button class="lt" data-tab="cookie">粘贴 Cookie</button>
+    </div>
+    <div class="login-pane" id="pane-qr">
+      <div class="qr-wrap"><img id="qr-img" alt="二维码"><div class="qr-mask" id="qr-mask"></div></div>
+      <p class="qr-tip" id="qr-tip">用网易云音乐 App 扫码</p>
+      <button class="wide-btn" id="qr-refresh">刷新二维码</button>
+      <button class="wide-btn ghost" id="qr-native">扫码被风控？在应用内登录</button>
+      <p class="qr-tip err" id="qr-native-msg"></p>
+    </div>
+    <div class="login-pane hidden" id="pane-cookie">
+      <p class="qr-tip">在电脑浏览器登录 music.163.com 后，复制请求头 Cookie 粘贴到下方（或仅 MUSIC_U 值）</p>
+      <textarea id="cookie-input" rows="4" placeholder="MUSIC_U=...; NMTID=..."></textarea>
+      <button class="wide-btn" id="cookie-save">保存登录</button>
+      <p class="qr-tip err" id="cookie-msg"></p>
+    </div>
+    <button class="wide-btn ghost hidden" id="ne-logout" style="margin-top:10px">退出登录</button>
+  </div>
+</div>
+
+<!-- QQ音乐登录弹窗 -->
+<div id="qqlogin-modal" class="modal hidden">
+  <div class="modal-box">
+    <button class="modal-close" id="qqlogin-close">✕</button>
+    <h3>QQ音乐登录</h3>
+    <div class="login-pane" id="pane-qq">
+      <button class="wide-btn" id="qq-native">在应用内登录（推荐，自动写入）</button>
+      <p class="qr-tip">在弹出的官方页面中扫码或账号登录 QQ 音乐，完成后自动保存登录态，无需手动复制 Cookie</p>
+      <p class="qr-tip err" id="qq-native-msg"></p>
+      <p class="qr-tip">或手动粘贴 Cookie：在电脑浏览器登录 y.qq.com 后，按 F12 打开开发者工具，在 Network 任意请求的 Request Headers 中复制完整 Cookie 粘贴到下方（需包含 uin= 与 qqmusic_key= 或 qm_keyst=）</p>
+      <textarea id="qq-cookie-input" rows="4" placeholder="uin=123456789; qqmusic_key=Q_H_L_...; qm_keyst=Q_H_L_..."></textarea>
+      <button class="wide-btn" id="qq-cookie-save">保存登录</button>
+      <button class="wide-btn hidden" id="qq-logout" style="margin-top:8px">退出登录</button>
+      <p class="qr-tip err" id="qq-cookie-msg"></p>
+    </div>
+  </div>
+</div>
+
+<!-- B站登录弹窗 -->
+<div id="bililogin-modal" class="modal hidden">
+  <div class="modal-box">
+    <button class="modal-close" id="bililogin-close">✕</button>
+    <h3>哔哩哔哩登录</h3>
+    <div class="login-tabs">
+      <button class="blt active" data-tab="qr">扫码登录</button>
+      <button class="blt" data-tab="cookie">粘贴 Cookie</button>
+    </div>
+    <div class="login-pane" id="bili-pane-qr">
+      <div class="qr-wrap"><img id="bili-qr-img" alt="二维码"><div class="qr-mask" id="bili-qr-mask"></div></div>
+      <p class="qr-tip" id="bili-qr-tip">用哔哩哔哩 App 扫码</p>
+      <button class="wide-btn" id="bili-qr-refresh">刷新二维码</button>
+    </div>
+    <div class="login-pane hidden" id="bili-pane-cookie">
+      <p class="qr-tip">在电脑浏览器登录 bilibili.com 后，按 F12 打开开发者工具，在 Network 任意请求的 Request Headers 中复制完整 Cookie 粘贴到下方（需包含 SESSDATA=）</p>
+      <textarea id="bili-cookie-input" rows="4" placeholder="SESSDATA=...; bili_jct=...; DedeUserID=..."></textarea>
+      <button class="wide-btn" id="bili-cookie-save">保存登录</button>
+      <p class="qr-tip err" id="bili-cookie-msg"></p>
+    </div>
+    <button class="wide-btn hidden" id="bili-logout" style="margin-top:8px">退出登录</button>
+  </div>
+</div>
+
+<!-- 歌词/视频全屏覆盖层 -->
+<div id="lyric-overlay" class="lyric-overlay hidden">
+  <div class="lo-bg" id="lo-bg"></div>
+  <div class="lo-head">
+    <div class="lo-meta">
+      <div class="lo-title" id="lo-title">未在播放</div>
+      <div class="lo-artist" id="lo-artist">—</div>
+    </div>
+    <div class="lo-seek">
+      <button class="ls-btn" id="lo-prev" title="上一首"><svg viewBox="0 0 48 48" fill="currentColor"><rect x="9" y="12" width="4" height="24" rx="1.5"/><path d="M38 13.5v21c0 1.6-1.8 2.5-3.1 1.6L17 25.6c-1.2-.8-1.2-2.4 0-3.2l17.9-10.5c1.3-.9 3.1 0 3.1 1.6z"/></svg></button>
+      <span class="time" id="lo-t-cur">0:00</span>
+      <div class="bar" id="lo-seek-bar"><div class="bar-fill" id="lo-seek-fill"><span class="knob"></span></div></div>
+      <span class="time" id="lo-t-dur">0:00</span>
+      <button class="ls-btn" id="lo-next" title="下一首"><svg viewBox="0 0 48 48" fill="currentColor"><rect x="35" y="12" width="4" height="24" rx="1.5"/><path d="M10 13.5v21c0 1.6 1.8 2.5 3.1 1.6l17.9-10.5c1.2-.8 1.2-2.4 0-3.2L13.1 11.9c-1.3-.9-3.1 0-3.1 1.6z"/></svg></button>
+    </div>
+    <div class="lo-right">
+      <button class="lo-close" id="lo-close" title="收起"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M6 9l6 6 6-6"/></svg></button>
+    </div>
+  </div>
+  <div class="lo-body">
+    <div class="lo-video hidden" id="lo-video">
+      <video id="lo-video-el" muted playsinline></video>
+      <div class="lo-danmaku" id="lo-danmaku"></div>
+      <div class="lo-gesture" id="lo-g-left"></div>
+      <div class="lo-gesture right" id="lo-g-right"></div>
+      <button class="mini-fs" id="mini-fs" title="全屏"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M8 3H5a2 2 0 0 0-2 2v3M16 3h3a2 2 0 0 1 2 2v3M8 21H5a2 2 0 0 1-2-2v-3M16 21h3a2 2 0 0 0 2-2v-3"/></svg></button>
+      <div class="lo-indicator" id="lo-indicator"></div>
+      <div class="lo-pp" id="lo-pp"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z"/></svg></div>
+      <div class="lo-bar">
+        <div class="bar" id="v-seek-bar"><div class="bar-fill" id="v-seek-fill"><span class="knob"></span></div></div>
+        <div class="lo-bar-row">
+          <div class="lo-bar-btns">
+            <button class="vc-btn" id="v-prev" title="上一首"><svg viewBox="0 0 48 48" fill="currentColor"><rect x="9" y="12" width="4" height="24" rx="1.5"/><path d="M38 13.5v21c0 1.6-1.8 2.5-3.1 1.6L17 25.6c-1.2-.8-1.2-2.4 0-3.2l17.9-10.5c1.3-.9 3.1 0 3.1 1.6z"/></svg></button>
+            <button class="vc-btn" id="v-play" title="播放/暂停"></button>
+            <button class="vc-btn" id="v-next" title="下一首"><svg viewBox="0 0 48 48" fill="currentColor"><rect x="35" y="12" width="4" height="24" rx="1.5"/><path d="M10 13.5v21c0 1.6 1.8 2.5 3.1 1.6l17.9-10.5c1.2-.8 1.2-2.4 0-3.2L13.1 11.9c-1.3-.9-3.1 0-3.1 1.6z"/></svg></button>
+            <span class="vc-time"><span id="v-t-cur">0:00</span> / <span id="v-t-dur">0:00</span></span>
+          </div>
+          <div class="dm-send">
+            <select id="dm-mode" class="dm-sel" title="弹幕位置"><option value="1">滚动</option><option value="5">顶部</option><option value="4">底部</option></select>
+            <select id="dm-color" class="dm-sel" title="弹幕颜色"><option value="16777215">白</option><option value="16711680">红</option><option value="65280">绿</option><option value="465560">蓝</option><option value="16776960">黄</option><option value="16753920">橙</option><option value="16711935">粉</option></select>
+            <input id="dm-input" maxlength="100" placeholder="发个友善的弹幕见证当下">
+            <button id="dm-btn">发送</button>
+          </div>
+          <div class="lo-bar-right">
+            <button class="vc-act" id="v-like" title="点赞"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round" stroke-linecap="round"><path d="M7 22V11l5-9c1.4.3 2.2 1.4 2.2 2.9L13.5 9H19c1.2 0 2.1 1.1 1.8 2.3l-1.6 8A2 2 0 0 1 17.2 21H7Z"/><path d="M7 11H4a1 1 0 0 0-1 1v9a1 1 0 0 0 1 1h3"/></svg><span class="vc-act-n" id="v-like-n">0</span></button>
+            <button class="vc-act" id="v-coin" title="投币"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><circle cx="12" cy="12" r="9"/><text x="12" y="16.2" text-anchor="middle" font-size="11.5" font-weight="700" fill="currentColor" stroke="none">币</text></svg><span class="vc-act-n" id="v-coin-n">0</span></button>
+            <button class="vc-act" id="v-cmt" title="评论区"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"><path d="M21 6a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h2v4l4.5-4H19a2 2 0 0 0 2-2V6Z"/></svg><span class="vc-act-n" id="v-cmt-n">0</span></button>
+            <button class="vc-toggle on" id="v-danmaku" title="弹幕显示模式"><svg viewBox="0 0 24 24"><rect x="2.5" y="4.5" width="19" height="15" rx="3.5" fill="none" stroke="currentColor" stroke-width="1.8"/><text x="12" y="16" text-anchor="middle" font-size="10" font-weight="700" fill="currentColor">弹</text></svg></button>
+            <select class="lo-speed" id="lo-speed" title="倍速播放"><option value="0.5">0.5x</option><option value="0.75">0.75x</option><option value="1" selected>1x</option><option value="1.25">1.25x</option><option value="1.5">1.5x</option><option value="2">2x</option></select>
+            <select class="lo-quality hidden" id="lo-quality" title="视频清晰度"></select>
+            <div class="lo-ctl" id="lo-ctl"></div>
+            <button id="lo-fs-btn" title="全屏"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M8 3H5a2 2 0 0 0-2 2v3M16 3h3a2 2 0 0 1 2 2v3M8 21H5a2 2 0 0 1-2-2v-3M16 21h3a2 2 0 0 0 2-2v-3"/></svg></button>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div class="lo-lyric scroll-y" id="lo-lyric"><div class="lo-lyric-inner" id="lo-lyric-inner"></div></div>
+    <div class="lo-comments hidden" id="lo-comments">
+      <div class="lo-cmt-head">
+        <button class="lo-cmt-tab active" id="cmt-tab-c">评论区</button>
+        <button class="lo-cmt-tab" id="cmt-tab-r">相关推荐</button>
+        <span class="lo-cmt-count" id="lo-cmt-count"></span>
+        <div class="lo-cmt-sort" id="cmt-sort">
+          <button class="cs-btn active" data-sort="2">最热</button>
+          <button class="cs-btn" data-sort="0">最新</button>
+        </div>
+        <button class="lo-cmt-close" id="lo-cmt-close" title="收起评论区"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M6 9l6 6 6-6"/></svg></button>
+      </div>
+      <div class="lo-cmt-list scroll-y" id="lo-cmt-list"></div>
+      <div class="lo-cmt-input" id="lo-cmt-input">
+        <div class="lo-cmt-reply-tip hidden" id="cmt-reply-tip"></div>
+        <div class="lo-cmt-row">
+          <input id="cmt-text" type="text" maxlength="100" placeholder="发一条友善的评论" autocomplete="off">
+          <button class="go-btn" id="cmt-send">发送</button>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<audio id="audio" preload="auto"></audio>
+<script src="/web/app.js"></script>
+</body>
+</html>

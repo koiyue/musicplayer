@@ -1,0 +1,25 @@
+# 用户数据: 登录凭据、WebView 配置、下载文件、队列/设置/歌单
+data/
+
+# 构建产物
+pkgA/
+pkgB/
+pkgC/
+pkgbuildB/
+pkgbuildC/
+output/
+build/
+dist/
+
+# 日志与缓存
+*.log
+*.err
+__pycache__/
+*.pyc
+*.part
+*.tmp
+
+.trae/
+.zcode/
+.workbuddy-ai/
+_bak_*/
