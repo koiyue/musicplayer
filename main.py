@@ -44,12 +44,52 @@ import webview
 
 import server
 
+try:
+    from desktop_lyrics import DesktopLyrics
+except Exception as _desktop_lyrics_import_error:
+    # The browser fallback and headless API mode must remain usable even when
+    # the optional native desktop-lyrics window cannot be imported.
+    DesktopLyrics = None
+
 PORT = server.free_port(8787)
 URL = "http://127.0.0.1:%d/" % PORT
 TITLE = "MusicHub"
 
 _user32 = ctypes.windll.user32
 _hwnd_cache = {}
+_desktop_lyrics = None
+
+# 显式 64 位原型: HWND/HICON 走 ctypes 默认 c_int 会被截断
+_user32.ShowWindow.argtypes = [wt.HWND, ctypes.c_int]
+_user32.ShowWindow.restype = wt.BOOL
+_user32.SetForegroundWindow.argtypes = [wt.HWND]
+_user32.SetForegroundWindow.restype = wt.BOOL
+_user32.PostMessageW.argtypes = [wt.HWND, wt.UINT, ctypes.c_size_t, ctypes.c_ssize_t]
+_user32.PostMessageW.restype = wt.BOOL
+_user32.SendMessageW.argtypes = [wt.HWND, wt.UINT, ctypes.c_size_t, ctypes.c_ssize_t]
+_user32.SendMessageW.restype = ctypes.c_ssize_t
+_user32.GetCursorPos.argtypes = [ctypes.POINTER(wt.POINT)]
+_user32.GetCursorPos.restype = wt.BOOL
+_user32.CreatePopupMenu.restype = wt.HMENU
+_user32.AppendMenuW.argtypes = [wt.HMENU, wt.UINT, ctypes.c_size_t, wt.LPCWSTR]
+_user32.AppendMenuW.restype = wt.BOOL
+_user32.TrackPopupMenu.argtypes = [wt.HMENU, ctypes.c_uint, ctypes.c_int, ctypes.c_int,
+                                   ctypes.c_uint, wt.HWND, ctypes.c_void_p]
+_user32.TrackPopupMenu.restype = ctypes.c_uint
+_user32.DestroyMenu.argtypes = [wt.HMENU]
+_user32.DestroyMenu.restype = wt.BOOL
+
+
+def _shutdown_desktop_lyrics():
+    """Stop the native lyrics thread without changing its saved preference."""
+    global _desktop_lyrics
+    obj = _desktop_lyrics
+    _desktop_lyrics = None
+    if obj is not None:
+        try:
+            obj.close()
+        except Exception as e:
+            _log("桌面歌词关闭失败: %s" % e)
 
 
 def _find_hwnd():
@@ -67,6 +107,10 @@ def _find_hwnd():
 
     def cb(hwnd, lp):
         if _user32.IsWindow(hwnd):
+            # 托盘辅助窗口标题是 "MusicHubTray", 同样以 TITLE 开头且属于本进程,
+            # 若不排除会被当成主窗口缓存, 导致铺满/最小化/关闭全部作用在隐藏窗口上.
+            if hwnd == _tray.get("hwnd"):
+                return True
             pid = wt.DWORD()
             _user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
             if pid.value != mypid:
@@ -147,7 +191,49 @@ class _NID(ctypes.Structure):
     ]
 
 
-_tray = {"nid": None, "hwnd": None, "old_proc": None, "proc_ref": None, "ready": False}
+_tray = {"nid": None, "hwnd": None, "ready": False, "thread_id": 0, "menu_ts": 0.0}
+_TRAY_CLASS = "MusicHubTrayWindow"
+_TRAY_PROC_REF = None
+_TRAY_CLASS_READY = False
+
+
+class _WNDCLASSEXW(ctypes.Structure):
+    _fields_ = [("cbSize", wt.UINT), ("style", wt.UINT),
+                ("lpfnWndProc", ctypes.WINFUNCTYPE(ctypes.c_ssize_t, wt.HWND, wt.UINT,
+                                                   ctypes.c_size_t, ctypes.c_ssize_t)),
+                ("cbClsExtra", ctypes.c_int), ("cbWndExtra", ctypes.c_int),
+                ("hInstance", wt.HINSTANCE), ("hIcon", wt.HICON), ("hCursor", wt.HANDLE),
+                ("hbrBackground", wt.HBRUSH), ("lpszMenuName", wt.LPCWSTR),
+                ("lpszClassName", wt.LPCWSTR), ("hIconSm", wt.HICON)]
+
+
+# 托盘专用 user32 实例. ctypes 的 argtypes 挂在 DLL 对象上, 与 desktop_lyrics
+# 共用 ctypes.windll.user32 会让双方的 RegisterClassExW 原型互相覆盖, 传入
+# byref(另一个同名结构体)就会报 "expected LP__WNDCLASSEXW ..."; 单独加载一份
+# 互不干扰(同一进程, 句柄通用).
+_tray_u32 = ctypes.WinDLL("user32", use_last_error=True)
+_tray_u32.RegisterClassExW.argtypes = [ctypes.POINTER(_WNDCLASSEXW)]
+_tray_u32.RegisterClassExW.restype = wt.ATOM
+_tray_u32.CreateWindowExW.argtypes = [wt.DWORD, wt.LPCWSTR, wt.LPCWSTR, wt.DWORD,
+                                      wt.INT, wt.INT, wt.INT, wt.INT, wt.HWND, wt.HMENU,
+                                      wt.HINSTANCE, wt.LPVOID]
+_tray_u32.CreateWindowExW.restype = wt.HWND
+_tray_u32.DefWindowProcW.argtypes = [wt.HWND, wt.UINT, ctypes.c_size_t, ctypes.c_ssize_t]
+_tray_u32.DefWindowProcW.restype = ctypes.c_ssize_t
+_tray_u32.GetMessageW.argtypes = [ctypes.POINTER(wt.MSG), wt.HWND, wt.UINT, wt.UINT]
+_tray_u32.GetMessageW.restype = wt.BOOL
+_tray_u32.TranslateMessage.argtypes = [ctypes.POINTER(wt.MSG)]
+_tray_u32.DispatchMessageW.argtypes = [ctypes.POINTER(wt.MSG)]
+_tray_u32.DispatchMessageW.restype = ctypes.c_ssize_t
+_tray_u32.PostQuitMessage.argtypes = [ctypes.c_int]
+_tray_u32.PostQuitMessage.restype = None
+
+ctypes.windll.kernel32.GetModuleHandleW.argtypes = [wt.LPCWSTR]
+ctypes.windll.kernel32.GetModuleHandleW.restype = wt.HINSTANCE
+ctypes.windll.kernel32.GetCurrentThreadId.restype = wt.DWORD
+
+_shell32.Shell_NotifyIconW.argtypes = [wt.DWORD, ctypes.POINTER(_NID)]
+_shell32.Shell_NotifyIconW.restype = wt.BOOL
 
 
 def _tray_remove():
@@ -157,7 +243,7 @@ def _tray_remove():
 
 
 def _tray_show():
-    h = _tray["hwnd"] or _find_hwnd()
+    h = _find_hwnd()
     if not h:
         return
     _user32.ShowWindow(h, SW_RESTORE)
@@ -166,43 +252,87 @@ def _tray_show():
 
 
 def _tray_menu():
-    h = _tray["hwnd"]
+    """在托盘窗口上弹出菜单. 托盘窗口仅作 owner, 不影响主窗口激活."""
+    owner = _tray["hwnd"]
     menu = _user32.CreatePopupMenu()
     _user32.AppendMenuW(menu, 0, 1001, "显示 MusicHub")
     _user32.AppendMenuW(menu, 0x400, 0, None)  # MF_SEPARATOR
     _user32.AppendMenuW(menu, 0, 1002, "退出")
     pt = wt.POINT()
     _user32.GetCursorPos(ctypes.byref(pt))
-    _user32.SetForegroundWindow(h)  # TrackPopupMenu 需要前台窗口, 否则点击无响应
-    _user32.TrackPopupMenu.argtypes = [wt.HMENU, ctypes.c_uint, ctypes.c_int,
-                                       ctypes.c_int, ctypes.c_uint, wt.HWND, ctypes.c_void_p]
-    _user32.TrackPopupMenu.restype = ctypes.c_uint
-    cmd = _user32.TrackPopupMenu(menu, 0x0000 | 0x0100, pt.x, pt.y, 0, h, None)  # LEFTALIGN|RETURNCMD
-    _user32.PostMessageW(h, 0x0000, 0, 0)  # WM_NULL: 让菜单立即收起
+    # TrackPopupMenu 要求 owner 为前台窗口并先发 WM_NULL, 否则点菜单外部不收起
+    _user32.SetForegroundWindow(owner)
+    cmd = _user32.TrackPopupMenu(menu, 0x0000 | 0x0020 | 0x0100, pt.x, pt.y, 0, owner,
+                                 None)  # LEFTALIGN|TOPALIGN|RETURNCMD
+    _user32.PostMessageW(owner, 0x0000, 0, 0)  # WM_NULL: 让菜单立即收起
     _user32.DestroyMenu(menu)
     if cmd == 1001:
         _tray_show()
     elif cmd == 1002:
-        _user32.PostMessageW(h, 0x0010, 0, 0)  # WM_CLOSE
+        h = _find_hwnd()
+        if h:
+            _user32.PostMessageW(h, 0x0010, 0, 0)  # WM_CLOSE: 走主窗口关闭流程
 
 
 def _tray_wnd_proc(hwnd, msg, wparam, lparam):
     if msg == WM_TRAY:
         ev = lparam & 0xFFFF
-        if ev in (0x0202, 0x0203):  # 左键抬起/双击 -> 恢复窗口
+        # 兼容传统 shell(WM_LBUTTONUP/DBLCLK) 与 Win11 24H2+ 新版通知区域
+        # (左键=NIN_SELECT 0x0400, 右键=WM_CONTEXTMENU 0x007B)
+        if ev in (0x0202, 0x0203, 0x0400):  # 左键抬起/双击/选择 -> 恢复窗口
+            _log("托盘左键 0x%04X" % ev)
             _tray_show()
-        elif ev == 0x0205:  # 右键抬起 -> 弹出菜单
-            _tray_menu()
+        elif ev in (0x0205, 0x007B):  # 右键抬起/上下文菜单 -> 弹菜单
+            # 只认抬起: 若在按下(0x0204)时弹菜单, 松开后的 0x0205 会再弹一次
+            now = time.monotonic()
+            if now - _tray["menu_ts"] > 0.35:  # 两种事件码同时到达时去重
+                _tray["menu_ts"] = now
+                _log("托盘右键 0x%04X" % ev)
+                _tray_menu()
         return 0
     if msg == WM_DESTROY:
         _tray_remove()
-    return _user32.CallWindowProcW(_tray["old_proc"], hwnd, msg, wparam, lparam)
+        _tray_u32.PostQuitMessage(0)
+        return 0
+    return _tray_u32.DefWindowProcW(hwnd, msg, wparam, lparam)
 
 
-def _init_tray(h):
-    """添加托盘图标并子类化主窗口过程接收托盘回调."""
-    if _tray["ready"]:
+def _tray_thread_main():
+    """托盘专属线程: 创建隐藏窗口 + 消息循环, 与 pywebview 的 WinForms 窗口完全解耦.
+
+    旧实现子类化主窗口过程接收回调, 但 WinForms 会重置 wndproc, 导致托盘消息丢失。
+    窗口类只注册一次, 重复启用时复用已有类。
+    """
+    global _TRAY_PROC_REF, _TRAY_CLASS_READY
+    hinst = ctypes.windll.kernel32.GetModuleHandleW(None)
+    _tray["thread_id"] = ctypes.windll.kernel32.GetCurrentThreadId()
+    if not _TRAY_CLASS_READY:
+        try:
+            _TRAY_PROC_REF = ctypes.WINFUNCTYPE(
+                ctypes.c_ssize_t, wt.HWND, wt.UINT, ctypes.c_size_t, ctypes.c_ssize_t)(
+                _tray_wnd_proc)
+            wc = _WNDCLASSEXW()
+            wc.cbSize = ctypes.sizeof(_WNDCLASSEXW)
+            wc.style = 0
+            wc.lpfnWndProc = _TRAY_PROC_REF
+            wc.cbClsExtra = wc.cbWndExtra = 0
+            wc.hInstance = hinst
+            wc.lpszClassName = _TRAY_CLASS
+            atom = _tray_u32.RegisterClassExW(ctypes.byref(wc))
+            if not atom and ctypes.get_last_error() != 1410:  # ERROR_CLASS_ALREADY_EXISTS
+                _log("托盘窗口类注册失败(0x%X)" % ctypes.get_last_error())
+                return
+            _TRAY_CLASS_READY = True
+        except Exception as e:
+            _log("托盘窗口类注册异常: %s" % e)
+            return
+    hwnd = _tray_u32.CreateWindowExW(0x00000080, _TRAY_CLASS, "MusicHubTray", 0x80000000,
+                                     0, 0, 0, 0, None, None, hinst, None)  # WS_EX_TOOLWINDOW|WS_POPUP
+    if not hwnd:
+        _log("托盘窗口创建失败(0x%X)" % ctypes.get_last_error())
         return
+    _tray["hwnd"] = hwnd
+
     hicon = _load_app_icon()
     if not hicon:
         _user32.LoadIconW.restype = wt.HICON
@@ -210,44 +340,39 @@ def _init_tray(h):
         hicon = _user32.LoadIconW(0, IDI_APPLICATION)
     nid = _NID()
     nid.cbSize = ctypes.sizeof(_NID)
-    nid.hWnd = h
+    nid.hWnd = hwnd
     nid.uID = 1
     nid.uFlags = 0x1 | 0x2 | 0x4  # NIF_MESSAGE|NIF_ICON|NIF_TIP
     nid.uCallbackMessage = WM_TRAY
     nid.hIcon = hicon
     nid.szTip = "MusicHub"
     if not _shell32.Shell_NotifyIconW(0, ctypes.byref(nid)):  # NIM_ADD
-        _log("托盘图标注册失败(0x%X), 回退为仅窗口模式" % ctypes.GetLastError())
+        _log("托盘图标注册失败(0x%X)" % ctypes.get_last_error())
         return
     _tray["nid"] = nid
-    _tray["hwnd"] = h
-    # 应用图标: 设置窗口大/小图标(任务栏显示)
-    if hicon:
-        _user32.SendMessageW(h, 0x007F, 1, hicon)  # WM_SETICON, ICON_BIG
-        _user32.SendMessageW(h, 0x007F, 0, hicon)  # ICON_SMALL
-    proc_type = ctypes.WINFUNCTYPE(ctypes.c_ssize_t, wt.HWND, ctypes.c_uint,
-                                   ctypes.c_size_t, ctypes.c_ssize_t)
-    ref = proc_type(_tray_wnd_proc)
-    _user32.SetWindowLongPtrW.argtypes = [wt.HWND, ctypes.c_int, ctypes.c_void_p]
-    _user32.SetWindowLongPtrW.restype = ctypes.c_void_p
-    _user32.CallWindowProcW.argtypes = [ctypes.c_void_p, wt.HWND, ctypes.c_uint,
-                                        ctypes.c_size_t, ctypes.c_ssize_t]
-    _user32.CallWindowProcW.restype = ctypes.c_ssize_t
-    _tray["old_proc"] = _user32.SetWindowLongPtrW(h, -4, ctypes.cast(ref, ctypes.c_void_p))  # GWLP_WNDPROC
-    _tray["proc_ref"] = ref  # 防止回调被 GC
     _tray["ready"] = True
-
-
-def _setup_tray():
-    def _do():
-        import time
+    _log("托盘图标已就绪")
+    # 应用图标同步给主窗口(任务栏显示), 稍后主窗口才存在
+    def _sync_icon():
         for _ in range(20):
             time.sleep(0.3)
             h = _find_hwnd()
-            if h:
-                _init_tray(h)
+            if h and hicon:
+                _user32.SendMessageW(h, 0x007F, 1, hicon)  # WM_SETICON, ICON_BIG
+                _user32.SendMessageW(h, 0x007F, 0, hicon)  # ICON_SMALL
                 break
-    threading.Thread(target=_do, daemon=True).start()
+    threading.Thread(target=_sync_icon, daemon=True).start()
+
+    msg = wt.MSG()
+    while _user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
+        _user32.TranslateMessage(ctypes.byref(msg))
+        _user32.DispatchMessageW(ctypes.byref(msg))
+
+
+def _setup_tray():
+    if _tray["ready"]:
+        return
+    threading.Thread(target=_tray_thread_main, name="MusicHubTray", daemon=True).start()
 
 
 # 应用内登录配置: 官方页面跑在真实 WebView2 里, 自行完成验证码/设备校验,
@@ -319,6 +444,91 @@ class Api:
         nx = int(r.left + dx * scale)
         ny = int(r.top + dy * scale)
         _user32.SetWindowPos(h, 0, nx, ny, 0, 0, 0x0001 | 0x0004)  # NOSIZE|NOZORDER
+
+    # ---------- 桌面歌词(可选的原生置顶窗口) ----------
+
+    @staticmethod
+    def _desktop():
+        return _desktop_lyrics
+
+    def desktop_lyrics_state(self):
+        """返回桌面歌词窗口状态；浏览器模式下返回 unavailable。"""
+        obj = self._desktop()
+        if obj is None:
+            return {"available": False, "enabled": False, "locked": False}
+        try:
+            state = obj.get_state()
+            state["available"] = True
+            return state
+        except Exception as e:
+            _log("读取桌面歌词状态失败: %s" % e)
+            return {"available": False, "enabled": False, "locked": False}
+
+    def desktop_lyrics_enable(self, enabled):
+        """显示/隐藏桌面歌词窗口并返回最新状态。"""
+        obj = self._desktop()
+        if obj is None:
+            return {"available": False, "enabled": False, "locked": False}
+        try:
+            state = obj.set_enabled(bool(enabled))
+            state["available"] = True
+            return state
+        except Exception as e:
+            _log("切换桌面歌词失败: %s" % e)
+            return {"available": False, "enabled": False, "locked": False,
+                    "error": str(e)}
+
+    def desktop_lyrics_lock(self):
+        """切换桌面歌词窗口的鼠标穿透锁定状态。"""
+        obj = self._desktop()
+        if obj is None:
+            return {"available": False, "enabled": False, "locked": False}
+        try:
+            state = obj.toggle_lock()
+            state["available"] = True
+            return state
+        except Exception as e:
+            _log("切换桌面歌词锁定失败: %s" % e)
+            return {"available": False, "enabled": False, "locked": False,
+                    "error": str(e)}
+
+    def desktop_lyrics_update(self, payload):
+        """把当前歌曲、歌词和播放进度交给桌面歌词窗口。"""
+        obj = self._desktop()
+        if obj is None:
+            return {"available": False}
+        try:
+            obj.update(payload)
+            return {"available": True}
+        except Exception as e:
+            _log("更新桌面歌词失败: %s" % e)
+            return {"available": False, "error": str(e)}
+
+    def desktop_lyrics_color(self, value):
+        """自定义桌面歌词已唱文字颜色: "#rrggbb"。"""
+        obj = self._desktop()
+        if obj is None:
+            return {"available": False}
+        try:
+            st = obj.set_color(value)
+            st["available"] = True
+            return st
+        except Exception as e:
+            _log("设置桌面歌词颜色失败: %s" % e)
+            return {"available": False, "error": str(e)}
+
+    def desktop_lyrics_font(self, family, size):
+        """设置桌面歌词字体与字号, 返回最新状态."""
+        obj = self._desktop()
+        if obj is None:
+            return {"available": False}
+        try:
+            st = obj.set_font(family, size)
+            st["available"] = True
+            return st
+        except Exception as e:
+            _log("设置桌面歌词字体失败: %s" % e)
+            return {"available": False, "error": str(e)}
 
     # ---------- 应用内登录(网易云/QQ, 绕开接口风控) ----------
 
@@ -522,10 +732,24 @@ def main():
         except KeyboardInterrupt:
             return
 
+    global _desktop_lyrics
+    if DesktopLyrics is not None:
+        try:
+            lyrics_path = os.path.join(server.DATA_DIR, "desktop_lyrics.json")
+            _desktop_lyrics = DesktopLyrics(lyrics_path)
+            if _desktop_lyrics.get_state().get("enabled"):
+                # The constructor only reads preferences. Recreate a previously
+                # enabled window once the desktop client is about to start.
+                _desktop_lyrics.set_enabled(True)
+        except Exception as e:
+            _desktop_lyrics = None
+            _log("桌面歌词初始化失败，已禁用: %s" % e)
+
     try:
         _check_local_page()
     except Exception as e:
         _log("本地页面自检失败(%s)，打开系统浏览器: %s" % (e, URL))
+        _shutdown_desktop_lyrics()
         try:
             webbrowser.open(URL)
         except Exception as open_error:
@@ -587,13 +811,17 @@ def main():
                     _log("系统浏览器打开失败: %s" % e)
 
         threading.Thread(target=_fallback_if_not_loaded, daemon=True).start()
-        webview.start(
-            gui="edgechromium",
-            debug="--debug" in sys.argv,
-            storage_path=storage_path,
-        )
+        try:
+            webview.start(
+                gui="edgechromium",
+                debug="--debug" in sys.argv,
+                storage_path=storage_path,
+            )
+        finally:
+            _shutdown_desktop_lyrics()
     except Exception as e:
         _log("桌面窗口启动失败(%s)，回退到浏览器模式" % e)
+        _shutdown_desktop_lyrics()
         try:
             webbrowser.open(URL)
         except Exception as open_error:

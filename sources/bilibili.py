@@ -267,6 +267,59 @@ def _cid(bvid):
     return pages
 
 
+def get_subtitles(bvid, cid=None):
+    """视频字幕: player/wbi/v2 的 subtitle.subtitles(含 AI 字幕), 优先 ai-* 轨.
+    返回 {lines:[{t,text}], ai} 或 {error}. 时间单位秒, 与 audio.currentTime 对齐."""
+    if not bvid:
+        return {"error": "缺少视频参数"}
+    if not cid:
+        try:
+            pages = _cid(bvid)
+            cid = (pages[0] or {}).get("cid") if pages else None
+        except Exception as e:
+            return {"error": "获取分P信息失败: %s" % e}
+    if not cid:
+        return {"error": "该视频无法解析 cid"}
+    try:
+        url = API + "/x/player/wbi/v2?" + _wbi_sign({"bvid": bvid, "cid": cid})
+        j = http_get(url, headers=_headers())
+    except Exception as e:
+        return {"error": "获取字幕列表失败: %s" % e}
+    subs = ((j.get("data") or {}).get("subtitle") or {}).get("subtitles") or []
+    if not subs:
+        return {"lines": [], "ai": False}
+    pick = None
+    for s in subs:
+        if (s.get("lan") or "").lower().startswith("ai"):
+            pick = s
+            break
+    pick = pick or subs[0]
+    u = pick.get("subtitle_url") or ""
+    if not u:
+        return {"lines": [], "ai": False}
+    if u.startswith("//"):
+        u = "https:" + u
+    try:
+        body = http_get(u, headers=_headers())
+    except Exception as e:
+        return {"error": "下载字幕内容失败: %s" % e}
+    if isinstance(body, dict):
+        # AI 字幕格式: {font_size..., body: [{content, from, to}]}
+        body = body.get("body") or []
+    if not isinstance(body, list):
+        return {"error": "下载字幕内容失败: 响应格式异常"}
+    lines = []
+    for b in body or []:
+        text = str(b.get("content") or "").strip()
+        if text:
+            try:
+                t = float(b.get("from") or 0)
+            except Exception:
+                t = 0.0
+            lines.append({"t": t, "text": text})
+    return {"lines": lines, "ai": (pick.get("lan") or "").lower().startswith("ai")}
+
+
 def _to_song(r):
     """将推荐/热门/相关推荐接口的条目转为 song (extra 带观看数/点赞数)."""
     bvid = r.get("bvid")

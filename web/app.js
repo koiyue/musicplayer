@@ -118,35 +118,85 @@ const SRC_LOGO = {
 // 启动恢复保护: 用户修改过队列/设置后, 迟到的 /api/queue、/api/settings 响应不得覆盖
 let userTouchedQueue = false;
 let userTouchedSettings = false;
+let bootSettings = null;
 let saveTimer = null;
+let setTimer = null;
+// 待保存状态跟踪: 保存最近一次尚未发出的 body; flush 后清空避免重复发送, 新修改重新置位
+let pendingQueueBody = null;
+let pendingSettingsBody = null;
+// 队列请求体(契约 B): {songs, index}; feedMode 下 index 取 state.mainIndex, 空队列取 -1
+function queueBody() {
+  return JSON.stringify({ songs: state.queue, index: state.feedMode ? state.mainIndex : state.index });
+}
+// 统一发送: 非 2xx 或 reject 都经 toast 可见提示(含状态码/错误类型), 不抛异常/不重排定时器(无重试风暴)
+// keepalive=true 用于退出/切后台 flush; 每源约 64KB 预算: 超阈值改用普通 fetch 并可见提示, 不静默截断
+function doSave(path, bodyStr, label, keepalive) {
+  const init = {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: bodyStr,
+  };
+  if (keepalive) {
+    let bytes = bodyStr.length;
+    try { bytes = new TextEncoder().encode(bodyStr).length; } catch (e) {}
+    if (bytes > 60000) toast(label + "较大, 改用后台保存", 2600);
+    else init.keepalive = true;
+  }
+  fetch(path, init)
+    .then((r) => { if (!r.ok) toast(label + "保存失败(" + r.status + ")", 2600); })
+    .catch(() => { toast(label + "保存失败(网络错误)", 2600); });
+}
+// 退出/切后台前统一 flush: 绕过防抖等待, 立即发出尚未发送的队列/设置保存, 然后清待保存标志
+function flushPendingSaves() {
+  if (saveTimer) { clearTimeout(saveTimer); saveTimer = null; }
+  if (setTimer) { clearTimeout(setTimer); setTimer = null; }
+  if (pendingQueueBody !== null) {
+    const b = pendingQueueBody; pendingQueueBody = null;
+    doSave("/api/queue", b, "队列", true);
+  }
+  if (pendingSettingsBody !== null) {
+    const b = pendingSettingsBody; pendingSettingsBody = null;
+    doSave("/api/settings", b, "设置", true);
+  }
+}
 function saveQueue() {
   userTouchedQueue = true;
+  pendingQueueBody = queueBody();
   clearTimeout(saveTimer);
   saveTimer = setTimeout(() => {
-    fetch("/api/queue", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ songs: state.queue, index: state.feedMode ? state.mainIndex : state.index }),
-    }).catch(() => {});
+    saveTimer = null;
+    if (pendingQueueBody === null) return;
+    const b = pendingQueueBody; pendingQueueBody = null;
+    doSave("/api/queue", b, "队列", false);
   }, 400);
 }
 
-// 设置持久化(音量 + 播放进度), 保存到本地 data/settings.json
-let settings = { volume: 0.8, pos: null, rate: 1 };  // pos: {key, time}
-let setTimer = null;
+// 设置持久化(音量 + 播放进度 + 代理 + 字体), 保存到本地 data/settings.json
+const DEFAULT_PROXY = { mode: "system", http: "", https: "" };
+const DEFAULT_FONT = {
+  ui_family: "Microsoft YaHei", ui_scale: 1,
+  lyrics_family: "Microsoft YaHei UI", lyrics_size: 28,
+};
+let settings = {
+  volume: 0.8, pos: null, rate: 1,
+  proxy: Object.assign({}, DEFAULT_PROXY),
+  font: Object.assign({}, DEFAULT_FONT),
+};  // pos: {key, time}
 function saveSettings() {
   userTouchedSettings = true;
+  pendingSettingsBody = JSON.stringify(settingSnapshot());
   clearTimeout(setTimer);
   setTimer = setTimeout(() => {
-    fetch("/api/settings", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(settings),
-    }).catch(() => {});
+    setTimer = null;
+    if (pendingSettingsBody === null) return;
+    const b = pendingSettingsBody; pendingSettingsBody = null;
+    doSave("/api/settings", b, "设置", false);
   }, 600);
 }
-function songKey(s) { return s ? (s.source + ":" + s.id) : ""; }
 let lastPosSave = 0;
+function settingSnapshot() {
+  return Object.assign({}, bootSettings || {}, settings);
+}
 function savePos() {
   if (audio.duration && audio.currentTime > 3 && audio.dataset.key) {
     settings.pos = { key: audio.dataset.key, time: audio.currentTime };
@@ -155,6 +205,160 @@ function savePos() {
   }
   saveSettings();
 }
+
+function cssFontFamily(name) {
+  // 字体名含空格时加引号; 服务端已禁止引号/分号等危险字符
+  return /^[A-Za-z0-9_-]+$/.test(name) ? name : '"' + name + '"';
+}
+function applyFontSettings() {
+  const f = settings.font || DEFAULT_FONT;
+  document.documentElement.style.setProperty("--font-family", cssFontFamily(f.ui_family));
+  document.documentElement.style.setProperty("--font-scale", String(f.ui_scale));
+}
+const FONT_FAMILIES = [
+  "Microsoft YaHei", "Microsoft YaHei UI", "SimHei", "SimSun", "KaiTi",
+  "DengXian", "PingFang SC", "Segoe UI", "Arial", "Consolas",
+];
+function fontOptions(families, select, current) {
+  const names = Array.isArray(families) && families.length ? families.slice() : FONT_FAMILIES.slice();
+  if (current && !names.includes(current)) names.push(current);
+  select.innerHTML = names.map((n) => '<option value="' + esc(n) + '">' + esc(n) + "</option>").join("");
+  select.value = current;
+}
+function collectSettingsForm() {
+  return {
+    proxy: {
+      mode: $("set-proxy-mode").value,
+      http: $("set-proxy-http").value.trim(),
+      https: $("set-proxy-https").value.trim(),
+    },
+    font: {
+      ui_family: $("set-ui-family").value,
+      ui_scale: Number($("set-ui-scale").value),
+      lyrics_family: $("set-lyrics-family").value,
+      lyrics_size: Number($("set-lyrics-size").value),
+    },
+  };
+}
+function renderSettingsForm(override) {
+  const o = override || {};
+  const p = Object.assign({}, DEFAULT_PROXY, settings.proxy || {}, o.proxy || {});
+  const f = Object.assign({}, DEFAULT_FONT, settings.font || {}, o.font || {});
+  $("set-proxy-mode").value = p.mode;
+  $("set-proxy-http").value = p.http || "";
+  $("set-proxy-https").value = p.https || "";
+  $("set-ui-family").value = f.ui_family;
+  $("set-ui-scale").value = String(f.ui_scale);
+  $("set-ui-scale-val").textContent = Math.round(f.ui_scale * 100) + "%";
+  $("set-lyrics-family").value = f.lyrics_family;
+  $("set-lyrics-size").value = String(f.lyrics_size);
+  $("set-lyrics-size-val").textContent = String(f.lyrics_size);
+  $("set-preview").style.fontFamily = cssFontFamily(f.ui_family);
+  $("set-msg").textContent = "";
+  syncProxyInputs();
+}
+function syncProxyInputs() {
+  const on = $("set-proxy-mode").value === "custom";
+  $("set-proxy-http").disabled = !on;
+  $("set-proxy-https").disabled = !on;
+}
+function renderSettingsFormDefault() {
+  $("set-proxy-mode").value = DEFAULT_PROXY.mode;
+  $("set-proxy-http").value = DEFAULT_PROXY.http;
+  $("set-proxy-https").value = DEFAULT_PROXY.https;
+  $("set-ui-family").value = DEFAULT_FONT.ui_family;
+  $("set-ui-scale").value = String(DEFAULT_FONT.ui_scale);
+  $("set-lyrics-family").value = DEFAULT_FONT.lyrics_family;
+  $("set-lyrics-size").value = String(DEFAULT_FONT.lyrics_size);
+  $("set-ui-scale-val").textContent = "100%";
+  $("set-lyrics-size-val").textContent = String(DEFAULT_FONT.lyrics_size);
+  $("set-preview").style.fontFamily = cssFontFamily(DEFAULT_FONT.ui_family);
+  document.documentElement.style.setProperty("--font-scale", "1");
+  $("set-msg").textContent = "已恢复默认，点保存后生效";
+  syncProxyInputs();
+}
+async function openSettings() {
+  const nativeFont = {};
+  const apiObj = desktopApi();
+  if (apiObj && typeof apiObj.desktop_lyrics_state === "function") {
+    try {
+      const st = await apiObj.desktop_lyrics_state();
+      if (st && st.available !== false) {
+        if (st.font_family) nativeFont.lyrics_family = st.font_family;
+        if (typeof st.font_size === "number") nativeFont.lyrics_size = st.font_size;
+        fontOptions(FONT_FAMILIES, $("set-lyrics-family"),
+                    nativeFont.lyrics_family || settings.font.lyrics_family);
+      }
+    } catch (e) {}
+  }
+  try {
+    const r = await api("/api/fonts");
+    fontOptions(r.families, $("set-ui-family"), (settings.font || DEFAULT_FONT).ui_family);
+    if (!nativeFont.lyrics_family) {
+      fontOptions(r.families, $("set-lyrics-family"), (settings.font || DEFAULT_FONT).lyrics_family);
+    }
+  } catch (e) {
+    fontOptions([], $("set-ui-family"), (settings.font || DEFAULT_FONT).ui_family);
+    if (!nativeFont.lyrics_family) {
+      fontOptions([], $("set-lyrics-family"), (settings.font || DEFAULT_FONT).lyrics_family);
+    }
+  }
+  renderSettingsForm({ font: nativeFont });
+  $("settings-modal").classList.remove("hidden");
+}
+function closeSettings() {
+  applyFontSettings();  // 撤销未保存的实时字号预览
+  $("settings-modal").classList.add("hidden");
+}
+async function saveSettingsForm() {
+  const draft = collectSettingsForm();
+  const body = JSON.stringify(Object.assign({}, settingSnapshot(), draft));
+  if (setTimer) { clearTimeout(setTimer); setTimer = null; }
+  pendingSettingsBody = null;
+  try {
+    const r = await fetch("/api/settings", {
+      method: "POST", headers: { "Content-Type": "application/json" }, body,
+    });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(j.error || "HTTP " + r.status);
+    userTouchedSettings = true;
+    settings.proxy = draft.proxy;
+    settings.font = draft.font;
+    bootSettings = JSON.parse(body);
+    applyFontSettings();
+    const apiObj = desktopApi();
+    if (apiObj && typeof apiObj.desktop_lyrics_font === "function") {
+      try {
+        await apiObj.desktop_lyrics_font(draft.font.lyrics_family, draft.font.lyrics_size);
+      } catch (e) {}
+    }
+    $("set-msg").textContent = "设置已保存";
+    setTimeout(() => { if ($("set-msg").textContent === "设置已保存") $("set-msg").textContent = ""; }, 2200);
+  } catch (e) {
+    $("set-msg").textContent = "保存失败：" + (e.message || e);
+  }
+}
+function setupSettingsUI() {
+  $("btn-settings").addEventListener("click", openSettings);
+  $("settings-close").addEventListener("click", closeSettings);
+  $("settings-modal").addEventListener("click", (e) => { if (e.target.id === "settings-modal") closeSettings(); });
+  $("set-proxy-mode").addEventListener("change", syncProxyInputs);
+  $("set-ui-family").addEventListener("change", () => {
+    $("set-preview").style.fontFamily = cssFontFamily($("set-ui-family").value);
+  });
+  $("set-ui-scale").addEventListener("input", (e) => {
+    $("set-ui-scale-val").textContent = Math.round(Number(e.target.value) * 100) + "%";
+    document.documentElement.style.setProperty("--font-scale", e.target.value);
+  });
+  $("set-lyrics-size").addEventListener("input", (e) => {
+    $("set-lyrics-size-val").textContent = e.target.value;
+  });
+  $("settings-reset").addEventListener("click", () => {
+    renderSettingsFormDefault();
+  });
+  $("settings-save").addEventListener("click", saveSettingsForm);
+}
+setupSettingsUI();
 
 // ---------------- 中栏渲染 ----------------
 const DEFAULT_EMPTY = '<div class="empty-ic">🎵</div><p>选择音源，搜索你喜欢的音乐</p>';
@@ -860,20 +1064,33 @@ function dlItemMenu(it, s) {
 }
 
 // ---------------- 播放队列 ----------------
-function songKey(s) { return s.source + ":" + s.id + ":" + JSON.stringify(s.extra || {}); }
+// canonicalJson: 对象键升序且递归, 数组保序, 不做 ASCII 转义, 紧凑无空白
+// (契约 A: 等价 Python json.dumps(separators=(",", ":"), ensure_ascii=False) 且 sort_keys)
+function canonicalJson(v) {
+  if (Array.isArray(v)) return "[" + v.map(canonicalJson).join(",") + "]";
+  if (v && typeof v === "object") {
+    return "{" + Object.keys(v).sort().map(function (k) {
+      return JSON.stringify(k) + ":" + canonicalJson(v[k]);
+    }).join(",") + "}";
+  }
+  return JSON.stringify(v === undefined ? null : v);
+}
+// 全文件唯一 songKey 声明(契约 A): source + ":" + String(id) + ":" + canonicalJson(extra || {})
+function songKey(s) { return s ? (s.source + ":" + String(s.id) + ":" + canonicalJson(s.extra || {})) : ""; }
+// 统一歌曲身份比较: 队列去重/播放高亮/下载去重与推荐流一律走同一身份函数
+function sameSong(a, b) { return songKey(a) === songKey(b); }
 function inQueue(s) {
-  return state.queue.some((q) => q.source === s.source && q.id === s.id &&
-    JSON.stringify(q.extra || {}) === JSON.stringify(s.extra || {}));
+  return state.queue.some((q) => sameSong(q, s));
 }
 function findQueue(s) {
-  return state.queue.findIndex((q) => q.source === s.source && q.id === s.id &&
-    JSON.stringify(q.extra || {}) === JSON.stringify(s.extra || {}));
+  return state.queue.findIndex((q) => sameSong(q, s));
 }
 
 function addToQueue(s) {
   if (inQueue(s)) { toast("已在播放列表中"); return; }
   state.queue.push(s);
-  if (state.index < 0 && !state.feedMode) { playAt(state.queue.length - 1); }
+  // 首曲自动播放分支也要持久化并置 userTouchedQueue(经 saveQueue): 否则启动恢复守卫失效、首曲漏存
+  if (state.index < 0 && !state.feedMode) { playAt(state.queue.length - 1); saveQueue(); }
   else { renderQueue(); saveQueue(); }
   toast("已加入: " + s.title);
 }
@@ -902,8 +1119,7 @@ function playFeed(s, list) {
   if (!state.feedMode) { state.feedMode = true; state.mainIndex = state.index; }
   state.plView = "feed";
   if (list && list.length && list !== state.feedQueue) state.feedQueue = list.slice();
-  let i = state.feedQueue.findIndex((q) => q.source === s.source && q.id === s.id &&
-    JSON.stringify(q.extra || {}) === JSON.stringify(s.extra || {}));
+  let i = state.feedQueue.findIndex((q) => sameSong(q, s));
   if (i < 0) {
     i = state.index + 1;
     if (i < 0 || i >= state.feedQueue.length) i = Math.max(0, state.feedQueue.length - 1);
@@ -932,6 +1148,7 @@ function playAt(i) {
   skipTimer = null;
   state.index = i;
   const s = q[i];
+  if (desktopLyrics.enabled) desktopBeginSong(s);
   $("pb-title").textContent = s.title;
   $("pb-artist").textContent = (s.artist || "—") + " · " + (SRC_NAME[s.source] || s.source);
   const pcs = coverSrc(s);
@@ -955,8 +1172,9 @@ function playAt(i) {
     const cs = coverSrc(s);
     $("lo-bg").style.backgroundImage = cs ? 'url("' + esc(cs) + '")' : "";
     setupVideo(s);
-    loadLyrics(s);
   }
+  // 桌面歌词不依赖覆盖层是否打开。
+  if (desktopLyrics.enabled) loadLyrics(s);
 }
 
 function markPlayingRows() {
@@ -1084,6 +1302,8 @@ function resetPlayerBar() {
   $("t-dur").textContent = "0:00";
   setPlayIcon(false);
   settings.pos = null;
+  stopAsr();
+  desktopReset();
   saveSettings();
 }
 
@@ -1349,8 +1569,8 @@ $("btn-mode").addEventListener("click", () => {
   toast(MODES[state.mode].name);
 });
 
-audio.addEventListener("play", () => { state.playing = true; setPlayIcon(true); });
-audio.addEventListener("pause", () => { state.playing = false; setPlayIcon(false); savePos(); });
+audio.addEventListener("play", () => { state.playing = true; setPlayIcon(true); desktopPush(true); });
+audio.addEventListener("pause", () => { state.playing = false; setPlayIcon(false); savePos(); desktopPush(true); });
 audio.addEventListener("loadedmetadata", () => {
   const t = parseFloat(audio.dataset.resume || "0");
   if (t > 3 && audio.duration && t < audio.duration - 3) audio.currentTime = t;
@@ -1363,6 +1583,7 @@ audio.addEventListener("timeupdate", () => {
   $("seek-fill").style.width = (d ? (audio.currentTime / d * 100) : 0) + "%";
   syncLyric();
   syncLoSeek();
+  desktopPush(false);
   // 每 5 秒记录一次播放进度
   const now = Date.now();
   if (d && audio.currentTime > 3 && now - lastPosSave > 5000) {
@@ -1371,6 +1592,11 @@ audio.addEventListener("timeupdate", () => {
     saveSettings();
   }
 });
+audio.addEventListener("seeked", () => {
+  if (asr.active) { asr.lines = []; asr.partial = ""; }  // 跳转后旧识别行时间轴失效, 从新位置重新积累
+  desktopPush(true);
+});
+audio.addEventListener("ratechange", () => desktopPush(true));
 audio.addEventListener("ended", () => {
   settings.pos = null;  // 播完不再恢复
   if (state.mode === "single") { audio.currentTime = 0; audio.play(); return; }
@@ -2188,6 +2414,359 @@ let lyricLines = [];      // [{t, text}]
 let lyricActive = -1;
 let lyricUserScroll = 0;  // 用户手动滚动后暂停自动跟随的时间戳
 
+// ---------------- 桌面歌词 ----------------
+// 桌面歌词由 Windows 原生置顶窗口绘制。前端只发送歌词快照和低频进度
+// 心跳；原生窗口会在心跳之间按播放速率外推时间，因此主窗口缩到托盘后仍能跟随。
+const desktopLyrics = {
+  enabled: false,
+  locked: false,
+  available: null,
+  color: "#ff69b4",
+  key: "",
+  lines: [],
+  lineRevision: 0,
+  sentLineRevision: -1,
+  lastPush: 0,
+  pushTimer: null,
+  statePromise: null,
+};
+
+function desktopApi() {
+  return window.pywebview && window.pywebview.api ? window.pywebview.api : null;
+}
+
+function rgbHex(c) {
+  if (typeof c === "string") return c;
+  if (Array.isArray(c) && c.length === 3) {
+    return "#" + c.map((x) => ("0" + (x & 255).toString(16)).slice(-2)).join("");
+  }
+  return "";
+}
+
+function setDesktopButton() {
+  const b = $("btn-desktop-lyrics");
+  if (!b) return;
+  b.classList.toggle("active", desktopLyrics.enabled);
+  b.classList.toggle("unavailable", desktopLyrics.available === false);
+  b.setAttribute("aria-pressed", desktopLyrics.enabled ? "true" : "false");
+  b.title = desktopLyrics.enabled ? "关闭桌面歌词" : "桌面歌词";
+  const u = $("btn-desktop-unlock");
+  if (u) {
+    u.classList.toggle("hidden", !desktopLyrics.enabled);
+    u.title = desktopLyrics.locked ? "解锁桌面歌词" : "锁定桌面歌词";
+    u.setAttribute("aria-label", u.title);
+    // 锁图标随状态切换: 锁定=开锁图标(点击解锁), 未锁定=上锁图标(点击锁定)
+    const ic = u.querySelector(".ic-lock-closed");
+    const io = u.querySelector(".ic-lock-open");
+    if (ic && io) {
+      ic.classList.toggle("hidden", desktopLyrics.locked);
+      io.classList.toggle("hidden", !desktopLyrics.locked);
+    }
+  }
+  const lc = $("btn-lyric-color");
+  if (lc) {
+    lc.classList.toggle("hidden", !desktopLyrics.enabled);
+    const swatch = lc.querySelector("span");
+    if (swatch && desktopLyrics.color) swatch.style.background = desktopLyrics.color;
+  }
+}
+
+// 应用内桌面歌词取色器: 用圆角深色面板替代浏览器原生白底直角取色器
+const colorPicker = { hue: 330, sat: 1, val: 1, hex: "#ff69b4", dragging: false };
+
+function hexToHsv(hex) {
+  const s = String(hex || "").replace("#", "");
+  if (!/^[0-9a-fA-F]{6}$/.test(s)) return null;
+  const r = parseInt(s.slice(0, 2), 16) / 255;
+  const g = parseInt(s.slice(2, 4), 16) / 255;
+  const b = parseInt(s.slice(4, 6), 16) / 255;
+  const max = Math.max(r, g, b), min = Math.min(r, g, b), d = max - min;
+  let h = 0;
+  if (d) {
+    if (max === r) h = 60 * (((g - b) / d) % 6);
+    else if (max === g) h = 60 * ((b - r) / d + 2);
+    else h = 60 * ((r - g) / d + 4);
+  }
+  if (h < 0) h += 360;
+  return { h, s: max ? d / max : 0, v: max };
+}
+function hsvToHex(h, s, v) {
+  const c = v * s, x = c * (1 - Math.abs((h / 60) % 2 - 1)), m = v - c;
+  let rgb;
+  if (h < 60) rgb = [c, x, 0];
+  else if (h < 120) rgb = [x, c, 0];
+  else if (h < 180) rgb = [0, c, x];
+  else if (h < 240) rgb = [0, x, c];
+  else if (h < 300) rgb = [x, 0, c];
+  else rgb = [c, 0, x];
+  return "#" + rgb.map((n) => ("0" + Math.round((n + m) * 255).toString(16)).slice(-2)).join("");
+}
+function renderColorPicker() {
+  const { hue, sat, val } = colorPicker;
+  const hex = hsvToHex(hue, sat, val);
+  colorPicker.hex = hex;
+  $("color-sv").style.background =
+    "linear-gradient(to top, #000, transparent), linear-gradient(to right, #fff, hsl(" + hue + " 100% 50%))";
+  $("color-sv-cursor").style.left = (sat * 100) + "%";
+  $("color-sv-cursor").style.top = ((1 - val) * 100) + "%";
+  $("color-hue").value = String(Math.round(hue));
+  $("color-preview").style.background = hex;
+  $("color-hex").textContent = hex;
+}
+function openColorPicker() {
+  const hsv = hexToHsv(desktopLyrics.color || "#ff69b4") || { h: 330, s: 1, v: 1 };
+  colorPicker.hue = hsv.h;
+  colorPicker.sat = hsv.s;
+  colorPicker.val = hsv.v;
+  renderColorPicker();
+  $("color-modal").classList.remove("hidden");
+}
+function closeColorPicker() {
+  $("color-modal").classList.add("hidden");
+}
+function setColorFromPointer(e) {
+  const r = $("color-sv").getBoundingClientRect();
+  colorPicker.sat = Math.min(1, Math.max(0, (e.clientX - r.left) / r.width));
+  colorPicker.val = Math.min(1, Math.max(0, 1 - (e.clientY - r.top) / r.height));
+  renderColorPicker();
+}
+function applyDesktopLyricsColor(hex) {
+  desktopLyrics.color = hex;
+  const swatch = $("btn-lyric-color").querySelector("span");
+  if (swatch) swatch.style.background = hex;
+  const api = desktopApi();
+  if (api && typeof api.desktop_lyrics_color === "function") api.desktop_lyrics_color(hex);
+}
+function setupColorPicker() {
+  const sv = $("color-sv");
+  $("btn-lyric-color").addEventListener("click", openColorPicker);
+  $("color-close").addEventListener("click", closeColorPicker);
+  $("color-cancel").addEventListener("click", closeColorPicker);
+  $("color-modal").addEventListener("click", (e) => { if (e.target.id === "color-modal") closeColorPicker(); });
+  $("color-hue").addEventListener("input", (e) => { colorPicker.hue = Number(e.target.value); renderColorPicker(); });
+  sv.addEventListener("pointerdown", (e) => {
+    colorPicker.dragging = true;
+    sv.setPointerCapture(e.pointerId);
+    setColorFromPointer(e);
+  });
+  sv.addEventListener("pointermove", (e) => { if (colorPicker.dragging) setColorFromPointer(e); });
+  sv.addEventListener("pointerup", () => { colorPicker.dragging = false; });
+  sv.addEventListener("pointercancel", () => { colorPicker.dragging = false; });
+  $("color-ok").addEventListener("click", () => {
+    applyDesktopLyricsColor(colorPicker.hex);
+    closeColorPicker();
+  });
+}
+setupColorPicker();
+
+function desktopStatusFor(s) {
+  if (!s) return "idle";
+  if (s.source === "bilibili") return "video";
+  if (s.source === "local") return "none";
+  return "loading";
+}
+
+function desktopBeginSong(s) {
+  const key = songKey(s);
+  if (desktopLyrics.key === key) return;
+  desktopLyrics.key = key;
+  desktopLyrics.lines = [];
+  desktopLyrics.lineRevision++;
+  desktopLyrics.sentLineRevision = -1;
+  desktopLyrics.status = desktopStatusFor(s);
+  desktopPush(true);
+}
+
+function desktopSetLines(s, lines, status) {
+  if (!s || songKey(s) !== desktopLyrics.key) return;
+  desktopLyrics.lines = Array.isArray(lines) ? lines.slice() : [];
+  desktopLyrics.lineRevision++;
+  desktopLyrics.status = status || (desktopLyrics.lines.length ? "ready" : "empty");
+  desktopPush(true);
+}
+
+function desktopReset() {
+  if (!desktopLyrics.enabled) return;
+  desktopLyrics.key = "";
+  desktopLyrics.lines = [];
+  desktopLyrics.lineRevision++;
+  desktopLyrics.sentLineRevision = -1;
+  desktopLyrics.status = "idle";
+  desktopPush(true);
+}
+
+function desktopPayload() {
+  const s = curSong();
+  const key = s ? songKey(s) : "";
+  // curPos() intentionally falls back to settings.pos when the restored song
+  // has not been loaded by the audio element yet.
+  const t = s ? curPos() : 0;
+  const p = {
+    key: key,
+    title: s ? (s.title || "") : "",
+    artist: s ? (s.artist || "") : "",
+    time: Number.isFinite(t) ? Math.max(0, t) : 0,
+    duration: s ? ((audio.duration && Number.isFinite(audio.duration)) ? audio.duration : (s.duration || 0)) : 0,
+    playing: !!(s && audio.src && !audio.paused),
+    rate: Number.isFinite(audio.playbackRate) && audio.playbackRate > 0 ? audio.playbackRate : (settings.rate || 1),
+    status: s ? (desktopLyrics.status || desktopStatusFor(s)) : "idle",
+  };
+  if (desktopLyrics.sentLineRevision !== desktopLyrics.lineRevision) {
+    p.lines = desktopLyrics.lines.map((l) => ({ t: Number(l.t) || 0, text: String(l.text || "") }));
+  }
+  return p;
+}
+
+function desktopPush(force) {
+  if (!desktopLyrics.enabled) return;
+  const api = desktopApi();
+  if (!api || typeof api.desktop_lyrics_update !== "function") {
+    desktopLyrics.available = false;
+    setDesktopButton();
+    return;
+  }
+  const now = Date.now();
+  if (!force && now - desktopLyrics.lastPush < 220) {
+    if (!desktopLyrics.pushTimer) {
+      desktopLyrics.pushTimer = setTimeout(() => {
+        desktopLyrics.pushTimer = null;
+        desktopPush(false);
+      }, Math.max(20, 220 - (now - desktopLyrics.lastPush)));
+    }
+    return;
+  }
+  const body = desktopPayload();
+  const rev = desktopLyrics.lineRevision;
+  desktopLyrics.lastPush = now;
+  Promise.resolve(api.desktop_lyrics_update(body)).then((r) => {
+    if (r && r.available === false) {
+      desktopLyrics.available = false;
+      setDesktopButton();
+      return;
+    }
+    desktopLyrics.available = true;
+    if (desktopLyrics.lineRevision === rev) desktopLyrics.sentLineRevision = rev;
+  }).catch(() => {
+    desktopLyrics.available = false;
+    setDesktopButton();
+  });
+}
+
+function desktopReadState() {
+  const api = desktopApi();
+  if (!api || typeof api.desktop_lyrics_state !== "function") {
+    desktopLyrics.available = false;
+    setDesktopButton();
+    return Promise.resolve(null);
+  }
+  if (desktopLyrics.statePromise) return desktopLyrics.statePromise;
+  desktopLyrics.statePromise = Promise.resolve(api.desktop_lyrics_state()).then((st) => {
+    if (!st || st.available === false) {
+      desktopLyrics.available = false;
+      setDesktopButton();
+      return null;
+    }
+    desktopLyrics.available = true;
+    desktopLyrics.enabled = !!st.enabled;
+    desktopLyrics.locked = !!st.locked;
+    if (st.color) desktopLyrics.color = rgbHex(st.color);
+    desktopLyrics.sentLineRevision = -1;
+    setDesktopButton();
+    if (desktopLyrics.enabled) {
+      const s = curSong();
+      if (s) {
+        if (desktopLyrics.key !== songKey(s)) desktopBeginSong(s);
+        else desktopPush(true);
+        loadLyrics(s);
+      } else desktopPush(true);
+    }
+    return st;
+  }).catch(() => {
+    desktopLyrics.available = false;
+    setDesktopButton();
+    return null;
+  }).finally(() => { desktopLyrics.statePromise = null; });
+  return desktopLyrics.statePromise;
+}
+
+// 原生桌面歌词窗口的 ×/锁 与主界面联动: 仅在 enabled/locked 真的变化时
+// 触发完整 desktopReadState, 避免轮询带来歌词重载和桌面窗口重绘。
+async function desktopSyncState() {
+  const api = desktopApi();
+  if (!api || typeof api.desktop_lyrics_state !== "function") return;
+  try {
+    const st = await api.desktop_lyrics_state();
+    if (!st || st.available === false) return;
+    if (!!st.enabled === desktopLyrics.enabled && !!st.locked === desktopLyrics.locked) return;
+    desktopReadState();
+  } catch (e) {}
+}
+
+async function toggleDesktopLyrics() {
+  const api = desktopApi();
+  if (!api || typeof api.desktop_lyrics_enable !== "function") {
+    toast("桌面歌词仅支持桌面版");
+    desktopLyrics.available = false;
+    setDesktopButton();
+    return;
+  }
+  // The native window also has its own close control. Refresh the actual
+  // native state first so clicking the player button reopens it immediately
+  // after that control was used.
+  let current = desktopLyrics.enabled;
+  try {
+    const actual = await api.desktop_lyrics_state();
+    if (actual && actual.available !== false) {
+      current = !!actual.enabled;
+      desktopLyrics.enabled = current;
+      desktopLyrics.locked = !!actual.locked;
+      desktopLyrics.available = true;
+      setDesktopButton();
+    }
+  } catch (e) {}
+  const target = !current;
+  try {
+    const st = await api.desktop_lyrics_enable(target);
+    if (!st || st.available === false || st.error) throw new Error((st && st.error) || "不可用");
+    desktopLyrics.available = true;
+    desktopLyrics.enabled = !!st.enabled;
+    desktopLyrics.locked = !!st.locked;
+    if (st.color) desktopLyrics.color = rgbHex(st.color);
+    desktopLyrics.sentLineRevision = -1;
+    setDesktopButton();
+    if (desktopLyrics.enabled) {
+      const s = curSong();
+      if (s) {
+        if (desktopLyrics.key !== songKey(s)) desktopBeginSong(s);
+        else desktopPush(true);
+        loadLyrics(s);
+      } else desktopPush(true);
+    }
+  } catch (e) {
+    desktopLyrics.available = false;
+    setDesktopButton();
+    toast("桌面歌词不可用");
+  }
+}
+
+async function toggleDesktopLyricsLock() {
+  const api = desktopApi();
+  if (!api || typeof api.desktop_lyrics_lock !== "function") {
+    toast("桌面歌词仅支持桌面版");
+    return;
+  }
+  try {
+    const st = await api.desktop_lyrics_lock();
+    if (!st || st.available === false || st.error) throw new Error((st && st.error) || "不可用");
+    desktopLyrics.available = true;
+    desktopLyrics.locked = !!st.locked;
+    setDesktopButton();
+    toast(desktopLyrics.locked ? "桌面歌词已锁定" : "桌面歌词已解锁", 1200);
+  } catch (e) {
+    toast("桌面歌词锁定状态更新失败");
+  }
+}
+
 function parseLRC(text) {
   const out = [];
   for (const rawLine of (text || "").split(/\r?\n/)) {
@@ -2248,11 +2827,35 @@ function syncLyric(force) {
   }
 }
 
+const lyricCache = new Map();
+let lyricLoadSeq = 0;
+
 async function loadLyrics(s) {
   const inner = $("lo-lyric-inner");
-  if (!s || s.source === "local" || s.source === "bilibili") {
-    // 本地/B站: 无平台歌词接口(B站以视频画面为主, 歌词面板已隐藏)
+  const seq = ++lyricLoadSeq;
+  const key = s ? songKey(s) : "";
+  if (asr.active && asr.key !== key) stopAsr();  // 切歌即停实时识别
+  if (desktopLyrics.enabled && s && desktopLyrics.key !== key) desktopBeginSong(s);
+  if (desktopLyrics.enabled && s && desktopLyrics.key === key) {
+    desktopLyrics.status = desktopStatusFor(s);
+    desktopPush(true);
+  }
+  if (!s || s.source === "local") {
+    // 本地: 无平台歌词接口
     renderLyric([]);
+    if (desktopLyrics.enabled && s) desktopSetLines(s, [], "none");
+    return;
+  }
+  if (s.source === "bilibili") {
+    // B站视频: 官方/AI字幕优先, 无字幕时系统音频回环实时识别兜底
+    loadVideoSubtitle(s, seq);
+    return;
+  }
+  if (lyricCache.has(key)) {
+    const cached = lyricCache.get(key) || [];
+    if (seq !== lyricLoadSeq || curSong() !== s) return;
+    renderLyric(cached);
+    if (desktopLyrics.enabled) desktopSetLines(s, cached, cached.length ? "ready" : "empty");
     return;
   }
   inner.innerHTML = '<div class="lo-empty">歌词加载中…</div>';
@@ -2261,11 +2864,110 @@ async function loadLyrics(s) {
                 "&id=" + encodeURIComponent(s.id) +
                 "&extra=" + encodeURIComponent(JSON.stringify(s.extra || {}));
     const j = await (await fetch(url)).json();
-    if (curSong() !== s) return;  // 已切歌, 丢弃旧歌词
-    if (j.error) { renderLyric([]); return; }
-    renderLyric(parseLRC(j.lyric));
+    // 歌词请求是独立异步任务: 切歌后即使旧请求晚到也不能污染桌面窗口。
+    if (seq !== lyricLoadSeq || curSong() !== s) return;
+    const lines = j.error ? [] : parseLRC(j.lyric);
+    lyricCache.set(key, lines);
+    renderLyric(lines);
+    if (desktopLyrics.enabled) desktopSetLines(s, lines, lines.length ? "ready" : "empty");
   } catch (e) {
-    if (curSong() === s) renderLyric([]);
+    if (seq !== lyricLoadSeq || curSong() !== s) return;
+    lyricCache.set(key, []);
+    renderLyric([]);
+    if (desktopLyrics.enabled) desktopSetLines(s, [], "empty");
+  }
+}
+
+// ---------------- B站视频字幕: 仅官方/AI 字幕, 无字幕显示「无字幕」 ----------------
+const asr = { active: false, key: "", seq: 0, lines: [], partial: "", timer: null };
+
+// 服务端识别段带墙钟时间戳: 距识别 N 秒前的句子 ≈ 播放进度 currentTime - N
+function asrMapTime(segT) {
+  return Math.max(0, (audio.currentTime || 0) - Math.max(0, Date.now() / 1000 - segT));
+}
+function asrApply() {
+  const s = curSong();
+  if (!asr.active || !s || songKey(s) !== asr.key) return;
+  const lines = asr.lines.slice();
+  // 连续讲话时 Vosk 迟迟不定稿, 必须把 partial 作为当前行, 否则桌面歌词长期空白
+  if (asr.partial) lines.push({ t: Math.max(0, (audio.currentTime || 0) - 0.1), text: asr.partial });
+  lines.sort((a, b) => a.t - b.t);
+  if (desktopLyrics.enabled) desktopSetLines(s, lines, "ready");
+  if (lyricOpen) renderLyric(lines);
+}
+async function asrTick() {
+  const s = curSong();
+  if (!asr.active || !s || songKey(s) !== asr.key) return;
+  if (!desktopLyrics.enabled && !lyricOpen) { stopAsr(); return; }  // 无人消费即停
+  try {
+    const j = await api("/api/asr/poll?after=" + asr.seq);
+    if (!asr.active || curSong() !== s) return;
+    asr.seq = j.seq || asr.seq;
+    const newPartial = audio.paused ? "" : (j.partial || "");
+    let changed = newPartial !== asr.partial;
+    asr.partial = newPartial;
+    if (!audio.paused && (j.segments || []).length) {
+      for (const seg of j.segments) asr.lines.push({ t: asrMapTime(seg.t), text: seg.text });
+      if (asr.lines.length > 300) asr.lines = asr.lines.slice(-300);
+      changed = true;
+    }
+    if (changed) asrApply();
+    if (j.error) { stopAsr(); toast("实时识别失败: " + j.error, 3000); }
+    else if (j.running === false) { stopAsr(); }
+  } catch (e) {}
+}
+async function startAsr(s) {
+  stopAsr();
+  try {
+    const r = await fetch("/api/asr/start", { method: "POST",
+      headers: { "Content-Type": "application/json" }, body: "{}" });
+    const j = await r.json();
+    if (j.error) { toast("实时字幕不可用: " + j.error, 3200); return; }
+  } catch (e) { return; }
+  asr.active = true; asr.key = songKey(s); asr.seq = 0; asr.lines = [];
+  asr.timer = setInterval(asrTick, 1200);
+  toast("该视频无字幕, 已开启语音实时识别", 2600);
+}
+function stopAsr() {
+  if (asr.timer) { clearInterval(asr.timer); asr.timer = null; }
+  if (asr.active) {
+    asr.active = false;
+    fetch("/api/asr/stop", { method: "POST",
+      headers: { "Content-Type": "application/json" }, body: "{}" }).catch(() => {});
+  }
+  asr.lines = []; asr.seq = 0; asr.key = ""; asr.partial = "";
+}
+async function loadVideoSubtitle(s, seq) {
+  const key = songKey(s);
+  // 已放弃 ASR/系统实时字幕: 无官方字幕时只显示「无字幕」
+  stopAsr();
+  if (lyricCache.has(key)) {
+    const cached = lyricCache.get(key) || [];
+    if (seq !== lyricLoadSeq || curSong() !== s) return;
+    renderLyric(cached);
+    if (desktopLyrics.enabled) {
+      desktopSetLines(s, cached.length ? cached : [{ t: 0, text: "无字幕" }],
+                      cached.length ? "ready" : "empty");
+    }
+    return;
+  }
+  try {
+    const extra = s.extra || {};
+    const j = await api("/api/subtitle?source=bilibili&id=" + encodeURIComponent(s.id) +
+                        "&cid=" + encodeURIComponent(extra.cid || ""));
+    if (seq !== lyricLoadSeq || curSong() !== s || songKey(s) !== key) return;
+    const lines = (j.lines || []).filter((l) => l && l.text);
+    lyricCache.set(key, lines);
+    renderLyric(lines);
+    if (desktopLyrics.enabled) {
+      desktopSetLines(s, lines.length ? lines : [{ t: 0, text: "无字幕" }],
+                      lines.length ? "ready" : "empty");
+    }
+  } catch (e) {
+    if (seq !== lyricLoadSeq || curSong() !== s) return;
+    lyricCache.set(key, []);
+    renderLyric([]);
+    if (desktopLyrics.enabled) desktopSetLines(s, [{ t: 0, text: "无字幕" }], "empty");
   }
 }
 
@@ -3310,6 +4012,8 @@ function closeLyric() {
 $("pb-cover").addEventListener("click", () => {
   if (state.index >= 0) openLyric();
 });
+$("btn-desktop-lyrics").addEventListener("click", toggleDesktopLyrics);
+$("btn-desktop-unlock").addEventListener("click", toggleDesktopLyricsLock);
 $("lo-close").addEventListener("click", closeLyric);
 $("lo-prev").addEventListener("click", prev);
 $("lo-next").addEventListener("click", next);
@@ -3318,14 +4022,22 @@ $("lo-lyric").addEventListener("touchmove", () => { lyricUserScroll = Date.now()
 
 // ---------------- 启动 ----------------
 async function boot() {
+  // pywebview 注入原生 API 后恢复桌面歌词开关；普通浏览器会安全跳过。
+  desktopReadState();
+  if (window.desktopStateSyncTimer) clearInterval(window.desktopStateSyncTimer);
+  window.desktopStateSyncTimer = setInterval(desktopSyncState, 1000);
   // 加载本地设置(音量 + 播放进度); 响应迟到时不覆盖用户已修改的设置
   try {
     const st = await api("/api/settings");
+    bootSettings = JSON.parse(JSON.stringify(st));
     if (st && !userTouchedSettings) {
       if (typeof st.volume === "number") settings.volume = Math.min(Math.max(st.volume, 0), 1);
       if (st.pos && st.pos.key) settings.pos = st.pos;
       if (typeof st.rate === "number" && st.rate >= 0.5 && st.rate <= 2) settings.rate = st.rate;
       if (typeof st.qn === "number" && st.qn >= 16) biliQn = st.qn;
+      if (st.proxy && typeof st.proxy === "object") settings.proxy = Object.assign({}, DEFAULT_PROXY, st.proxy);
+      if (st.font && typeof st.font === "object") settings.font = Object.assign({}, DEFAULT_FONT, st.font);
+      applyFontSettings();
       audio.volume = settings.volume;
       audio.playbackRate = settings.rate || 1;
       $("lo-speed").value = String(settings.rate || 1);
@@ -3363,8 +4075,22 @@ async function boot() {
         } else if (s.duration) {
           $("t-dur").textContent = fmt(s.duration);
         }
+        if (desktopLyrics.enabled) {
+          desktopLyrics.key = "";
+          desktopBeginSong(s);
+          loadLyrics(s);
+        }
       }
     }
   } catch (e) {}
 }
+window.addEventListener("pywebviewready", desktopReadState);
 boot();
+
+// ---------------- 退出/切后台前统一 flush (新增路径, 绕过防抖等待) ----------------
+// pagehide: 卸载阶段用 keepalive fetch 发出尚未保存的队列/设置; 不用同步 XHR(Chromium 卸载阶段已禁用)
+window.addEventListener("pagehide", flushPendingSaves);
+// 切到后台(visibilityState=hidden)时同样立即 flush, 避免防抖窗口内的修改因页面挂起而丢失
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "hidden") flushPendingSaves();
+});

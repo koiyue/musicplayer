@@ -15,7 +15,9 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from sources import netease, qq, migu, bilibili
+from sources import common
 from sources.common import UA
+import asr
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 WEB_DIR = os.path.join(BASE_DIR, "web")
@@ -58,6 +60,16 @@ STATIC_TYPES = {
     ".ico": "image/x-icon",
     ".woff2": "font/woff2",
 }
+
+
+# ---------- 统一歌曲身份 ----------
+def _song_identity(source, sid, extra):
+    """歌曲唯一身份键. 必须与前端 JSON.stringify 口径一致:
+    紧凑分隔符(默认分隔符是 ", " / ": ", 不显式指定就对不上)、非 ASCII 原样、键递归排序;
+    %s 渲染 sid 等价于前端 String(id)(整数不带引号)."""
+    return "%s:%s:%s" % (source, sid,
+                         json.dumps(extra or {}, sort_keys=True, ensure_ascii=False,
+                                    separators=(",", ":")))
 
 
 def _load_queue():
@@ -113,6 +125,188 @@ def _save_pls(obj):
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(obj, f, ensure_ascii=False)
     os.replace(tmp, PLAYLISTS_FILE)
+
+
+# ---------- 写接口业务校验 ----------
+_QUEUE_SOURCES = ("netease", "qq", "migu", "bilibili", "local")
+_MAX_QUEUE_SONGS = 2000
+_MAX_SONG_ID_LEN = 300
+_MAX_PL_NAME_LEN = 120
+
+
+def _is_number(v):
+    """int/float 且排除 bool(Python 里 isinstance(True, int) 为 True)."""
+    return isinstance(v, (int, float)) and not isinstance(v, bool)
+
+
+def _validate_queue(obj):
+    """校验 POST /api/queue 请求体. 合法返回 None, 非法返回 "<字段>:<原因码>".
+    只做校验、不改数据; 未知字段(如 vip)原样保留, 不做白名单裁剪."""
+    songs = obj.get("songs")
+    if not isinstance(songs, list):
+        return "songs:songs_not_array"
+    if len(songs) > _MAX_QUEUE_SONGS:
+        return "songs:songs_too_many"
+    for i, s in enumerate(songs):
+        if not isinstance(s, dict):
+            return "song[%d]:song_not_object" % i
+        src = s.get("source")
+        if not isinstance(src, str) or src not in _QUEUE_SOURCES:
+            return "song[%d].source:song_source" % i
+        sid = s.get("id")
+        if isinstance(sid, bool) or not isinstance(sid, (str, int)):
+            return "song[%d].id:song_id" % i
+        sid = str(sid)
+        if not sid or len(sid) > _MAX_SONG_ID_LEN:
+            return "song[%d].id:song_id" % i
+        if "extra" in s and s["extra"] is not None:
+            ex = s["extra"]
+            if isinstance(ex, bool) or not isinstance(ex, dict):
+                return "song[%d].extra:song_extra" % i
+        for k in ("title", "artist", "cover"):
+            if k in s and not isinstance(s[k], str):
+                return "song[%d].%s:song_field_type" % (i, k)
+        if "duration" in s:
+            d = s["duration"]
+            if not _is_number(d) or d < 0:
+                return "song[%d].duration:song_field_type" % i
+        if "file" in s:
+            f = s["file"]
+            if not isinstance(f, str):
+                return "song[%d].file:song_field_type" % i
+            # 与 _local_file 的 basename 口径一致, 拒绝路径穿越
+            if os.path.basename(f) != f:
+                return "song[%d].file:song_file_path" % i
+    idx = obj.get("index", -1)
+    if isinstance(idx, bool) or not isinstance(idx, int):
+        return "index:index_type"
+    if not songs:
+        if idx != -1:
+            return "index:index_on_empty_queue" if idx > -1 else "index:index_range"
+    if idx < -1 or idx > len(songs) - 1:
+        return "index:index_range"
+    return None
+
+
+FONT_FAMILIES = ("Microsoft YaHei", "Microsoft YaHei UI", "SimHei", "SimSun",
+                 "KaiTi", "DengXian", "PingFang SC", "Segoe UI", "Arial", "Consolas")
+
+
+def _validate_proxy(v):
+    """代理配置: 只接受 http/https 代理地址(本机回环不受代理影响)."""
+    if not isinstance(v, dict):
+        return "proxy:proxy_shape"
+    if v.get("mode") not in ("system", "none", "custom"):
+        return "proxy:proxy_mode"
+    for key in ("http", "https"):
+        s = v.get(key, "")
+        if s is None:
+            s = ""
+        if not isinstance(s, str) or len(s) > 300:
+            return "proxy:%s_length" % key
+        s = s.strip()
+        if s:
+            u = urllib.parse.urlparse(s)
+            if u.scheme not in ("http", "https") or not u.hostname or " " in s:
+                return "proxy:%s_url" % key
+    if v.get("mode") == "custom" and not (v.get("http") or "").strip():
+        return "proxy:proxy_missing"
+    return None
+
+
+def _validate_font(v):
+    if not isinstance(v, dict):
+        return "font:font_shape"
+    for key in ("ui_family", "lyrics_family"):
+        s = v.get(key)
+        if not isinstance(s, str) or not s.strip() or len(s.strip()) > 60:
+            return "font:%s_length" % key
+        if any(c in s for c in "\"'{};<>\\\n\r"):
+            return "font:%s_chars" % key
+        if key == "lyrics_family" and len(s.strip()) >= 32:  # LOGFONT.lfFaceName
+            return "font:%s_length" % key
+    scale = v.get("ui_scale")
+    if not _is_number(scale) or not 0.8 <= scale <= 1.5:
+        return "font:ui_scale_range"
+    size = v.get("lyrics_size")
+    if isinstance(size, bool) or not isinstance(size, int) or not 16 <= size <= 72:
+        return "font:lyrics_size_range"
+    return None
+
+
+def _validate_settings(obj):
+    """校验 POST /api/settings 请求体(JSON 对象已由 _json_body 保证).
+    合法返回 None, 非法返回 "<字段>:<原因码>"; 未知字段原样保留."""
+    if "proxy" in obj:
+        err = _validate_proxy(obj["proxy"])
+        if err:
+            return err
+    if "font" in obj:
+        err = _validate_font(obj["font"])
+        if err:
+            return err
+    if "volume" in obj:
+        v = obj["volume"]
+        if not _is_number(v):
+            return "volume:volume_type"
+        if not 0 <= v <= 1:
+            return "volume:volume_range"
+    if "rate" in obj:
+        v = obj["rate"]
+        if not _is_number(v):
+            return "rate:rate_type"
+        if not 0.5 <= v <= 2:
+            return "rate:rate_range"
+    if "qn" in obj:
+        v = obj["qn"]
+        if isinstance(v, bool) or not isinstance(v, int):
+            return "qn:qn_type"
+        if v < 16:
+            return "qn:qn_range"
+    if "pos" in obj and obj["pos"] is not None:
+        p = obj["pos"]
+        if not isinstance(p, dict):
+            return "pos:pos_shape"
+        if "key" in p:
+            k = p["key"]
+            if not isinstance(k, str) or not k:
+                return "pos:pos_key"
+        if "time" in p:
+            t = p["time"]
+            if not _is_number(t) or t < 0:
+                return "pos:pos_time"
+    return None
+
+
+def _validate_pl_name(raw):
+    """歌单名: 非 str(且非 None) = 类型违规(HTTP 400); str 但空白 = 既有业务错误(200), 保持不变.
+    返回 (name, http_status, error); http_status 为 None 表示合法."""
+    if raw is None:
+        return "", None, None
+    if not isinstance(raw, str):
+        return None, 400, "name:name_type"
+    name = raw.strip()
+    if not name:
+        return "", None, None
+    if len(name) > _MAX_PL_NAME_LEN:
+        return None, 400, "name:name_type"
+    return name, None, None
+
+
+def _pl_id_ok(raw):
+    """歌单 id: 缺失保持既有语义(查不到歌单), 传了非 str 则类型违规."""
+    return raw is None or isinstance(raw, str)
+
+
+def _validate_icon(raw):
+    """seticon 的 icon: 缺失/None 视为清空; 非空必须是 http:/https:/data:image/ 开头."""
+    if raw is None:
+        return "", None, None
+    if not isinstance(raw, str):
+        return None, 400, "icon:icon_type"
+    if raw and not raw.startswith(("http:", "https:", "data:image/")):
+        return None, 400, "icon:icon_type"
+    return raw, None, None
 
 
 # ---------- 下载管理器 ----------
@@ -397,8 +591,7 @@ def _dl_fetch(t):
 
 
 def _dl_enqueue(song):
-    tid = "%s:%s:%s" % (song.get("source"), song.get("id"),
-                        json.dumps(song.get("extra") or {}, sort_keys=True, ensure_ascii=False))
+    tid = _song_identity(song.get("source"), song.get("id"), song.get("extra"))
     with _dl_lock:
         exist = _dl_state.get(tid)
         if exist and exist.get("status") in ("pending", "downloading"):
@@ -621,6 +814,9 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(403, {"error": "forbidden"})
         if path == "/api/sources":
             return self._send(200, {"sources": list(SRC.keys())})
+        if path == "/api/fonts":
+            return self._send(200, {"families": list(FONT_FAMILIES),
+                                    "lyrics_min": 16, "lyrics_max": 72})
         if path == "/api/search":
             return self._search(g)
         if path == "/api/playlist":
@@ -631,6 +827,10 @@ class Handler(BaseHTTPRequestHandler):
             return self._stream_api(g)
         if path == "/api/lyrics":
             return self._lyrics_api(g)
+        if path == "/api/subtitle":
+            return self._subtitle_api(g)
+        if path == "/api/asr/poll":
+            return self._send(200, asr.poll(g("after")))
         if path == "/api/queue":
             with _queue_lock:
                 return self._send(200, _load_queue())
@@ -769,15 +969,31 @@ class Handler(BaseHTTPRequestHandler):
         path = parsed.path
         if not self._authorized(urllib.parse.parse_qs(parsed.query)):
             return self._send(403, {"error": "forbidden"})
+        # ASR 控制接口无请求体, 放在 JSON 体校验之前
+        if path == "/api/asr/start":
+            return self._send(200, asr.start())
+        if path == "/api/asr/stop":
+            return self._send(200, asr.stop())
         body = self._json_body()
         if body is None:
             return self._send(400, {"error": "请求体无效或过大"})
         if path == "/api/queue":
+            err = _validate_queue(body)
+            if err:
+                return self._send(400, {"error": "队列数据无效: " + err})
             with _queue_lock:
                 _save_queue(body)
             return self._send(200, {"ok": True})
         if path == "/api/settings":
+            err = _validate_settings(body)
+            if err:
+                return self._send(400, {"error": "设置数据无效: " + err})
             _save_settings(body)
+            if "proxy" in body:
+                try:
+                    common.configure_proxy(body["proxy"])
+                except Exception as e:
+                    return self._send(400, {"error": "代理配置失败: %s" % e})
             return self._send(200, {"ok": True})
         if path == "/api/netease/manual":
             return self._send(200, netease.manual_cookie(body.get("cookie", "")))
@@ -917,11 +1133,24 @@ class Handler(BaseHTTPRequestHandler):
     # ---------- 本地歌单 ----------
     def _local_pl_action(self, action, body):
         import time as _t
+        # 类型违规一律在任何读写盘之前返回 HTTP 400; 业务错误仍保持既有 200 + {"error": ...} 约定
+        if action in ("create", "rename"):
+            name, code, err = _validate_pl_name(body.get("name"))
+            if code:
+                return self._send(code, {"error": "歌单参数无效: " + err})
+        if action in ("delete", "rename", "seticon", "add", "remove"):
+            if not _pl_id_ok(body.get("id")):
+                return self._send(400, {"error": "歌单参数无效: id:id_type"})
+        if action == "seticon":
+            icon, code, err = _validate_icon(body.get("icon"))
+            if code:
+                return self._send(code, {"error": "歌单参数无效: " + err})
+        if action in ("add", "remove") and "song" in body and not isinstance(body["song"], dict):
+            return self._send(400, {"error": "歌单参数无效: song:song_not_object"})
         with _pl_lock:
             d = _load_pls()
             lists = d["lists"]
             if action == "create":
-                name = (body.get("name") or "").strip()
                 if not name:
                     return self._send(200, {"error": "歌单名不能为空"})
                 pid = "pl%d" % int(_t.time() * 1000)
@@ -934,7 +1163,7 @@ class Handler(BaseHTTPRequestHandler):
                 _save_pls(d)
                 return self._send(200, {"ok": True})
             if action == "rename":
-                pid, name = body.get("id"), (body.get("name") or "").strip()
+                pid = body.get("id")
                 pl = next((l for l in lists if l.get("id") == pid), None)
                 if not pl or not name:
                     return self._send(200, {"error": "参数无效"})
@@ -942,7 +1171,7 @@ class Handler(BaseHTTPRequestHandler):
                 _save_pls(d)
                 return self._send(200, {"ok": True})
             if action == "seticon":
-                pid, icon = body.get("id"), (body.get("icon") or "")
+                pid = body.get("id")
                 pl = next((l for l in lists if l.get("id") == pid), None)
                 if not pl:
                     return self._send(200, {"error": "歌单不存在"})
@@ -956,9 +1185,10 @@ class Handler(BaseHTTPRequestHandler):
                 if not pl:
                     return self._send(200, {"error": "歌单不存在"})
 
+                # 与 /api/dl 的任务身份键共用 _song_identity: 键序无关、中文值不再因
+                # ensure_ascii 差异而分裂
                 def key(x):
-                    return (x.get("source"), str(x.get("id")),
-                            json.dumps(x.get("extra") or {}, sort_keys=True))
+                    return _song_identity(x.get("source"), x.get("id"), x.get("extra"))
                 k = key(s)
                 songs = pl.setdefault("songs", [])
                 if action == "add":
@@ -983,15 +1213,25 @@ class Handler(BaseHTTPRequestHandler):
         rng = self.headers.get("Range")
         start, end = 0, size - 1
         code = 200
+        unsatisfiable = False
         if rng:
-            m = re.match(r"bytes=(\d*)-(\d*)", rng)
-            if m:
+            # 只接受"单区间 bytes"范围头(单位大小写敏感, 保持现状); 语法非法/未知单位/多区间
+            # 按 RFC 属于不可解析的 Range -> 忽略并返回 200 全文, 不是 416.
+            m = re.match(r"^bytes=(\d*)-(\d*)$", rng)
+            if m and (m.group(1) or m.group(2)):
                 if m.group(1):
                     start = int(m.group(1))
-                if m.group(2):
-                    end = min(int(m.group(2)), size - 1)
+                    end = min(int(m.group(2)), size - 1) if m.group(2) else size - 1
+                else:
+                    # 后缀区间 bytes=-N: 取末尾 N 字节; bytes=-0 不可满足
+                    suffix = int(m.group(2))
+                    if suffix <= 0:
+                        unsatisfiable = True
+                    else:
+                        start = max(0, size - suffix)
+                        end = size - 1
                 code = 206
-        if start > end or start >= size:
+        if unsatisfiable or start > end or start >= size:
             self.send_response(416)
             self.send_header("Content-Range", "bytes */%d" % size)
             self.end_headers()
@@ -1038,6 +1278,16 @@ class Handler(BaseHTTPRequestHandler):
         try:
             s = {"id": g("id"), "extra": json.loads(g("extra", "{}") or "{}")}
             return self._send(200, src.get_lyrics(s))
+        except Exception as e:
+            return self._send(200, {"error": str(e)})
+
+    def _subtitle_api(self, g):
+        """视频字幕(B站官方/AI 字幕): {"lines":[{t,text}], ai} 或 {"error": str}."""
+        src = SRC.get(g("source"))
+        if not src or not hasattr(src, "get_subtitles"):
+            return self._send(200, {"error": "该音源暂不支持字幕"})
+        try:
+            return self._send(200, src.get_subtitles(g("id"), g("cid") or None))
         except Exception as e:
             return self._send(200, {"error": str(e)})
 
@@ -1136,6 +1386,7 @@ def free_port(preferred=8787):
 
 def serve(port):
     os.makedirs(DATA_DIR, exist_ok=True)
+    common.configure_proxy(_load_settings().get("proxy"))
     _dl_restore()
     httpd = ThreadingHTTPServer(("127.0.0.1", port), Handler)
     t = threading.Thread(target=httpd.serve_forever, daemon=True)
