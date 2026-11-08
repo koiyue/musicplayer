@@ -181,7 +181,7 @@ def http_get(url, headers=None, timeout=12, raw=False, attempts=2, budget=None):
         return _fail_result(err, n)
     if raw:
         return payload
-    text = payload.decode("utf-8", "replace")
+    text = payload.decode("utf-8", "replace").lstrip()
     # 部分接口用 jsonp 包裹, 自动剥离
     if text and text[0] not in "{[":
         s, e = text.find("("), text.rfind(")")

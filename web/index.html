@@ -22,6 +22,12 @@
     </button>
   </div>
 </div>
+<!-- 程序皮肤背景(图片/GIF/视频) -->
+<div id="skin-bg" aria-hidden="true">
+  <img id="skin-bg-image" alt="">
+  <video id="skin-bg-video" muted autoplay loop playsinline></video>
+  <div class="skin-bg-shade"></div>
+</div>
 <div id="app">
   <!-- 左栏: 音源 + 我的 -->
   <aside id="sidebar">
@@ -37,6 +43,7 @@
       <button class="mine-btn" id="btn-mylists">我的歌单</button>
       <button class="mine-btn" id="btn-queue">播放列表</button>
       <button class="mine-btn" id="btn-downloads">下载管理</button>
+      <button class="mine-btn" id="btn-room">一起听</button>
       <button class="mine-btn" id="btn-settings">设置</button>
     </nav>
     <div class="sidebar-foot">
@@ -61,6 +68,7 @@
     <div id="crumb" class="crumb hidden"></div>
     <div id="content" class="content scroll-y">
       <div id="list" class="song-list"></div>
+      <input type="hidden" id="home-data" value="{}">
       <div id="empty" class="empty">
         <div class="empty-ic src-logo-lg"><img src="/web/img/netease.png" alt="网易云音乐"></div>
       </div>
@@ -310,6 +318,29 @@
       <div class="set-preview" id="set-preview">MusicHub 字体预览 · 音乐让生活更美好</div>
     </div>
 
+    <div class="set-group">
+      <h4>程序皮肤</h4>
+      <div class="set-row">
+        <label for="set-skin-fit">显示方式</label>
+        <select id="set-skin-fit">
+          <option value="fill">拉伸（铺满）</option>
+          <option value="contain">填充（完整显示）</option>
+          <option value="cover">覆盖（等比裁剪）</option>
+        </select>
+      </div>
+      <div class="skin-picker">
+        <div class="skin-preview" id="set-skin-preview">
+          <span class="skin-preview-empty">未选择皮肤</span>
+        </div>
+        <div class="skin-picker-actions">
+          <label class="go-btn ghost skin-file-btn" for="set-skin-file">选择图片 / 动图 / 视频</label>
+          <input id="set-skin-file" type="file" accept="image/*,video/*" class="hidden">
+          <button class="go-btn ghost" id="set-skin-clear" type="button">清除皮肤</button>
+        </div>
+        <p class="set-hint skin-file-name" id="set-skin-file-name">支持 JPG、PNG、GIF、WebP、MP4、WebM，单个文件不超过 200 MB。</p>
+      </div>
+    </div>
+
     <div class="set-msg" id="set-msg"></div>
     <div class="set-actions">
       <button class="go-btn ghost" id="settings-reset">恢复默认</button>
@@ -340,6 +371,8 @@
   <div class="lo-body">
     <div class="lo-video hidden" id="lo-video">
       <video id="lo-video-el" muted playsinline></video>
+      <video id="room-remote-video" class="room-remote-video hidden" autoplay playsinline></video>
+      <canvas id="room-capture-canvas" class="room-capture-only" width="640" height="360"></canvas>
       <div class="lo-danmaku" id="lo-danmaku"></div>
       <div class="lo-gesture" id="lo-g-left"></div>
       <div class="lo-gesture right" id="lo-g-right"></div>
@@ -368,6 +401,7 @@
             <button class="vc-toggle on" id="v-danmaku" title="弹幕显示模式"><svg viewBox="0 0 24 24"><rect x="2.5" y="4.5" width="19" height="15" rx="3.5" fill="none" stroke="currentColor" stroke-width="1.8"/><text x="12" y="16" text-anchor="middle" font-size="10" font-weight="700" fill="currentColor">弹</text></svg></button>
             <select class="lo-speed" id="lo-speed" title="倍速播放"><option value="0.5">0.5x</option><option value="0.75">0.75x</option><option value="1" selected>1x</option><option value="1.25">1.25x</option><option value="1.5">1.5x</option><option value="2">2x</option></select>
             <select class="lo-quality hidden" id="lo-quality" title="视频清晰度"></select>
+            <select class="lo-quality hidden" id="lo-part" title="视频分P"></select>
             <div class="lo-ctl" id="lo-ctl"></div>
             <button id="lo-fs-btn" title="全屏"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M8 3H5a2 2 0 0 0-2 2v3M16 3h3a2 2 0 0 1 2 2v3M8 21H5a2 2 0 0 1-2-2v-3M16 21h3a2 2 0 0 0 2-2v-3"/></svg></button>
           </div>
@@ -399,6 +433,61 @@
 </div>
 
 <audio id="audio" preload="auto"></audio>
+<audio id="room-fallback-audio" preload="auto"></audio>
+
+<!-- P2P 一起听 -->
+<div id="room-panel" class="modal hidden">
+  <div class="modal-box room-box">
+    <button class="modal-close" id="room-close" title="关闭">✕</button>
+    <h3>P2P 一起听</h3>
+    <div id="room-landing">
+      <p class="set-hint">优先 WebRTC 音视频直连；失败后自动使用房主自动开放的 LAN HTTP 回退。邀请码包含短期房间凭据，请勿公开分享。</p>
+      <div class="set-row">
+        <label for="room-nick">昵称</label>
+        <input id="room-nick" type="text" maxlength="20" placeholder="房主 / 成员">
+      </div>
+      <div class="set-actions">
+        <button class="go-btn" id="room-create">创建房间</button>
+        <button class="go-btn ghost" id="room-show-join">加入房间</button>
+      </div>
+    </div>
+
+    <div id="room-host" class="hidden">
+      <div class="room-status" id="room-host-status"></div>
+      <div class="room-slots" id="room-slots"></div>
+      <div class="room-chat" id="room-chat"></div>
+      <div class="room-chat-input">
+        <input id="room-chat-text" type="text" maxlength="200" placeholder="发消息给房间成员">
+        <button class="go-btn" id="room-chat-send">发送</button>
+      </div>
+      <div class="set-actions">
+        <button class="go-btn ghost" id="room-retry">重试 WebRTC</button>
+        <button class="go-btn ghost" id="room-leave">离开房间</button>
+      </div>
+    </div>
+
+    <div id="room-join" class="hidden">
+      <p class="set-hint">粘贴房主生成的邀请码，生成应答码后发回房主。</p>
+      <textarea id="room-invite" class="room-code" spellcheck="false" placeholder="粘贴 MH1. 开头的邀请码"></textarea>
+      <div class="set-actions">
+        <button class="go-btn" id="room-join-go">生成应答码</button>
+        <button class="go-btn ghost" id="room-copy-answer">复制应答码</button>
+      </div>
+      <textarea id="room-answer" class="room-code" spellcheck="false" readonly placeholder="生成的应答码"></textarea>
+      <div class="set-actions">
+        <button class="go-btn ghost" id="room-member-leave">离开房间</button>
+      </div>
+      <div class="room-chat" id="room-member-chat"></div>
+      <div class="room-chat-input">
+        <input id="room-member-chat-text" type="text" maxlength="200" placeholder="发消息给房间成员">
+        <button class="go-btn" id="room-member-chat-send">发送</button>
+      </div>
+    </div>
+  </div>
+</div>
+
 <script src="/web/app.js"></script>
+<script src="/web/listen.js"></script>
+<script src="/web/listen_ui.js"></script>
 </body>
 </html>

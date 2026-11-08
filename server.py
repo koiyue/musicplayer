@@ -1,7 +1,11 @@
 # -*- coding: utf-8 -*-
 """本地 HTTP 服务: 标准库 http.server, 提供 /api/* 音源接口 + /proxy 音频代理 + 静态前端."""
+import base64
+import copy
 import hashlib
 import hmac
+import inspect
+import ipaddress
 import json
 import os
 import re
@@ -22,6 +26,7 @@ import asr
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 WEB_DIR = os.path.join(BASE_DIR, "web")
 DATA_DIR = os.path.join(BASE_DIR, "data")
+SKIN_DIR = os.path.join(DATA_DIR, "skins")
 QUEUE_FILE = os.path.join(DATA_DIR, "queue.json")
 SETTINGS_FILE = os.path.join(DATA_DIR, "settings.json")
 PLAYLISTS_FILE = os.path.join(DATA_DIR, "playlists.json")
@@ -31,12 +36,22 @@ DL_TASKS_FILE = os.path.join(DL_DIR, "tasks.json")
 AUDIO_EXTS = (".mp3", ".m4a", ".flac", ".ogg", ".aac", ".wav")
 AUDIO_TYPES = {".mp3": "audio/mpeg", ".m4a": "audio/mp4", ".flac": "audio/flac",
                ".ogg": "audio/ogg", ".aac": "audio/aac", ".wav": "audio/wav"}
+SKIN_TYPES = {
+    ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+    ".gif": "image/gif", ".webp": "image/webp", ".bmp": "image/bmp",
+    ".apng": "image/apng", ".svg": "image/svg+xml", ".ico": "image/x-icon",
+    ".avif": "image/avif", ".mp4": "video/mp4", ".webm": "video/webm",
+    ".ogg": "video/ogg", ".mov": "video/quicktime", ".m4v": "video/mp4",
+}
+SKIN_MAX = 256 * 1024 * 1024
 
 # 本地 API 访问令牌: 每次启动随机生成, 注入到 index.html, 前端经请求头/查询参数带回.
 # 跨域网页拿不到该令牌(服务不再返回 CORS 头), 无法调用本地 API.
 TOKEN = secrets.token_urlsafe(24)
 # 图片代理白名单(B站封面防盗链); 只允许这些域名及其子域
-IMG_HOSTS = ("hdslb.com", "biliimg.com", "bilibili.com")
+IMG_HOSTS = ("hdslb.com", "biliimg.com", "bilibili.com",
+             "music.126.net", "p1.music.126.net", "p2.music.126.net",
+             "gtimg.cn", "y.gtimg.cn", "qpic.cn", "y.qq.com")
 IMG_MAX = 10 * 1024 * 1024
 
 SRC = {
@@ -234,6 +249,62 @@ def _validate_font(v):
     return None
 
 
+def _validate_skin(v):
+    """校验皮肤元数据；媒体本体通过 /api/skin 原始二进制接口上传。"""
+    if not isinstance(v, dict):
+        return "skin:skin_shape"
+    if "enabled" in v and not isinstance(v.get("enabled"), bool):
+        return "skin:skin_enabled"
+    typ = v.get("type", "")
+    if typ not in ("", "image", "video"):
+        return "skin:skin_type"
+    fit = v.get("fit", "cover")
+    if fit not in ("fill", "contain", "cover"):
+        return "skin:skin_fit"
+    name = v.get("name", "")
+    if not isinstance(name, str) or len(name) > 180:
+        return "skin:skin_name"
+    data = v.get("data", "")
+    if not isinstance(data, str) or len(data) > 512:
+        # 旧版 Data URL 仍允许在 16MB JSON 上限内使用，避免拒绝升级前的设置。
+        if not (isinstance(data, str) and len(data) <= 16 * 1024 * 1024):
+            return "skin:skin_data"
+    if data:
+        if data.startswith("/skin"):
+            parsed = None
+            try:
+                parsed = urllib.parse.urlparse(data)
+                stored = (urllib.parse.parse_qs(parsed.query).get("name") or [""])[0]
+            except Exception:
+                stored = ""
+            if (not parsed or parsed.scheme or parsed.netloc or parsed.fragment or
+                    parsed.path != "/skin" or
+                    not stored or
+                    os.path.basename(stored) != stored):
+                return "skin:skin_path"
+        elif not re.match(r"^data:(?:image|video)/[a-z0-9.+-]+(?:;[^,]*)?,", data, re.I):
+            return "skin:skin_data"
+    url = v.get("url", "")
+    if not isinstance(url, str) or len(url) > 512:
+        return "skin:skin_url"
+    if url:
+        try:
+            parsed_url = urllib.parse.urlparse(url)
+            stored = (urllib.parse.parse_qs(parsed_url.query).get("name") or [""])[0]
+        except Exception:
+            stored = ""
+            parsed_url = None
+        if (not parsed_url or parsed_url.scheme or parsed_url.netloc or
+                parsed_url.fragment or
+                parsed_url.path != "/skin" or
+                os.path.basename(stored) != stored or not stored):
+            return "skin:skin_url"
+    size = v.get("size", 0)
+    if isinstance(size, bool) or not isinstance(size, (int, float)) or size < 0 or size > SKIN_MAX:
+        return "skin:skin_size"
+    return None
+
+
 def _validate_settings(obj):
     """校验 POST /api/settings 请求体(JSON 对象已由 _json_body 保证).
     合法返回 None, 非法返回 "<字段>:<原因码>"; 未知字段原样保留."""
@@ -243,6 +314,10 @@ def _validate_settings(obj):
             return err
     if "font" in obj:
         err = _validate_font(obj["font"])
+        if err:
+            return err
+    if "skin" in obj:
+        err = _validate_skin(obj["skin"])
         if err:
             return err
     if "volume" in obj:
@@ -724,6 +799,850 @@ def _dl_clear_finished():
         _dl_persist()
 
 
+# ---------- P2P 一起听: 权威房间状态 + 独立 LAN 监听 ----------
+ROOM_MAX_MEMBERS = 3
+ROOM_PORT_FIRST = 8797
+ROOM_PORT_LAST = 8806
+ROOM_GRANT_TTL = 600
+ROOM_FIREWALL_HINT = ("若局域网设备无法连接，请在 Windows 防火墙中允许 Python 的专用网络入站连接，"
+                      "或临时关闭防火墙；本程序不会自动修改防火墙规则。")
+_ROOM_PROPOSAL_RE = re.compile(r"^[A-Za-z0-9_.-]{1,32}$")
+_ROOM_RFC1918 = tuple(ipaddress.ip_network(x) for x in
+                      ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"))
+
+_room_cond = threading.Condition(threading.RLock())
+_room_state = None
+_room_stopping = []
+
+
+class RoomState:
+    def __init__(self, epoch=1):
+        self.room_id = secrets.token_urlsafe(12)
+        self.host_id = secrets.token_urlsafe(9)
+        self.epoch = epoch
+        self.room_secret = secrets.token_bytes(32)
+        self.max_members = ROOM_MAX_MEMBERS
+        self.seq = 0
+        self.rev = 0
+        self.generation = 0
+        self.transport = "http"
+        self.state = {}
+        self.members = []
+        self.chat_tail = []
+        self.events = []
+        self.proposals = []
+        self.proposal_seq = 0
+        self.nonces = {}
+        self.revoked_nonces = set()
+        self.used_ops = {}
+        self.rate = {}
+        self.slots = []
+        self.lan_ips = []
+        self.lan_available = False
+        self.firewall_hint = ROOM_FIREWALL_HINT
+        self.room_port = 0
+        self.bound_ips = ["127.0.0.1"]
+        self.servers = []
+        self.fallback_urls = []
+        self.loopback_url = ""
+        self.start_error = ""
+
+
+def _room_refresh_slot(room, slot):
+    """签发短期 HMAC grant; nonce 为一次性凭据, 轮换/重置后旧凭据立即撤销."""
+    old = slot.get("nonce")
+    if old:
+        room.revoked_nonces.add(old)
+        room.nonces.pop(old, None)
+    nonce = secrets.token_urlsafe(12)
+    exp = int(time.time()) + ROOM_GRANT_TTL
+    payload = {"room_id": room.room_id, "member_id": slot["member_id"],
+               "epoch": room.epoch, "scope": "member", "exp": exp,
+               "nonce": nonce, "slot": slot["slot"]}
+    raw = json.dumps(payload, sort_keys=True, separators=(",", ":"),
+                     ensure_ascii=False).encode("utf-8")
+    b64 = base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
+    sig = base64.urlsafe_b64encode(
+        hmac.new(room.room_secret, b64.encode("ascii"), hashlib.sha256).digest()
+    ).rstrip(b"=").decode("ascii")
+    slot["grant"] = b64 + "." + sig
+    slot["exp"] = exp
+    slot["nonce"] = nonce
+    room.nonces[nonce] = {"exp": exp, "member_id": slot["member_id"],
+                          "epoch": room.epoch}
+
+
+def _room_new_slots(room):
+    room.slots = []
+    for i in range(1, ROOM_MAX_MEMBERS + 1):
+        slot = {"slot": i, "member_id": secrets.token_urlsafe(9),
+                "grant": "", "exp": 0, "nonce": ""}
+        room.slots.append(slot)
+        _room_refresh_slot(room, slot)
+
+
+class _RoomServer(ThreadingHTTPServer):
+    allow_reuse_address = False
+    daemon_threads = True
+
+    def __init__(self, addr, bound_ips):
+        self.room_bound_ips = tuple(bound_ips)
+        super().__init__(addr, RoomHandler)
+
+
+def _room_lan_ips():
+    """默认路由探测 + 主机名解析, 排除无效地址, RFC1918 优先, 最多 3 个."""
+    found = []
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            s.connect(("223.5.5.5", 80))
+            found.append(s.getsockname()[0])
+        finally:
+            s.close()
+    except Exception:
+        pass
+    try:
+        for info in socket.getaddrinfo(socket.gethostname(), None,
+                                       socket.AF_INET, socket.SOCK_DGRAM):
+            ip = info[4][0]
+            if ip not in found:
+                found.append(ip)
+    except Exception:
+        pass
+    out = []
+    for ip in found:
+        try:
+            a = ipaddress.IPv4Address(ip)
+        except Exception:
+            continue
+        if (a.is_loopback or a.is_link_local or a.is_reserved or
+                a.is_multicast or a.is_unspecified or ip in out):
+            continue
+        out.append(ip)
+    out.sort(key=lambda ip: 0 if any(ipaddress.IPv4Address(ip) in n
+                                     for n in _ROOM_RFC1918) else 1)
+    usable = []
+    for ip in out[:3]:
+        try:
+            t = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            try:
+                t.bind((ip, 0))
+            finally:
+                t.close()
+            usable.append(ip)
+        except OSError:
+            continue
+    return usable[:3]
+
+
+def _room_stop_servers(servers, port):
+    """后台 shutdown + server_close, 不阻塞请求线程."""
+    if not servers:
+        return
+    ev = threading.Event()
+    with _room_cond:
+        _room_stopping.append({"port": port, "event": ev})
+
+    def _run():
+        for httpd, _ in servers:
+            try:
+                httpd.shutdown()
+            except Exception:
+                pass
+            try:
+                httpd.server_close()
+            except Exception:
+                pass
+        ev.set()
+        with _room_cond:
+            for d in list(_room_stopping):
+                if d["event"] is ev:
+                    _room_stopping.remove(d)
+
+    threading.Thread(target=_run, daemon=True).start()
+
+
+def _room_start_locked(room):
+    lan = _room_lan_ips()
+    room.lan_ips = lan
+    room.lan_available = bool(lan)
+    ips = ["127.0.0.1"] + [ip for ip in lan if ip != "127.0.0.1"]
+    busy = {d["port"] for d in _room_stopping if not d["event"].is_set()}
+    servers = []
+    chosen = 0
+    last = None
+    for port in range(ROOM_PORT_FIRST, ROOM_PORT_LAST + 1):
+        if port in busy:
+            continue
+        try:
+            for ip in ips:
+                servers.append([_RoomServer((ip, port), ips), None])
+            chosen = port
+            break
+        except OSError as e:
+            last = e
+            for srv, _ in servers:
+                try:
+                    srv.server_close()
+                except Exception:
+                    pass
+            servers = []
+    if not chosen:
+        room.start_error = str(last or "端口均被占用")
+        return False
+    room.room_port = chosen
+    room.bound_ips = ips
+    room.loopback_url = "http://127.0.0.1:%d" % chosen
+    room.fallback_urls = (["http://%s:%d" % (ip, chosen) for ip in lan]
+                          if lan else ["http://127.0.0.1:%d" % chosen])
+    for item in servers:
+        t = threading.Thread(target=item[0].serve_forever,
+                             kwargs={"poll_interval": 0.2}, daemon=True)
+        t.start()
+        item[1] = t
+    room.servers = [tuple(x) for x in servers]
+    return True
+
+
+def _room_local(reset):
+    global _room_state
+    with _room_cond:
+        room = _room_state
+        if room is None:
+            room = RoomState(epoch=1)
+            _room_state = room
+            _room_new_slots(room)
+            if not _room_start_locked(room):
+                _room_state = None
+                return {"ok": False, "error": "无法启动房间监听: " + room.start_error}
+        elif reset:
+            old_room = room
+            room = RoomState(epoch=old_room.epoch + 1)
+            room.room_port = old_room.room_port
+            room.loopback_url = old_room.loopback_url
+            room.bound_ips = old_room.bound_ips
+            room.servers = old_room.servers
+            room.lan_ips = old_room.lan_ips
+            room.lan_available = old_room.lan_available
+            room.fallback_urls = old_room.fallback_urls
+            _room_state = room
+            _room_new_slots(room)
+            _room_cond.notify_all()
+        now = int(time.time())
+        for slot in room.slots:
+            if slot["exp"] - now < 30:
+                _room_refresh_slot(room, slot)
+        return {"ok": True, "room_id": room.room_id, "host_id": room.host_id,
+                "epoch": room.epoch, "max_members": room.max_members,
+                "room_port": room.room_port, "loopback_url": room.loopback_url,
+                "fallback_urls": list(room.fallback_urls),
+                "lan_available": bool(room.lan_available),
+                "firewall_hint": room.firewall_hint,
+                "slots": [{"slot": s["slot"], "member_id": s["member_id"],
+                           "grant": s["grant"]} for s in room.slots]}
+
+
+def _room_grant_slot(num):
+    with _room_cond:
+        room = _room_state
+        if room is None:
+            return {"ok": False, "error": "房间不存在"}
+        slot = next((s for s in room.slots if s["slot"] == num), None)
+        if not slot:
+            return {"ok": False, "error": "slot 无效"}
+        _room_refresh_slot(room, slot)
+        return {"ok": True, "member_id": slot["member_id"],
+                "grant": slot["grant"], "firewall_hint": room.firewall_hint}
+
+
+def _room_proposal_view(p):
+    return {"id": p["id"], "member_id": p["member_id"], "type": p["type"],
+            "payload": copy.deepcopy(p["payload"]), "actor": p["actor"],
+            "ts": p["ts"], "op_id": p["op_id"]}
+
+
+def _room_proposals(since, wait):
+    try:
+        deadline = time.monotonic() + min(max(float(wait or 0), 0.0), 5.0)
+    except (TypeError, ValueError):
+        deadline = time.monotonic()
+    with _room_cond:
+        while True:
+            room = _room_state
+            if room is None:
+                return {"ok": True, "proposals": [], "seq": 0}
+            items = [_room_proposal_view(p) for p in room.proposals
+                     if p["_seq"] > since]
+            if items or time.monotonic() >= deadline:
+                return {"ok": True, "proposals": items, "seq": room.proposal_seq}
+            rem = deadline - time.monotonic()
+            if rem > 0:
+                _room_cond.wait(rem)
+
+
+def _room_commit(body):
+    ev_in, state_in = body.get("event"), body.get("state")
+    if not isinstance(ev_in, dict) or not isinstance(state_in, dict):
+        return {"ok": False, "error": "请求体无效"}
+    q, fq = state_in.get("queue") or [], state_in.get("feedQueue") or []
+    if not isinstance(q, list) or not isinstance(fq, list):
+        return {"ok": False, "error": "queue 无效"}
+    err = _validate_queue({"songs": q, "index": -1})
+    if err:
+        return {"ok": False, "error": "queue 数据无效: " + err}
+    err = _validate_queue({"songs": fq, "index": -1})
+    if err:
+        return {"ok": False, "error": "feedQueue 数据无效: " + err}
+    state = copy.deepcopy(state_in)
+    song = state.get("song")
+    if (isinstance(song, dict) and song.get("source") and
+            song.get("id") is not None and not state.get("song_key")):
+        try:
+            state["song_key"] = _song_identity(song.get("source"),
+                                               str(song.get("id")),
+                                               song.get("extra"))
+        except Exception:
+            pass
+    members = body.get("members") if isinstance(body.get("members"), list) else []
+    chat = body.get("chat_tail") if isinstance(body.get("chat_tail"), list) else []
+    try:
+        gen = int(body.get("generation") or 0)
+    except (TypeError, ValueError):
+        gen = 0
+    transport = body.get("transport") if body.get("transport") in ("webrtc", "http") else "http"
+    with _room_cond:
+        room = _room_state
+        if room is None:
+            return {"ok": False, "error": "房间不存在"}
+        try:
+            want = int(ev_in.get("seq") or 0)
+        except (TypeError, ValueError):
+            want = 0
+        if ev_in.get("type") == "anchor":
+            # 心跳只刷新权威快照, 不增加事件序号, 否则 WebRTC/HTTP 成员会不断请求 resync。
+            ev = copy.deepcopy(ev_in)
+            ev["seq"] = room.seq
+            ev["rev"] = room.rev
+            ev["room_id"] = room.room_id
+            ev.setdefault("v", 1)
+            ev.setdefault("actor", room.host_id)
+            ev.setdefault("ts", time.time())
+            ev["transport"] = ev.get("transport") if ev.get("transport") in ("webrtc", "http") else transport
+            room.state = state
+            room.members = copy.deepcopy(members[:ROOM_MAX_MEMBERS + 1])
+            room.chat_tail = copy.deepcopy(chat[-50:])
+            room.generation = gen
+            room.transport = transport
+            _room_cond.notify_all()
+            return {"ok": True, "event": ev, "seq": room.seq, "rev": room.rev}
+        seq = max(want, room.seq + 1)
+        ev = copy.deepcopy(ev_in)
+        ev["seq"] = seq
+        ev["rev"] = seq
+        ev["room_id"] = room.room_id
+        ev.setdefault("v", 1)
+        ev.setdefault("type", "commit")
+        ev.setdefault("actor", "host")
+        ev.setdefault("ts", time.time())
+        ev["transport"] = ev.get("transport") if ev.get("transport") in ("webrtc", "http") else transport
+        room.events.append(ev)
+        if len(room.events) > 500:
+            del room.events[:-500]
+        room.seq = room.rev = seq
+        room.state = state
+        room.members = copy.deepcopy(members[:ROOM_MAX_MEMBERS + 1])
+        room.chat_tail = copy.deepcopy(chat[-50:])
+        room.generation = gen
+        room.transport = transport
+        _room_cond.notify_all()
+    return {"ok": True, "event": ev, "seq": seq, "rev": seq}
+
+
+def _room_debug_state():
+    with _room_cond:
+        room = _room_state
+        if room is None:
+            return {"ok": True, "active": False, "events": [], "seq": 0, "rev": 0}
+        return {"ok": True, "active": True, "room_id": room.room_id,
+                "host_id": room.host_id, "epoch": room.epoch,
+                "seq": room.seq, "rev": room.rev,
+                "generation": room.generation, "transport": room.transport,
+                "state": copy.deepcopy(room.state),
+                "members": copy.deepcopy(room.members),
+                "chat_tail": copy.deepcopy(room.chat_tail),
+                "events": copy.deepcopy(room.events[-100:]),
+                "event_count": len(room.events),
+                "proposal_count": len(room.proposals),
+                "room_port": room.room_port,
+                "lan_available": room.lan_available,
+                "server_time": time.time()}
+
+
+def _room_close():
+    global _room_state
+    with _room_cond:
+        room = _room_state
+        _room_state = None
+        if room is not None:
+            _room_cond.notify_all()
+            _room_stop_servers(room.servers, room.room_port)
+        return {"ok": True}
+
+
+def _room_verify_locked(room, token):
+    try:
+        b64, sig = (token or "").split(".", 1)
+        want = hmac.new(room.room_secret, b64.encode("ascii"), hashlib.sha256).digest()
+        got = base64.urlsafe_b64decode(sig + "=" * (-len(sig) % 4))
+        if not hmac.compare_digest(want, got):
+            return None
+        p = json.loads(base64.urlsafe_b64decode(
+            b64 + "=" * (-len(b64) % 4)).decode("utf-8"))
+    except Exception:
+        return None
+    if not isinstance(p, dict):
+        return None
+    if p.get("room_id") != room.room_id or p.get("epoch") != room.epoch:
+        return None
+    if p.get("scope") not in ("member", "guest"):
+        return None
+    try:
+        exp = int(p.get("exp") or 0)
+    except (TypeError, ValueError):
+        return None
+    if exp <= int(time.time()):
+        return None
+    nonce = p.get("nonce")
+    if not isinstance(nonce, str) or not nonce or nonce in room.revoked_nonces:
+        return None
+    rec = room.nonces.get(nonce)
+    if (not rec or rec["exp"] != exp or rec["epoch"] != room.epoch or
+            rec["member_id"] != p.get("member_id")):
+        return None
+    return p
+
+
+def _room_auth(token):
+    with _room_cond:
+        room = _room_state
+        if room is None:
+            return None
+        p = _room_verify_locked(room, token)
+        if not p:
+            return None
+        return room, p
+
+
+def _room_replay_locked(room, p, key):
+    """nonce + 操作键的一次性防重放; 只针对写请求."""
+    now = time.time()
+    for k, v in list(room.used_ops.items()):
+        if v <= now:
+            del room.used_ops[k]
+    k = (p["nonce"],) + tuple(key)
+    if k in room.used_ops:
+        return False
+    room.used_ops[k] = now + 60
+    return True
+
+
+def _room_append_proposal(room, p, body, typ, payload):
+    now = time.time()
+    times = [t for t in room.rate.get(p["member_id"], []) if now - t < 60]
+    if len(times) >= 20:
+        return False, "请求过于频繁"
+    times.append(now)
+    room.rate[p["member_id"]] = times
+    room.proposal_seq += 1
+    room.proposals.append({
+        "id": secrets.token_urlsafe(9), "member_id": p["member_id"],
+        "type": typ, "payload": copy.deepcopy(payload),
+        "actor": body.get("actor"), "ts": body.get("ts"),
+        "op_id": body.get("op_id"), "_seq": room.proposal_seq})
+    if len(room.proposals) > 200:
+        del room.proposals[:-200]
+    _room_cond.notify_all()
+    return True, None
+
+
+class RoomHandler(BaseHTTPRequestHandler):
+    """独立 LAN 房间接口: 仅 /room/*, 不复用主服务令牌与路由."""
+    protocol_version = "HTTP/1.1"
+    server_version = "MusicHubRoom/1.0"
+    sys_version = ""
+
+    def log_message(self, *a):
+        pass
+
+    def _host_ok(self):
+        host = (self.headers.get("Host") or "").strip().lower()
+        port = self.server.server_address[1]
+        allowed = {"127.0.0.1:%d" % port, "localhost:%d" % port}
+        for ip in getattr(self.server, "room_bound_ips", ()):
+            allowed.add(("%s:%d" % (ip, port)).lower())
+        return host in allowed
+
+    def _origin_ok(self, origin):
+        o = origin.strip().rstrip("/")
+        if re.match(r"^http://(?:127\.0\.0\.1|localhost):\d+$", o, re.I):
+            return True
+        port = self.server.server_address[1]
+        for ip in getattr(self.server, "room_bound_ips", ("127.0.0.1",)):
+            if o.lower() == ("http://%s:%d" % (ip, port)).lower():
+                return True
+        return False
+
+    def _cors(self):
+        h = {}
+        origin = self.headers.get("Origin")
+        if not origin or not self._origin_ok(origin):
+            return h
+        h["Access-Control-Allow-Origin"] = origin
+        h["Vary"] = "Origin"
+        h["Access-Control-Allow-Headers"] = "X-Room-Grant, Content-Type"
+        h["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+        if (self.headers.get("Access-Control-Request-Private-Network") or
+                "").strip().lower() == "true":
+            h["Access-Control-Allow-Private-Network"] = "true"
+        return h
+
+    def _common(self):
+        h = {"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"}
+        h.update(self._cors())
+        return h
+
+    def _send(self, code, body, ctype="application/json; charset=utf-8", extra=None):
+        if isinstance(body, (dict, list)):
+            body = json.dumps(body, ensure_ascii=False).encode("utf-8")
+        elif isinstance(body, str):
+            body = body.encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", ctype or "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        for k, v in (extra or {}).items():
+            self.send_header(k, v)
+        for k, v in self._common().items():
+            self.send_header(k, v)
+        self.end_headers()
+        if body:
+            try:
+                self.wfile.write(body)
+            except (BrokenPipeError, ConnectionResetError,
+                    ConnectionAbortedError, OSError):
+                pass
+
+    def _begin_stream(self, code, ctype, extra, length=None):
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        for k, v in (extra or {}).items():
+            self.send_header(k, v)
+        for k, v in self._common().items():
+            self.send_header(k, v)
+        if length is not None:
+            self.send_header("Content-Length", str(length))
+        else:
+            self.send_header("Connection", "close")
+            self.close_connection = True
+        self.end_headers()
+
+    def _grant_token(self, qs):
+        return (qs.get("grant") or [""])[0] or self.headers.get("X-Room-Grant") or ""
+
+    def do_OPTIONS(self):
+        if not self._host_ok():
+            return self._send(403, {"ok": False, "error": "forbidden"})
+        path = urllib.parse.urlparse(self.path).path
+        if not path.startswith("/room/"):
+            return self._send(403, {"ok": False, "error": "forbidden"})
+        return self._send(204, b"", ctype=None)
+
+    def do_GET(self):
+        if not self._host_ok():
+            return self._send(403, {"ok": False, "error": "forbidden"})
+        parsed = urllib.parse.urlparse(self.path)
+        path = parsed.path
+        qs = urllib.parse.parse_qs(parsed.query)
+        g = lambda k, d="": (qs.get(k) or [d])[0]
+        if path == "/room/":
+            with _room_cond:
+                rid = _room_state.room_id if _room_state else "-"
+            return self._send(200, "ok\nroom_id: %s\n" % rid,
+                              "text/plain; charset=utf-8")
+        if not path.startswith("/room/"):
+            return self._send(404, {"ok": False, "error": "not found"})
+        auth = _room_auth(self._grant_token(qs))
+        if not auth:
+            return self._send(403, {"ok": False, "error": "grant 无效或已过期"})
+        room, p = auth
+        with _room_cond:
+            if room is not _room_state:
+                return self._send(403, {"ok": False, "error": "房间已重置"})
+        if path == "/room/ping":
+            return self._send(200, {"ok": True, "room_id": room.room_id,
+                                    "member_id": p["member_id"],
+                                    "epoch": room.epoch,
+                                    "server_time": time.time(),
+                                    "transport": "http"})
+        if path == "/room/state":
+            with _room_cond:
+                if room is not _room_state:
+                    return self._send(403, {"ok": False, "error": "房间已重置"})
+                out = {"ok": True, "room_id": room.room_id,
+                       "state": copy.deepcopy(room.state),
+                       "members": copy.deepcopy(room.members),
+                       "chat_tail": copy.deepcopy(room.chat_tail),
+                       "seq": room.seq, "rev": room.rev,
+                       "transport": room.transport,
+                       "generation": room.generation,
+                       "server_time": time.time()}
+            return self._send(200, out)
+        if path == "/room/events":
+            try:
+                since = int(g("since", "0") or 0)
+            except ValueError:
+                since = 0
+            try:
+                wait = min(max(float(g("wait", "0") or 0), 0.0), 5.0)
+            except ValueError:
+                wait = 0.0
+            deadline = time.monotonic() + wait
+            with _room_cond:
+                while True:
+                    if room is not _room_state:
+                        return self._send(403, {"ok": False, "error": "房间已重置"})
+                    evs = [e for e in room.events if (e.get("seq") or 0) > since]
+                    if evs or time.monotonic() >= deadline:
+                        out = {"ok": True, "events": copy.deepcopy(evs),
+                               "seq": room.seq, "rev": room.rev,
+                               "state": copy.deepcopy(room.state),
+                               "members": copy.deepcopy(room.members),
+                               "chat_tail": copy.deepcopy(room.chat_tail)}
+                        break
+                    rem = deadline - time.monotonic()
+                    if rem > 0:
+                        _room_cond.wait(rem)
+            return self._send(200, out)
+        if path == "/room/stream":
+            return self._room_stream(g("kind"), room)
+        return self._send(404, {"ok": False, "error": "not found"})
+
+    def do_POST(self):
+        if not self._host_ok():
+            return self._send(403, {"ok": False, "error": "forbidden"})
+        parsed = urllib.parse.urlparse(self.path)
+        path = parsed.path
+        qs = urllib.parse.parse_qs(parsed.query)
+        if path not in ("/room/propose", "/room/chat"):
+            return self._send(404, {"ok": False, "error": "not found"})
+        raw = b""
+        try:
+            n = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            n = 0
+        if n <= 0 or n > 4096:
+            self.close_connection = True
+            return self._send(413, {"ok": False, "error": "请求体无效或过大"})
+        raw = self.rfile.read(n)
+        try:
+            body = json.loads(raw.decode("utf-8"))
+        except Exception:
+            return self._send(400, {"ok": False, "error": "请求体无效"})
+        if not isinstance(body, dict):
+            return self._send(400, {"ok": False, "error": "请求体无效"})
+        auth = _room_auth(self._grant_token(qs))
+        if not auth:
+            return self._send(403, {"ok": False, "error": "grant 无效或已过期"})
+        room, p = auth
+        if body.get("member_id") != p["member_id"]:
+            return self._send(403, {"ok": False, "error": "member_id 不匹配"})
+        if path == "/room/chat":
+            typ = "chat"
+            text = str(body.get("text") or "")[:200]
+            payload = {"text": text,
+                       "nickname": str(body.get("nickname") or "")[:40]}
+        else:
+            typ = body.get("type")
+            payload = body.get("payload")
+            if not isinstance(typ, str) or not _ROOM_PROPOSAL_RE.match(typ):
+                return self._send(400, {"ok": False, "error": "type 无效"})
+            if not isinstance(payload, dict):
+                return self._send(400, {"ok": False, "error": "payload 无效"})
+            try:
+                if len(json.dumps(payload, ensure_ascii=False)) > 2048:
+                    return self._send(400, {"ok": False, "error": "payload 过大"})
+            except (TypeError, ValueError):
+                return self._send(400, {"ok": False, "error": "payload 无效"})
+        op_id = str(body.get("op_id") or "")[:80]
+        replay = ("POST", path, op_id or hashlib.sha256(raw).hexdigest())
+        with _room_cond:
+            if room is not _room_state:
+                return self._send(403, {"ok": False, "error": "房间已重置"})
+            if not _room_replay_locked(room, p, replay):
+                return self._send(409, {"ok": False, "error": "重复请求"})
+            ok, err = _room_append_proposal(room, p, body, typ, payload)
+        if not ok:
+            return self._send(429, {"ok": False, "error": err})
+        return self._send(200, {"ok": True})
+
+    def _room_local_file(self, name):
+        fname = os.path.basename(name or "")
+        fp = os.path.join(DL_DIR, fname)
+        root = os.path.realpath(DL_DIR)
+        real = os.path.realpath(fp)
+        if (not fname or not real.startswith(root + os.sep) or
+                not os.path.isfile(real)):
+            return self._send(404, {"ok": False, "error": "not found"})
+        size = os.path.getsize(real)
+        rng = self.headers.get("Range")
+        start, end, code = 0, size - 1, 200
+        bad = False
+        if rng:
+            m = re.match(r"^bytes=(\d*)-(\d*)$", rng)
+            if m and (m.group(1) or m.group(2)):
+                if m.group(1):
+                    start = int(m.group(1))
+                    end = min(int(m.group(2)), size - 1) if m.group(2) else size - 1
+                else:
+                    suffix = int(m.group(2))
+                    if suffix <= 0:
+                        bad = True
+                    else:
+                        start, end = max(0, size - suffix), size - 1
+                code = 206
+        if bad or start > end or start >= size:
+            return self._send(416, {"ok": False, "error": "range not satisfiable"},
+                              extra={"Content-Range": "bytes */%d" % size})
+        ext = os.path.splitext(fname)[1].lower()
+        ctype = AUDIO_TYPES.get(ext, "application/octet-stream")
+        extra = {"Accept-Ranges": "bytes"}
+        if code == 206:
+            extra["Content-Range"] = "bytes %d-%d/%d" % (start, end, size)
+        self._begin_stream(code, ctype, extra, length=end - start + 1)
+        try:
+            with open(real, "rb") as f:
+                f.seek(start)
+                remain = end - start + 1
+                while remain > 0:
+                    chunk = f.read(min(64 * 1024, remain))
+                    if not chunk:
+                        break
+                    remain -= len(chunk)
+                    self.wfile.write(chunk)
+        except (BrokenPipeError, ConnectionResetError,
+                ConnectionAbortedError, OSError):
+            pass
+
+    def _room_stream(self, kind, room):
+        if kind not in ("audio", "video"):
+            return self._send(400, {"ok": False, "error": "kind 无效"})
+        with _room_cond:
+            if room is not _room_state:
+                return self._send(403, {"ok": False, "error": "房间已重置"})
+            state = copy.deepcopy(room.state)
+        song = state.get("song") if isinstance(state, dict) else None
+        if not isinstance(song, dict) or not song.get("source") or song.get("id") is None:
+            return self._send(502, {"ok": False, "error": "当前无歌曲"})
+        source = song.get("source")
+        if source == "local":
+            return self._room_local_file(song.get("file") or song.get("id"))
+        src = SRC.get(source)
+        if not src:
+            return self._send(502, {"ok": False, "error": "未知音源"})
+        s = {"id": str(song.get("id")), "extra": song.get("extra") or {}}
+        try:
+            qn = int(state.get("qn") or 16)
+        except (TypeError, ValueError):
+            qn = 16
+        try:
+            if kind == "video" and hasattr(src, "get_video"):
+                args = inspect.signature(src.get_video).parameters
+                if "room" in args:
+                    info = src.get_video(s, qn=qn, room=True)
+                else:
+                    info = src.get_video(s, qn=qn)
+            else:
+                info = src.get_stream(s)
+        except Exception as e:
+            return self._send(502, {"ok": False, "error": "取流失败: %s" % e})
+        if (not isinstance(info, dict) or info.get("error") or
+                not info.get("url")):
+            err = info.get("error") if isinstance(info, dict) else "无可用流"
+            return self._send(502, {"ok": False,
+                                    "error": str(err or "无可用流")})
+        url = info["url"]
+        segs = [u for u in (info.get("segments") or []) if u and u != url]
+        headers = dict(info.get("headers") or {})
+        headers.setdefault("User-Agent", UA)
+        for u in [url] + segs:
+            if urllib.parse.urlparse(u).scheme not in ("http", "https"):
+                return self._send(502, {"ok": False, "error": "上游地址无效"})
+        rng = self.headers.get("Range")
+        m = re.match(r"bytes=(\d+)-", rng or "")
+        multi = bool(segs) and (not rng or (m and int(m.group(1)) == 0))
+        if rng and not multi:
+            headers["Range"] = rng if rng.lower().startswith("bytes=") else "bytes=" + rng.strip()
+        try:
+            resp = urllib.request.urlopen(
+                urllib.request.Request(url, headers=headers), timeout=20)
+        except urllib.error.HTTPError as e:
+            if e.code == 416:
+                cr = e.headers.get("Content-Range") if e.headers else None
+                return self._send(416, {"ok": False, "error": "range not satisfiable"},
+                                  extra={"Content-Range": cr or "bytes */0"})
+            return self._send(502, {"ok": False, "error": "上游取流失败: %s" % e})
+        except Exception as e:
+            return self._send(502, {"ok": False, "error": "上游取流失败: %s" % e})
+        code = 200 if multi else resp.getcode()
+        default_type = "video/mp4" if kind == "video" else "audio/mpeg"
+        ctype = (resp.headers.get("Content-Type") or default_type).split(";")[0].strip()
+        extra = {}
+        if multi:
+            extra["Accept-Ranges"] = "none"
+            length = None
+        else:
+            extra["Accept-Ranges"] = resp.headers.get("Accept-Ranges") or "bytes"
+            for k in ("Content-Range", "Content-Encoding"):
+                v = resp.headers.get(k)
+                if v:
+                    extra[k] = v
+            try:
+                length = int(resp.headers.get("Content-Length"))
+            except (TypeError, ValueError):
+                length = None
+        self._begin_stream(code, ctype, extra, length=length)
+
+        def _pump(r):
+            try:
+                while True:
+                    chunk = r.read(64 * 1024)
+                    if not chunk:
+                        return True
+                    self.wfile.write(chunk)
+            except (BrokenPipeError, ConnectionResetError,
+                    ConnectionAbortedError, OSError):
+                return False
+            finally:
+                try:
+                    r.close()
+                except Exception:
+                    pass
+
+        if not _pump(resp):
+            return
+        if multi:
+            seg_headers = dict(headers)
+            seg_headers.pop("Range", None)
+            for u in segs:
+                try:
+                    r2 = urllib.request.urlopen(
+                        urllib.request.Request(u, headers=seg_headers), timeout=20)
+                except Exception:
+                    break
+                if not _pump(r2):
+                    break
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "MusicHub/1.0"
 
@@ -812,6 +1731,27 @@ class Handler(BaseHTTPRequestHandler):
             return self._static(path[5:])
         if not self._authorized(qs):
             return self._send(403, {"error": "forbidden"})
+        if path == "/api/room/local":
+            try:
+                out = _room_local(g("reset", "0") == "1")
+            except Exception as e:
+                return self._send(500, {"ok": False, "error": str(e)})
+            return self._send(200 if out.get("ok") else 500, out)
+        if path == "/api/room/grant":
+            try:
+                slot = int(g("slot", "1") or 1)
+            except ValueError:
+                slot = 0
+            out = _room_grant_slot(slot)
+            return self._send(200 if out.get("ok") else 400, out)
+        if path == "/api/room/proposals":
+            try:
+                since = int(g("since", "0") or 0)
+            except ValueError:
+                since = 0
+            return self._send(200, _room_proposals(since, g("wait", "0")))
+        if path == "/api/room/state":
+            return self._send(200, _room_debug_state())
         if path == "/api/sources":
             return self._send(200, {"sources": list(SRC.keys())})
         if path == "/api/fonts":
@@ -819,6 +1759,10 @@ class Handler(BaseHTTPRequestHandler):
                                     "lyrics_min": 16, "lyrics_max": 72})
         if path == "/api/search":
             return self._search(g)
+        if path == "/api/recommend":
+            return self._recommend(g)
+        if path == "/api/home":
+            return self._home(g)
         if path == "/api/playlist":
             return self._playlist(g)
         if path == "/api/mylists":
@@ -891,6 +1835,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._proxy(g)
         if path == "/imgproxy":
             return self._imgproxy(g)
+        if path == "/skin":
+            return self._skin_file(g("name"))
         # 网易云登录
         if path == "/api/netease/status":
             return self._send(200, netease.status())
@@ -974,9 +1920,17 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, asr.start())
         if path == "/api/asr/stop":
             return self._send(200, asr.stop())
+        if path == "/api/room/close":
+            return self._send(200, _room_close())
+        # 自定义皮肤以原始二进制上传，避免把视频编码成巨大的 JSON/Data URL。
+        if path == "/api/skin":
+            return self._skin_upload(urllib.parse.parse_qs(parsed.query))
         body = self._json_body()
         if body is None:
             return self._send(400, {"error": "请求体无效或过大"})
+        if path == "/api/room/commit":
+            out = _room_commit(body)
+            return self._send(200 if out.get("ok") else 400, out)
         if path == "/api/queue":
             err = _validate_queue(body)
             if err:
@@ -1111,6 +2065,35 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as e:
             return self._send(200, {"error": "搜索失败: %s" % e})
 
+    def _recommend(self, g):
+        src = SRC.get(g("source"))
+        fn = getattr(src, "recommend", None) if src else None
+        if not src:
+            return self._send(200, {"songs": [], "error": "未知音源"})
+        if not fn:
+            return self._send(200, {"songs": [], "error": "该音源暂无推荐"})
+        try:
+            limit = max(1, min(int(g("limit", "30") or 30), 50))
+            kwargs = {"limit": limit, "mode": g("mode") or None,
+                      "topid": g("topid") or None,
+                      "albumid": g("albumid") or None}
+            return self._send(200, fn(**kwargs))
+        except Exception as e:
+            return self._send(200, {"songs": [], "error": "获取推荐失败: %s" % e})
+
+    def _home(self, g):
+        src = SRC.get(g("source"))
+        fn = getattr(src, "home", None) if src else None
+        if not fn:
+            return self._send(200, {"quick": [], "playlists": [], "charts": [],
+                                    "activities": [], "error": "该音源暂无首页"})
+        try:
+            limit = max(1, min(int(g("limit", "30") or 30), 50))
+            return self._send(200, fn(limit=limit))
+        except Exception as e:
+            return self._send(200, {"quick": [], "playlists": [], "charts": [],
+                                    "activities": [], "error": "获取首页失败: %s" % e})
+
     def _playlist(self, g):
         src = SRC.get(g("source"))
         if not src:
@@ -1202,6 +2185,108 @@ class Handler(BaseHTTPRequestHandler):
                 _save_pls(d)
                 return self._send(200, {"ok": True})
         return self._send(200, {"error": "未知操作"})
+
+    # ---------- 自定义皮肤文件 ----------
+    def _skin_file(self, name):
+        """以受保护的本地静态资源方式返回已上传的皮肤，支持视频 Range 请求。"""
+        fname = os.path.basename(urllib.parse.unquote(name or ""))
+        fp = os.path.join(SKIN_DIR, fname)
+        if not fname or not os.path.isfile(fp):
+            return self._send(404, "not found", "text/plain")
+        size = os.path.getsize(fp)
+        if size <= 0:
+            return self._send(404, "not found", "text/plain")
+        rng = self.headers.get("Range")
+        start, end, code = 0, size - 1, 200
+        unsatisfiable = False
+        if rng:
+            m = re.match(r"^bytes=(\d*)-(\d*)$", rng)
+            if m and (m.group(1) or m.group(2)):
+                if m.group(1):
+                    start = int(m.group(1))
+                    end = min(int(m.group(2)), size - 1) if m.group(2) else size - 1
+                else:
+                    suffix = int(m.group(2))
+                    if suffix <= 0:
+                        unsatisfiable = True
+                    else:
+                        start, end = max(0, size - suffix), size - 1
+                code = 206
+        if unsatisfiable or start > end or start >= size:
+            self.send_response(416)
+            self.send_header("Content-Range", "bytes */%d" % size)
+            self.end_headers()
+            return
+        ext = os.path.splitext(fname)[1].lower()
+        self.send_response(code)
+        self.send_header("Content-Type", SKIN_TYPES.get(ext, "application/octet-stream"))
+        self.send_header("Accept-Ranges", "bytes")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Content-Length", str(end - start + 1))
+        if code == 206:
+            self.send_header("Content-Range", "bytes %d-%d/%d" % (start, end, size))
+        self.end_headers()
+        try:
+            with open(fp, "rb") as f:
+                f.seek(start)
+                remain = end - start + 1
+                while remain > 0:
+                    chunk = f.read(min(64 * 1024, remain))
+                    if not chunk:
+                        break
+                    remain -= len(chunk)
+                    self.wfile.write(chunk)
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError):
+            pass
+
+    def _skin_upload(self, qs):
+        """保存一份图片/GIF/视频皮肤并返回随机文件名。请求体为原始二进制。"""
+        try:
+            n = int(self.headers.get("Content-Length") or 0)
+        except (TypeError, ValueError):
+            n = 0
+        if n <= 0:
+            return self._send(400, {"error": "皮肤文件为空"})
+        if n > SKIN_MAX:
+            return self._send(413, {"error": "皮肤文件不能超过 256MB"})
+        original = (qs.get("name") or [""])[0]
+        original = os.path.basename(urllib.parse.unquote(original))
+        ext = os.path.splitext(original)[1].lower()
+        ctype = (self.headers.get("Content-Type") or "").split(";", 1)[0].strip().lower()
+        if ext not in SKIN_TYPES:
+            mime_ext = next((e for e, m in SKIN_TYPES.items() if m == ctype), "")
+            ext = mime_ext
+        if ext not in SKIN_TYPES:
+            return self._send(415, {"error": "仅支持图片、GIF 或视频皮肤"})
+        # 只使用服务端生成的名称，设置文件中的 name 不会形成路径。
+        fname = secrets.token_hex(16) + ext
+        os.makedirs(SKIN_DIR, exist_ok=True)
+        fp = os.path.join(SKIN_DIR, fname)
+        tmp = fp + ".tmp"
+        got = 0
+        try:
+            with open(tmp, "wb") as f:
+                while got < n:
+                    chunk = self.rfile.read(min(1024 * 1024, n - got))
+                    if not chunk:
+                        break
+                    got += len(chunk)
+                    f.write(chunk)
+            if got != n:
+                try:
+                    os.remove(tmp)
+                except OSError:
+                    pass
+                return self._send(400, {"error": "皮肤文件上传不完整"})
+            os.replace(tmp, fp)
+        except OSError as e:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+            return self._send(500, {"error": "保存皮肤失败: %s" % e})
+        return self._send(200, {"ok": True, "name": fname,
+                                "mime": SKIN_TYPES[ext], "size": got})
 
     # ---------- 本地文件(已下载歌曲) ----------
     def _local_file(self, name):
@@ -1301,7 +2386,12 @@ class Handler(BaseHTTPRequestHandler):
         if u.scheme not in ("http", "https") or not any(
                 host == h or host.endswith("." + h) for h in IMG_HOSTS):
             return self._send(400, "bad url", "text/plain")
-        headers = {"User-Agent": UA, "Referer": "https://www.bilibili.com/"}
+        referer = "https://www.bilibili.com/"
+        if "music.126.net" in host:
+            referer = "https://music.163.com/"
+        elif "gtimg.cn" in host or "qpic.cn" in host or host == "y.qq.com":
+            referer = "https://y.qq.com/"
+        headers = {"User-Agent": UA, "Referer": referer}
         try:
             req = urllib.request.Request(url, headers=headers)
             with urllib.request.urlopen(req, timeout=15) as resp:
@@ -1341,7 +2431,12 @@ class Handler(BaseHTTPRequestHandler):
         headers = dict(info.get("headers") or {})
         headers.setdefault("User-Agent", UA)
         rng = self.headers.get("Range")
-        if rng:
+        # B站旧版 durl 会把一个视频拆成多个顺序分片: 顺序接力成一条流。
+        # 只有从 0 开始(或无 Range)的请求能安全接力; 非零 Range 仍只代理首片。
+        segs = [u for u in (info.get("segments") or []) if u and u != info["url"]]
+        m = re.match(r"bytes=(\d+)-", rng or "")
+        multi = bool(segs) and (not rng or (m and int(m.group(1)) == 0))
+        if rng and not multi:
             headers["Range"] = rng
         try:
             req = urllib.request.Request(info["url"], headers=headers)
@@ -1349,26 +2444,48 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as e:
             return self._send(502, {"error": "上游取流失败: %s" % e})
         code = resp.getcode()
-        self.send_response(code)
-        self.send_header("Accept-Ranges", "bytes")
-        for h in ("Content-Type", "Content-Length", "Content-Range"):
-            v = resp.headers.get(h)
-            if v:
-                self.send_header(h, v)
+        self.send_response(code if not multi else 200)
+        if not multi:
+            self.send_header("Accept-Ranges", "bytes")
+            for h in ("Content-Type", "Content-Length", "Content-Range"):
+                v = resp.headers.get(h)
+                if v:
+                    self.send_header(h, v)
+        else:
+            ctype = resp.headers.get("Content-Type")
+            if ctype:
+                self.send_header("Content-Type", ctype)
+            self.send_header("Accept-Ranges", "none")
         self.end_headers()
-        try:
-            while True:
-                chunk = resp.read(64 * 1024)
-                if not chunk:
-                    break
-                self.wfile.write(chunk)
-        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError):
-            pass
-        finally:
+
+        def _pump(r):
             try:
-                resp.close()
-            except Exception:
-                pass
+                while True:
+                    chunk = r.read(64 * 1024)
+                    if not chunk:
+                        return True
+                    self.wfile.write(chunk)
+            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError):
+                return False
+            finally:
+                try:
+                    r.close()
+                except Exception:
+                    pass
+
+        if not _pump(resp):
+            return
+        if multi:
+            seg_headers = dict(headers)
+            seg_headers.pop("Range", None)
+            for u in segs:
+                try:
+                    r2 = urllib.request.urlopen(
+                        urllib.request.Request(u, headers=seg_headers), timeout=20)
+                except Exception:
+                    break
+                if not _pump(r2):
+                    break
 
 
 def free_port(preferred=8787):

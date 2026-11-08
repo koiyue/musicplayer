@@ -2,11 +2,19 @@
 """QQ音乐音源: 免登录搜索/歌单; 播放地址用 vkey.GetVkeyServer.CgiGetVkey(返回 purl).
 VIP/付费曲 purl 为空 -> 前端灰显.
 登录: 官方扫码接口(ptlogin2)已风控 403, 采用手动粘贴 Cookie(uin+qm36+music_key/skey)."""
+import contextvars
+import gzip
 import hashlib
+import html
 import json
 import os
 import random
+import re
+import threading
+import time
 import urllib.parse
+import zlib
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from . import secure_store, song
 from .common import http_get, UA
@@ -205,9 +213,337 @@ def search(keyword, limit=30, page=1):
     return {"songs": out, "page": page, "total": total, "page_size": limit, "has_more": has_more}
 
 
-def get_playlist(ref):
+_HOME_TTL = 300
+_HOME_BUDGET = 2.0
+_HOME_CACHE = {}
+_HOME_CACHE_LOCK = threading.Lock()
+_HOME_DEADLINE = contextvars.ContextVar("qq_home_deadline", default=None)
+
+
+def _home_timeout():
+    default = 1.5
+    try:
+        deadline = _HOME_DEADLINE.get()
+        if deadline is None:
+            return default
+        left = float(deadline) - time.monotonic()
+        return max(0.4, min(default, left))
+    except Exception:
+        return default
+
+
+def _home_get(url, headers=None, raw=False):
+    """首页专用网络请求: 单次尝试、短超时, 失败直接返回空结果."""
+    timeout = _home_timeout()
+    args = {"headers": headers, "timeout": timeout, "attempts": 1,
+            "budget": timeout}
+    if raw:
+        args["raw"] = True
+    j = http_get(url, **args)
+    if isinstance(j, dict) and ("error" in j or "_nonjson" in j):
+        return {} if not raw else b""
+    return j
+
+
+def _cached_home_part(key, fn, allow_empty=True):
+    """首页片段短缓存: 避免切音源/刷新时重复请求; 空结果可下次重试."""
+    now = time.monotonic()
+    with _HOME_CACHE_LOCK:
+        hit = _HOME_CACHE.get(key)
+        if hit and hit[0] > now:
+            return hit[1]
+    val = fn()
+    if allow_empty or val:
+        with _HOME_CACHE_LOCK:
+            _HOME_CACHE[key] = (now + _HOME_TTL, val)
+    return val
+
+
+def _parallel_map(fn, items, limit=8):
+    """并行执行首页片段请求; 总截止时间到后不再等待剩余任务, 保留输入顺序."""
+    out = [None] * len(items)
+    if not items:
+        return out
+    ctx = contextvars.copy_context()
+    pool = ThreadPoolExecutor(max_workers=min(limit, len(items)))
+    try:
+        futures = {ctx.run(pool.submit, fn, item): i for i, item in enumerate(items)}
+        deadline = _HOME_DEADLINE.get()
+        try:
+            for f in as_completed(futures, timeout=(
+                    max(0.1, deadline - time.monotonic()) if deadline else None)):
+                try:
+                    out[futures[f]] = f.result()
+                except Exception:
+                    pass
+        except TimeoutError:
+            pass
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
+    return out
+
+
+def _home_public_playlists(limit=12):
+    """公共歌单: 一次请求 fcg_get_diss_by_tag, 附带静态兜底."""
+    fallback = [
+        {"id": "7707261125", "ref": "7707261125", "title": "甜度爆表 | 旋律说唱狙击少女心",
+         "cover": "http://qpic.y.qq.com/music_cover/s4SoBc0IrDEDpHKlDkDflKbCgbic5ldSQrdsEafqvxULdib5CvKhaibww/300?n=1",
+         "sub": "855.8万次播放", "tag": "热门歌单", "action": "playlist"},
+        {"id": "7729596131", "ref": "7729596131", "title": "耳机里的秘密 | 宝藏女声集合站",
+         "cover": "http://qpic.y.qq.com/music_cover/qhuJFHlwiayRp1rhWoJk9HaAkric2uNwiaX5vwuDF1mb4LgEId9z2eExg/300?n=1",
+         "sub": "5550.4万次播放", "tag": "热门歌单", "action": "playlist"},
+        {"id": "7614366897", "ref": "7614366897", "title": "侠气古风 : 腰间两把刀！断和了",
+         "cover": "http://qpic.y.qq.com/music_cover/nKLrO3Sp1ctkpqK9rmuze9wmyUcyQV38GpUdnwYNkAyEUicTQ2dCBoA/300?n=1",
+         "sub": "4082.7万次播放", "tag": "热门歌单", "action": "playlist"},
+        {"id": "7426529126", "ref": "7426529126", "title": "「片段」你与星河皆不可及",
+         "cover": "http://qpic.y.qq.com/music_cover/LQ4zic8aEyNEreHko5rQ2a6S0JjhXjvoxzTWXvqiaZDDvJWlibGcCWa4g/300?n=1",
+         "sub": "3944.7万次播放", "tag": "热门歌单", "action": "playlist"},
+    ]
+    url = ("https://c.y.qq.com/splcloud/fcgi-bin/fcg_get_diss_by_tag.fcg"
+           "?format=json&inCharset=utf8&outCharset=utf-8&notice=0&platform=yqq.json"
+           "&needNewCode=0&picmid=1&categoryId=10000000&sortId=3&sin=0&ein=%d"
+           "&g_tk=%d" % (max(1, limit - 1), _gtk()))
+    j = _home_get(url, headers=QQ_HEADERS)
+    rows = ((j.get("data") or {}).get("list") or [])
+    out = []
+    for p in rows[:limit]:
+        ref = p.get("dissid")
+        if not ref:
+            continue
+        out.append({
+            "id": ref, "ref": ref, "title": p.get("dissname") or "推荐歌单",
+            "cover": p.get("imgurl") or "", "sub": _fmt_count(p.get("listennum")),
+            "tag": "热门歌单", "action": "playlist",
+        })
+    return out[:limit] if out else fallback[:limit]
+
+
+def _home_page_html():
+    """读取 QQ 音乐馆推荐页 HTML(服务端 gzip/deflate 压缩)."""
+    if time.monotonic() >= (_HOME_DEADLINE.get() or float("inf")):
+        return ""
+    payload = _home_get("https://c.y.qq.com/node/musicmac/v6/index.html",
+                        headers=_headers(_cookie_str()), raw=True)
+    if not isinstance(payload, (bytes, bytearray)):
+        return ""
+    payload = bytes(payload)
+    try:
+        text = gzip.decompress(payload).decode("utf-8", "replace")
+    except Exception:
+        try:
+            text = zlib.decompress(payload, -zlib.MAX_WBITS).decode("utf-8", "replace")
+        except Exception:
+            text = payload.decode("utf-8", "replace")
+    return html.unescape(text)
+
+
+def _home_banners(limit=5):
+    """音乐馆推荐页运营 Banner: data-type=10002 为专辑, 点击进入专辑歌曲列表."""
+    s = _home_page_html()
+    pat = (r'<p class="focus__pic[^>]*>\s*<a[^>]*data-rid="(\d+)"'
+           r'[^>]*data-type="(\d+)"[^>]*>\s*<picture>\s*<img[^>]*src="([^"]+)')
+
+    def banner_card(m):
+        ref, typ, cover = m.group(1), m.group(2), m.group(3)
+        if typ != "10002":
+            return None
+        return {"id": ref, "ref": ref, "albumid": ref,
+                "title": "QQ音乐精选专辑", "cover": cover,
+                "sub": "QQ音乐 · 精选活动", "tag": "精选活动", "action": "album"}
+
+    cards = _parallel_map(banner_card, list(re.finditer(pat, s)), limit=5)
+    out, seen = [], set()
+    for c in cards:
+        if not c or c["ref"] in seen:
+            continue
+        seen.add(c["ref"])
+        out.append(c)
+        if len(out) >= limit:
+            break
+    return out
+
+
+_HOME_TOPLIST_META = {
+    26: ("巅峰榜·热歌", "https://y.gtimg.cn/music/common/upload/iphone_order_channel/20150820174743.jpg"),
+    27: ("巅峰榜·新歌", "https://y.gtimg.cn/music/common/upload/iphone_order_channel/20150820174831.jpg"),
+    4:  ("巅峰榜·流行指数", "https://y.gtimg.cn/music/common/upload/test_order_channel_hitlist_con/1847681.png"),
+    3:  ("巅峰榜·欧美", "https://y.gtimg.cn/music/common/upload/iphone_order_channel/20150122151215.jpg"),
+    5:  ("巅峰榜·内地", "https://y.gtimg.cn/music/common/upload/iphone_order_channel/20150820174759.jpg"),
+    62: ("飙升榜", "https://y.gtimg.cn/music/common/upload/iphone_order_channel/20150820174903.jpg"),
+    64: ("巅峰榜·香港", "https://y.gtimg.cn/music/common/upload/iphone_order_channel/20150820174920.jpg"),
+    65: ("巅峰榜·台湾", "https://y.gtimg.cn/music/common/upload/iphone_order_channel/20150820174937.jpg"),
+    17: ("巅峰榜·日本", "https://y.gtimg.cn/music/common/upload/iphone_order_channel/20150820174954.jpg"),
+    52: ("巅峰榜·韩国", "https://y.gtimg.cn/music/common/upload/iphone_order_channel/20150820175011.jpg"),
+}
+
+
+def _home_toplist_info(topid):
+    """巅峰榜卡片: 静态元数据, 点击时再请求真实榜单内容."""
+    title, cover = _HOME_TOPLIST_META.get(int(topid), ("巅峰榜", ""))
+    return {"title": title, "cover": cover, "sub": "QQ音乐 · 巅峰榜",
+            "topid": int(topid), "action": "toplist"}
+
+
+def _fmt_count(v):
+    try:
+        n = int(v or 0)
+    except (TypeError, ValueError):
+        return ""
+    return "%.1f万次播放" % (n / 10000.0) if n >= 10000 else "%d次播放" % n
+
+
+def _home_song(t):
+    """首页/榜单里的 QQ 歌曲条目 -> 统一 song 结构."""
+    singers = "/".join((s.get("name") or "") for s in (t.get("singer") or []))
+    pay = t.get("pay") or {}
+    vip = bool(pay.get("pay_play") or pay.get("payplay") or
+               pay.get("pay_status") or pay.get("paystatus") or
+               pay.get("pay_month") or pay.get("paymonth"))
+    return song("qq", t.get("songmid") or t.get("mid") or t.get("songid"),
+                t.get("songname") or t.get("name") or t.get("title") or "",
+                singers, t.get("albumname") or "", t.get("interval") or 0,
+                _cover(t.get("albummid")),
+                extra={"vip": vip, "media_mid": t.get("strMediaMid") or ""})
+
+
+def _home_new_songs(limit=30):
+    """首页快捷入口用的新歌, 与 recommend 共享解析但使用首页短超时."""
+    data = {
+        "comm": {"ct": 24, "cv": 4747474},
+        "new_song": {
+            "module": "QQMusic.MusichallServer",
+            "method": "GetNewSong",
+            "param": {"type": 0},
+        },
+    }
+    url = ("https://u.y.qq.com/cgi-bin/musicu.fcg?format=json&data=" +
+           urllib.parse.quote(json.dumps(data, separators=(",", ":"))))
+    j = _home_get(url, headers=QQ_HEADERS)
+    payload = (j.get("new_song") or {}).get("data") or {}
+    rows = payload.get("song_list") or []
+    out = []
+    for t in rows[:limit]:
+        singers = "/".join((s.get("name") or "") for s in t.get("singer") or [])
+        album = t.get("album") or {}
+        pay = t.get("pay") or {}
+        vip = bool(pay.get("pay_play") or pay.get("payplay") or
+                   pay.get("pay_status") or pay.get("paystatus") or
+                   pay.get("pay_month") or pay.get("paymonth") or
+                   pay.get("note") not in (0, None))
+        media = ((t.get("file") or {}).get("media_mid") or t.get("media_mid") or "")
+        mid = t.get("mid") or t.get("songmid") or t.get("id")
+        if not mid:
+            continue
+        out.append(song("qq", mid, t.get("name") or t.get("title") or "",
+                        singers, album.get("name", ""), t.get("interval", 0),
+                        _cover(album.get("mid")),
+                        extra={"vip": vip, "media_mid": media}))
+    return out
+
+
+def home(limit=30):
+    """QQ 首页: 各区块并行抓取, 单次请求短超时且总预算内返回."""
+    token = _HOME_DEADLINE.set(time.monotonic() + _HOME_BUDGET)
+    try:
+        def task_playlists():
+            return _cached_home_part("playlists", lambda: _home_public_playlists(limit=12),
+                                     allow_empty=False)
+
+        def task_charts():
+            return _cached_home_part("charts", lambda: [
+                _home_toplist_info(tid) for tid in _HOME_TOPLIST_META],
+                                     allow_empty=False)
+
+        def task_activities():
+            def load():
+                cards = _home_banners(limit=4)
+                return cards if cards else [
+                    {"id": "67421058", "ref": "67421058", "albumid": "67421058",
+                     "title": "QQ音乐精选专辑",
+                     "cover": "https://y.qq.com/music/common/upload/MUSIC_FOCUS/7032830.png?max_age=2592000",
+                     "sub": "QQ音乐 · 精选活动", "tag": "精选活动", "action": "album"},
+                    {"id": "67445700", "ref": "67445700", "albumid": "67445700",
+                     "title": "QQ音乐新碟",
+                     "cover": "https://y.qq.com/music/common/upload/ocs/a784ddef0b4632a2c9fa822a16f5a6a6.jpg?max_age=2592000",
+                     "sub": "QQ音乐 · 精选活动", "tag": "精选活动", "action": "album"},
+                ]
+            return _cached_home_part("activities", load, allow_empty=False)
+
+        tasks = [task_playlists, task_charts, task_activities]
+        results = _parallel_map(lambda fn: fn(), tasks, limit=3)
+        new_songs = []
+        playlists = (results[0] or [])[:12]
+        charts = results[1] or []
+        activities = results[2] or []
+        quick = [
+            {"title": "每日推荐", "sub": "QQ音乐新歌速递", "cover": "", "tag": "每日更新",
+             "action": "songs", "mode": "new"},
+            {"title": "新歌速递", "sub": "最新上架歌曲", "cover": "", "tag": "新歌",
+             "action": "songs", "mode": "new"},
+            {"title": "巅峰榜·热歌", "sub": "站内播放热度", "cover": "", "tag": "榜单",
+             "action": "toplist", "topid": 26},
+            {"title": "私人推荐", "sub": "根据常听风格推荐",
+             "cover": playlists[0].get("cover") if playlists else "", "tag": "个性化",
+             "action": "playlist", "ref": playlists[0].get("ref") if playlists else ""},
+            {"title": "经典专区", "sub": "热门怀旧金曲", "cover": "", "tag": "精选",
+             "action": "search", "keyword": "经典老歌"},
+            {"title": "听·周杰伦", "sub": "艺人歌曲精选", "cover": "", "tag": "艺人",
+             "action": "search", "keyword": "周杰伦"},
+        ]
+        return {"quick": quick, "playlists": playlists, "charts": charts,
+                "activities": activities, "songs": new_songs, "source": "qq"}
+    finally:
+        _HOME_DEADLINE.reset(token)
+
+
+def recommend(limit=30, mode=None, topid=None, albumid=None):
+    """QQ 推荐: 默认新歌; topid 指定巅峰榜, albumid 指定精选专辑."""
+    if albumid:
+        try:
+            j = http_get("https://c.y.qq.com/v8/fcg-bin/fcg_v8_album_info_cp.fcg"
+                         "?albumid=%s&format=json" % urllib.parse.quote(str(albumid)),
+                         headers=_headers(_cookie_str()))
+        except Exception as e:
+            return {"songs": [], "error": str(e)}
+        rows = (j.get("data") or {}).get("list") or []
+        out = []
+        for t in rows[:limit]:
+            if not (t.get("songmid") or t.get("songid")):
+                continue
+            singers = "/".join((s.get("name") or "") for s in (t.get("singer") or []))
+            pay = t.get("pay") or {}
+            out.append(song("qq", t.get("songmid") or t.get("songid"),
+                            t.get("songname") or t.get("songorig") or "",
+                            singers, t.get("albumname") or "", t.get("interval") or 0,
+                            _cover(t.get("albummid") or t.get("strMediaMid")),
+                            extra={"vip": bool(pay.get("payplay") or pay.get("payalbum")),
+                                   "media_mid": t.get("strMediaMid") or ""}))
+        return {"songs": out, "has_more": False}
+    if topid:
+        try:
+            j = http_get("https://c.y.qq.com/v8/fcg-bin/fcg_v8_toplist_cp.fcg"
+                         "?topid=%s&format=json" % urllib.parse.quote(str(topid)),
+                         headers=_headers(_cookie_str()))
+        except Exception as e:
+            return {"songs": [], "error": str(e)}
+        rows = []
+        for r in (j.get("songlist") or [])[:limit]:
+            t = r.get("data") or {}
+            if t.get("songmid"):
+                rows.append(_home_song(t))
+        return {"songs": rows, "has_more": False}
+    try:
+        limit = int(limit)
+    except (TypeError, ValueError):
+        limit = 30
+    limit = max(1, min(100, limit))
+    return {"songs": _home_new_songs(limit), "has_more": False}
+
+
+def get_playlist(ref, quick=False):
     """歌单内容: 经典端点 fcg_ucc_getcdinfo_byids_cp (cdlist[0].songlist),
-    登录 Cookie 下可完整读取"我喜欢"等私有歌单."""
+    登录 Cookie 下可完整读取"我喜欢"等私有歌单. quick=True 供首页可用性探测,
+    使用短超时且不重试, 避免阻塞首页加载."""
     ref = ("%s" % ref).strip()
     ck = _cookie_str()
     uin = _uin()
@@ -217,7 +553,10 @@ def get_playlist(ref):
            "&hostUin=0&format=json&inCharset=utf8&outCharset=utf-8&notice=0"
            "&platform=yqq&needNewCode=0" % (urllib.parse.quote(ref), gk, uin if ck else "0"))
     try:
-        j = http_get(url, headers=_headers(ck) if ck else QQ_HEADERS)
+        if quick:
+            j = _home_get(url, headers=_headers(ck) if ck else QQ_HEADERS)
+        else:
+            j = http_get(url, headers=_headers(ck) if ck else QQ_HEADERS)
     except Exception as e:
         return {"error": "获取歌单失败: %s" % e}
     cds = j.get("cdlist") or []

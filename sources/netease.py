@@ -5,6 +5,7 @@ import os
 import threading
 import time
 import urllib.parse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from . import secure_store, song
 from .common import http_get, http_post, UA
@@ -55,8 +56,9 @@ def _headers(cookie=None):
     return h
 
 
-def _get(url, cookie=None, timeout=12):
-    return http_get(url, headers=_headers(cookie), timeout=timeout)
+def _get(url, cookie=None, timeout=12, attempts=2, budget=None):
+    return http_get(url, headers=_headers(cookie), timeout=timeout,
+                    attempts=attempts, budget=budget)
 
 
 def _post(url, data, cookie=None, form=True):
@@ -233,6 +235,204 @@ def search(keyword, limit=30, page=1):
     total = int(total) if total else None
     has_more = (page * limit < total) if total else (len(out) >= limit)
     return {"songs": out, "page": page, "total": total, "page_size": limit, "has_more": has_more}
+
+
+def _fmt_count(v):
+    try:
+        n = float(v or 0)
+    except (TypeError, ValueError):
+        return ""
+    if n >= 100000000:
+        return "%.1f亿播放" % (n / 100000000)
+    if n >= 10000:
+        return "%.1f万播放" % (n / 10000)
+    return "%d播放" % int(n)
+
+
+def _safe_get(url, cookie=None):
+    try:
+        j = _get(url, cookie=cookie)
+        return j if isinstance(j, dict) else {}
+    except Exception:
+        return {}
+
+
+_HOME_TTL = 300
+_HOME_BUDGET = 2.0
+_HOME_TOPLIST_META = [
+    {"id": 19723756, "name": "飙升榜", "coverImgUrl": "https://p2.music.126.net/DrRIg6CrgDfVLEph9SNh7w==/18696095720518497.jpg", "updateFrequency": "刚刚更新", "trackCount": 100},
+    {"id": 3779629, "name": "新歌榜", "coverImgUrl": "https://p2.music.126.net/N2HO5xfYEqyQ8q6oxCw8IQ==/18713687906568048.jpg", "updateFrequency": "每天更新", "trackCount": 100},
+    {"id": 2884035, "name": "原创榜", "coverImgUrl": "https://p2.music.126.net/sBzD11nforcuh1jdLSgX7g==/18740076185638788.jpg", "updateFrequency": "每周四更新", "trackCount": 100},
+    {"id": 3778678, "name": "热歌榜", "coverImgUrl": "https://p2.music.126.net/GhhuF6Ep5Tq9IEvLsyCN7w==/18708190348409091.jpg", "updateFrequency": "每天更新", "trackCount": 200},
+    {"id": 71384707, "name": "网易云古典榜", "coverImgUrl": "https://p2.music.126.net/urByD_AmfBDBrs7fA9-O8A==/109951167976973225.jpg", "updateFrequency": "每周四更新", "trackCount": 100},
+    {"id": 1978921795, "name": "网易云电音榜", "coverImgUrl": "https://p2.music.126.net/hXGObvXfsGtFjFvRhOYAkA==/109951170091888741.jpg", "updateFrequency": "每周五更新", "trackCount": 50},
+]
+_HOME_PRIVATE_META = [
+    {"id": 0, "name": "网易独家放送", "picUrl": "https://p2.music.126.net/DrRIg6CrgDfVLEph9SNh7w==/18696095720518497.jpg", "tag": "精选内容"},
+    {"id": 0, "name": "云村精选", "picUrl": "https://p2.music.126.net/N2HO5xfYEqyQ8q6oxCw8IQ==/18713687906568048.jpg", "tag": "编辑推荐"},
+]
+_HOME_CACHE = {}
+_HOME_STALE = {}
+_HOME_CACHE_LOCK = threading.Lock()
+
+
+def _home_get(url, cookie=None):
+    """首页专用请求: 单次尝试、短超时, 失败返回空 dict."""
+    try:
+        j = _get(url, cookie=cookie, timeout=1.5, attempts=1, budget=1.5)
+        if isinstance(j, dict) and ("error" in j or "_nonjson" in j):
+            return {}
+        return j if isinstance(j, dict) else {}
+    except Exception:
+        return {}
+
+
+def _cached_home_part(key, fn, allow_empty=False):
+    """首页片段短缓存: 新鲜值直接返回; 请求失败时允许用过期值兜底."""
+    now = time.monotonic()
+    with _HOME_CACHE_LOCK:
+        hit = _HOME_CACHE.get(key)
+        if hit and hit[0] > now:
+            return hit[1]
+    try:
+        val = fn()
+    except Exception:
+        val = None
+    if val:
+        with _HOME_CACHE_LOCK:
+            _HOME_CACHE[key] = (now + _HOME_TTL, val)
+            _HOME_STALE[key] = val
+        return val
+    with _HOME_CACHE_LOCK:
+        return _HOME_STALE.get(key, [] if allow_empty else {})
+
+
+def _home_parallel(tasks, budget=None):
+    """并行执行首页片段请求; 总预算到后不再等待剩余任务, 保留输入顺序."""
+    out = [None] * len(tasks)
+    if not tasks:
+        return out
+    deadline = time.monotonic() + (budget if budget is not None else _HOME_BUDGET)
+    pool = ThreadPoolExecutor(max_workers=len(tasks))
+    try:
+        futures = {pool.submit(fn): i for i, fn in enumerate(tasks)}
+        for f in as_completed(futures, timeout=max(0.1, deadline - time.monotonic())):
+            try:
+                out[futures[f]] = f.result()
+            except Exception:
+                pass
+    except TimeoutError:
+        pass
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
+    return out
+
+
+def recommend(limit=30, mode=None, topid=None, albumid=None):
+    """首页/推荐数据: daily=每日推荐, fm=私人漫游, toplist=榜单,
+    personalized/newsong=个性化新歌(默认)."""
+    try:
+        limit = int(limit)
+    except (TypeError, ValueError):
+        limit = 30
+    limit = max(1, min(100, limit))
+    ck = _cookie_str()
+    if mode == "daily":
+        j = _safe_get("https://music.163.com/api/v3/discovery/recommend/songs", ck)
+        rows = ((j.get("data") or {}).get("dailySongs") or [])
+    elif mode == "fm":
+        j = _safe_get("https://music.163.com/api/v1/radio/get", ck)
+        rows = j.get("data") or []
+    elif mode == "toplist" and topid:
+        j = _safe_get(
+            "https://music.163.com/api/v3/playlist/detail?id=%s&n=1000&s=0" %
+            urllib.parse.quote(str(topid)), ck)
+        pl = j.get("playlist") or j.get("result") or {}
+        rows = pl.get("tracks") or []
+    else:
+        # limit=1/2 偶尔会被接口风控返回404，因此请求至少10条，再按调用方要求截断。
+        request_limit = max(10, limit)
+        j = _safe_get(
+            "https://music.163.com/api/personalized/newsong?limit=%d" %
+            request_limit, ck)
+        rows = j.get("result") or []
+    out = []
+    for item in rows:
+        t = item.get("song") or item
+        if not t.get("id"):
+            continue
+        out.append(song("netease", t.get("id"), t.get("name"), _artists(t),
+                        (t.get("al") or t.get("album") or {}).get("name", ""),
+                        _dur(t), _cover(t) or item.get("picUrl", ""),
+                        extra=_extra(t)))
+        if len(out) >= limit:
+            break
+    return {"songs": out, "has_more": False}
+
+
+def home(limit=30):
+    """网易云首页: 并行抓取各区块, 单次请求短超时且有总预算."""
+    ck = _cookie_str()
+    cache_key = _account_key(ck) or "anon"
+    urls = {
+        "daily": "https://music.163.com/api/v3/discovery/recommend/songs",
+        "resource": "https://music.163.com/api/v1/discovery/recommend/resource",
+        "playlists": "https://music.163.com/api/personalized/playlist?limit=12",
+        "private": "https://music.163.com/api/personalized/privatecontent?limit=4",
+        "toplist": "https://music.163.com/api/toplist/detail",
+    }
+    keys = list(urls)
+    results = _home_parallel([
+        lambda k=k: _cached_home_part(cache_key + ":" + k,
+                                      lambda: _home_get(urls[k], ck))
+        for k in keys
+    ])
+    data = dict(zip(keys, results))
+    daily_rows = ((data.get("daily") or {}).get("data") or {}).get("dailySongs") or []
+    resource = (data.get("resource") or {}).get("recommend") or []
+    pls = (data.get("playlists") or {}).get("result") or []
+    tops = (data.get("toplist") or {}).get("list") or _HOME_TOPLIST_META
+    private = (data.get("private") or {}).get("result") or _HOME_PRIVATE_META
+
+    def cover(i, arr, key="picUrl", fallback=""):
+        try:
+            return arr[i].get(key) or fallback
+        except (IndexError, AttributeError, TypeError):
+            return fallback
+
+    daily_cover = _cover(daily_rows[0]) if daily_rows else cover(0, resource)
+    quick = [
+        {"title": "每日推荐", "sub": "根据你的口味生成", "cover": daily_cover,
+         "action": "songs", "mode": "daily", "tag": "每日更新"},
+        {"title": "私人雷达", "sub": "发现更多相似好歌",
+         "cover": cover(0, resource), "ref": (resource[0] or {}).get("id") if resource else "3136952023",
+         "action": "playlist", "tag": "个性化"},
+        {"title": "私人漫游", "sub": "随机漫游你的音乐口味", "cover": cover(1, resource, fallback=cover(0, pls)),
+         "action": "songs", "mode": "fm", "tag": "FM"},
+        {"title": "经典专区", "sub": "古典与精选榜单", "cover": cover(4, tops, "coverImgUrl", cover(2, pls)),
+         "action": "toplist", "topid": "71384707", "tag": "榜单"},
+        {"title": "相似歌曲", "sub": "从常听风格延伸", "cover": cover(0, pls, fallback=cover(2, resource)),
+         "action": "songs", "mode": "personalized", "tag": "发现"},
+        {"title": "听·G.E.M.邓紫棋", "sub": "艺人歌曲精选", "cover": cover(3, pls, fallback=cover(4, resource)),
+         "action": "search", "keyword": "G.E.M.邓紫棋", "tag": "艺人"},
+    ]
+    playlists = [{
+        "id": p.get("id"), "ref": p.get("id"), "title": p.get("name") or "推荐歌单",
+        "cover": p.get("picUrl") or "", "sub": _fmt_count(p.get("playCount")),
+        "tag": p.get("copywriter") or "推荐歌单", "action": "playlist",
+    } for p in pls[:12] if p.get("id")]
+    charts = [{
+        "id": t.get("id"), "topid": t.get("id"), "title": t.get("name") or "排行榜",
+        "cover": t.get("coverImgUrl") or "", "sub": t.get("updateFrequency") or "排行榜",
+        "tag": "%s首" % (t.get("trackCount") or 0), "action": "toplist",
+    } for t in tops[:6] if t.get("id")]
+    activities = [{
+        "id": p.get("id"), "title": p.get("name") or "独家放送",
+        "cover": p.get("picUrl") or p.get("sPicUrl") or "",
+        "sub": p.get("tag") or "精选内容", "action": "none",
+    } for p in private[:4]]
+    return {"quick": quick, "playlists": playlists, "charts": charts,
+            "activities": activities, "source": "netease"}
 
 
 def list_my_playlists():

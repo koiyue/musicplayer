@@ -33,6 +33,146 @@ function withTok(url) {
   return url + (url.indexOf("?") === -1 ? "?" : "&") + "t=" + encodeURIComponent(MH_TOKEN);
 }
 const audio = $("audio");
+// ---------------- 一起听: 播放器桥接 ----------------
+// Listen.* 由 web/listen.js 注入; app.js 保持无房间时行为不变。
+const Listen = {
+  active: false, role: "", applying: null, suppressPersist: false,
+  timeline: { basePos: 0, baseTs: Date.now(), rate: 1, playing: false, duration: 0 },
+};
+window.Listen = Listen;
+function roomActive() { return !!(window.Listen && window.Listen.active); }
+function roomApplying() { return !!(window.Listen && window.Listen.applying); }
+function roomClock() {
+  if (!roomActive()) return null;
+  const t = window.Listen.timeline || {};
+  const rate = Number(t.rate) || 1;
+  const base = Number(t.basePos) || 0;
+  const ts = Number(t.baseTs) || Date.now();
+  return { pos: Math.max(0, base + (t.playing ? (Date.now() - ts) / 1000 * rate : 0)),
+           rate: rate, playing: !!t.playing, duration: Number(t.duration) || 0 };
+}
+function withApply(origin, fn) {
+  const ctx = window.Listen;
+  const old = ctx && ctx.applying;
+  if (ctx) ctx.applying = origin || "remote";
+  try { return fn(); } finally { if (ctx) ctx.applying = old || null; }
+}
+function roomPropose(type, payload) {
+  const L = window.Listen;
+  if (!L || !L.active || roomApplying()) return false;
+  if (typeof L.propose === "function") { L.propose(type, payload || {}); return true; }
+  return false;
+}
+function roomIntent(type, payload, localFn) {
+  if (roomPropose(type, payload)) return true;
+  if (typeof localFn === "function") localFn();
+  return false;
+}
+function roomApplyIntent(p) {
+  if (!p || typeof p !== "object") return;
+  const t = p.type, pl = p.payload || {};
+  if (t === "chat" || t === "state" || t === "transport" || t === "hello") return;
+  withApply("remote", () => {
+    Listen.suppressPersist = true;
+    if (t === "play") audio.play().catch(() => {});
+    else if (t === "pause") audio.pause();
+    else if (t === "seek") { if (audio.src && audio.duration) audio.currentTime = Math.max(0, Number(pl.time) || 0); }
+    else if (t === "set_rate") { settings.rate = Number(pl.rate) || 1; audio.playbackRate = settings.rate; $("lo-video-el").playbackRate = settings.rate; }
+    else if (t === "set_mode") { state.mode = pl.mode || state.mode; $("btn-mode").innerHTML = MODES[state.mode].icon; }
+    else if (t === "prev") prev();
+    else if (t === "next" || t === "advance") next();
+    else if (t === "play_song" && pl.song) playNow(pl.song, pl.fromList || null);
+    else if (t === "queue_add" && pl.song) addToQueue(pl.song);
+    else if (t === "feed_enter" && pl.song) playFeed(pl.song, pl.list || []);
+    else if (t === "feed_part") {
+      const i = Number(pl.index), s = aq()[i];
+      if (s) { aq()[i] = Object.assign({}, s, { extra: pl.extra || {} }); playAt(i); renderQueue(); }
+    }
+    Listen.suppressPersist = false;
+    const st = roomSnapshot();
+    if (t === "play") st.playing = true;
+    if (t === "pause") st.playing = false;
+    if (t === "seek") st.time = Math.max(0, Number(pl.time) || 0);
+    Listen.timeline = { basePos: Number(st.time) || 0, baseTs: Date.now(),
+                        rate: st.rate, playing: !!st.playing, duration: st.duration };
+    renderQueue(); markPlayingRows();
+  });
+}
+function roomSnapshot() {
+  const s = curSong();
+  const c = roomClock();
+  return {
+    song: s ? JSON.parse(JSON.stringify(s)) : null,
+    song_key: s ? songKey(s) : "",
+    queue: JSON.parse(JSON.stringify(state.queue || [])),
+    feedQueue: JSON.parse(JSON.stringify(state.feedQueue || [])),
+    index: state.index, feedMode: !!state.feedMode,
+    mainIndex: state.mainIndex, plView: state.plView, mode: state.mode,
+    playing: c ? c.playing : (!audio.paused && !!audio.src),
+    time: c ? c.pos : (audio.currentTime || 0),
+    duration: c ? c.duration : (audio.duration || (s && s.duration) || 0),
+    rate: c ? c.rate : (audio.playbackRate || settings.rate || 1),
+    qn: biliQn || 16, generation: 0,
+  };
+}
+function roomApplyState(st) {
+  if (!st || typeof st !== "object") return;
+  withApply("snapshot", () => {
+    Listen.suppressPersist = true;
+    if (Array.isArray(st.queue)) state.queue = JSON.parse(JSON.stringify(st.queue));
+    if (Array.isArray(st.feedQueue)) state.feedQueue = JSON.parse(JSON.stringify(st.feedQueue));
+    state.feedMode = !!st.feedMode;
+    state.mainIndex = Number.isFinite(st.mainIndex) ? st.mainIndex : -1;
+    state.plView = st.plView || "feed";
+    state.mode = st.mode || "loop";
+    if (Number.isFinite(st.index)) state.index = st.index;
+    settings.rate = Number(st.rate) || 1;
+    audio.playbackRate = settings.rate;
+    const loSpeed = $("lo-speed");
+    if (loSpeed) loSpeed.value = String(settings.rate);
+    const s = curSong();
+    if (s) {
+      $("pb-title").textContent = s.title || "";
+      $("pb-artist").textContent = (s.artist || "—") + " · " + (SRC_NAME[s.source] || s.source);
+      const pcs = coverSrc(s);
+      $("pb-cover").innerHTML = pcs ? '<img src="' + esc(pcs) + '">' : "♪";
+      audio.dataset.key = songKey(s);
+      audio.dataset.resume = "";
+      if (Listen.role === "host") {
+        audio.src = proxyUrl(s);
+        if (st.playing) audio.play().catch(() => {}); else audio.pause();
+      } else {
+        audio.removeAttribute("src");
+        audio.load();
+      }
+      if (desktopLyrics.enabled) desktopBeginSong(s);
+      if (lyricOpen) setupVideo(s);
+      loadLyrics(s);
+    }
+    const t = Number(st.time) || 0;
+    Listen.timeline = { basePos: t, baseTs: Date.now(), rate: settings.rate,
+                        playing: !!st.playing, duration: Number(st.duration) || 0 };
+    if (Listen.role === "host" && s && Math.abs(audio.currentTime - t) > 0.5 && audio.duration)
+      audio.currentTime = t;
+    renderQueue(); markPlayingRows();
+    const modeBtn = $("btn-mode");
+    if (modeBtn) { modeBtn.innerHTML = MODES[state.mode].icon; modeBtn.title = MODES[state.mode].name; }
+    Listen.suppressPersist = false;
+  });
+}
+window.MusicHubPlayer = {
+  snapshot: roomSnapshot,
+  apply: roomApplyState,
+  applyIntent: roomApplyIntent,
+  clock: roomClock,
+  withApply: withApply,
+  propose: roomPropose,
+  songKey: songKey,
+  state: state,
+  audio: audio,
+};
+window.toast = toast;
+window.esc = esc;
 // Windows 媒体风格播放模式图标
 const _st = 'fill="none" stroke="currentColor" stroke-width="3.4" stroke-linecap="round" stroke-linejoin="round"';
 const MODES = {
@@ -160,6 +300,7 @@ function flushPendingSaves() {
   }
 }
 function saveQueue() {
+  if (window.Listen && window.Listen.suppressPersist) return;
   userTouchedQueue = true;
   pendingQueueBody = queueBody();
   clearTimeout(saveTimer);
@@ -171,18 +312,21 @@ function saveQueue() {
   }, 400);
 }
 
-// 设置持久化(音量 + 播放进度 + 代理 + 字体), 保存到本地 data/settings.json
+// 设置持久化(音量 + 播放进度 + 代理 + 字体 + 程序皮肤), 保存到本地 data/settings.json
 const DEFAULT_PROXY = { mode: "system", http: "", https: "" };
 const DEFAULT_FONT = {
   ui_family: "Microsoft YaHei", ui_scale: 1,
   lyrics_family: "Microsoft YaHei UI", lyrics_size: 28,
 };
+const DEFAULT_SKIN = { enabled: false, type: "", url: "", data: "", fit: "cover", name: "", size: 0 };
 let settings = {
   volume: 0.8, pos: null, rate: 1,
   proxy: Object.assign({}, DEFAULT_PROXY),
   font: Object.assign({}, DEFAULT_FONT),
+  skin: Object.assign({}, DEFAULT_SKIN),
 };  // pos: {key, time}
 function saveSettings() {
+  if (window.Listen && window.Listen.suppressPersist) return;
   userTouchedSettings = true;
   pendingSettingsBody = JSON.stringify(settingSnapshot());
   clearTimeout(setTimer);
@@ -195,9 +339,12 @@ function saveSettings() {
 }
 let lastPosSave = 0;
 function settingSnapshot() {
-  return Object.assign({}, bootSettings || {}, settings);
+  const out = Object.assign({}, bootSettings || {}, settings);
+  out.skin = skinForSave(settings.skin);
+  return out;
 }
 function savePos() {
+  if (window.Listen && (window.Listen.active || window.Listen.suppressPersist)) return;
   if (audio.duration && audio.currentTime > 3 && audio.dataset.key) {
     settings.pos = { key: audio.dataset.key, time: audio.currentTime };
   } else {
@@ -215,15 +362,285 @@ function applyFontSettings() {
   document.documentElement.style.setProperty("--font-family", cssFontFamily(f.ui_family));
   document.documentElement.style.setProperty("--font-scale", String(f.ui_scale));
 }
+function normalizeSkin(value) {
+  const s = value && typeof value === "object" ? value : {};
+  const url = typeof s.url === "string" ? s.url : (typeof s.path === "string" ? s.path : "");
+  const data = typeof s.data === "string" ? s.data : "";
+  const m = data.match(/^data:(image|video)\/[a-z0-9.+-]+(?:;[^,]*)?,/i);
+  const type = s.type === "image" || s.type === "video" ? s.type : (m ? m[1].toLowerCase() : "");
+  const fit = ["fill", "contain", "cover"].includes(s.fit) ? s.fit : DEFAULT_SKIN.fit;
+  // 仅允许本地皮肤端点；媒体文件会在渲染时由 skinMediaSrc 追加本次启动令牌。
+  let cleanUrl = "";
+  if (url && /^\/skin\?name=[^#\s]+$/i.test(url)) {
+    try {
+      const parsed = new URL(url, location.origin);
+      const stored = parsed.searchParams.get("name") || "";
+      if (stored && stored === stored.replace(/[\\/]/g, "")) {
+        cleanUrl = "/skin?name=" + encodeURIComponent(stored);
+      }
+    } catch (_) {}
+  }
+  const validUrl = !!cleanUrl;
+  const validData = data && m && m[1].toLowerCase() === type;
+  // 兼容旧版本 data URL，同时接受上传接口返回的相对/绝对 URL。
+  if ((!validUrl && !validData) || !type) return Object.assign({}, DEFAULT_SKIN, { fit });
+  return {
+    enabled: s.enabled !== false,
+    type,
+    url: cleanUrl,
+    data,
+    fit,
+    name: typeof s.name === "string" ? s.name.slice(0, 160) : "",
+    size: Number.isFinite(Number(s.size)) ? Math.max(0, Number(s.size)) : 0,
+  };
+}
+function skinSource(value) {
+  const s = normalizeSkin(value);
+  return s.url || s.data || "";
+}
+function skinMediaSrc(source) {
+  if (!source || source.startsWith("data:") || source.startsWith("blob:")) return source;
+  return source.startsWith("/") ? withTok(source) : source;
+}
+function skinForSave(value) {
+  const s = normalizeSkin(value);
+  const out = {
+    enabled: Boolean(s.enabled && (s.url || s.data)),
+    type: s.type,
+    url: s.url || "",
+    name: s.name || "",
+    fit: s.fit,
+    size: s.size || 0,
+  };
+  // 旧图片 data URL 可继续兼容；视频 data URL 不再写入设置请求体。
+  if (!s.url && s.data && s.type === "image") out.data = s.data;
+  if (!s.url && s.type === "video") out.enabled = false;
+  return out;
+}
+function skinObjectFit(fit) {
+  return ["fill", "contain", "cover"].includes(fit) ? fit : DEFAULT_SKIN.fit;
+}
+function applySkinSettings(value) {
+  const s = normalizeSkin(value);
+  const root = document.body;
+  const bg = $("skin-bg"), img = $("skin-bg-image"), video = $("skin-bg-video");
+  if (!bg || !img || !video) return;
+  video.pause();
+  video.removeAttribute("src");
+  img.removeAttribute("src");
+  img.style.objectFit = skinObjectFit(s.fit);
+  video.style.objectFit = skinObjectFit(s.fit);
+  img.style.display = "none";
+  video.style.display = "none";
+  if (!s.enabled || !skinSource(s)) {
+    root.classList.remove("skin-active");
+    return;
+  }
+  root.classList.add("skin-active");
+  const source = skinMediaSrc(skinSource(s));
+  if (s.type === "video") {
+    video.style.display = "block";
+    video.src = source;
+    video.load();
+    const p = video.play();
+    if (p && typeof p.catch === "function") p.catch(() => {});
+  } else {
+    img.style.display = "block";
+    img.src = source;
+  }
+}
+let skinDraft = Object.assign({}, DEFAULT_SKIN);
+let skinUploadPending = false;
+let skinUploadSeq = 0;
+function setSkinUploadPending(on) {
+  skinUploadPending = !!on;
+  const save = $("settings-save");
+  if (save) save.disabled = skinUploadPending;
+}
+function renderSkinPreview(value) {
+  const s = normalizeSkin(value);
+  const box = $("set-skin-preview"), name = $("set-skin-file-name");
+  if (!box || !name) return;
+  box.innerHTML = "";
+  box.style.setProperty("--skin-fit", skinObjectFit(s.fit));
+  if (!s.enabled || !skinSource(s)) {
+    box.innerHTML = '<span class="skin-preview-empty">未选择皮肤</span>';
+    name.textContent = "支持 JPG、PNG、GIF、WebP、MP4、WebM，单个文件不超过 200 MB。";
+    return;
+  }
+  const media = document.createElement(s.type === "video" ? "video" : "img");
+  media.src = skinMediaSrc(skinSource(s));
+  media.style.objectFit = skinObjectFit(s.fit);
+  media.alt = s.name || "程序皮肤预览";
+  if (s.type === "video") {
+    media.muted = true; media.autoplay = true; media.loop = true; media.playsInline = true;
+    media.addEventListener("canplay", () => { const p = media.play(); if (p) p.catch(() => {}); }, { once: true });
+  }
+  box.appendChild(media);
+  name.textContent = s.name ? (s.name + (s.size ? " · " + (s.size / 1048576).toFixed(1) + " MB" : "")) : "已选择皮肤";
+}
+function skinFileError(message) {
+  $("set-msg").textContent = message;
+  $("set-skin-file").value = "";
+  setSkinUploadPending(false);
+}
+function loadSkinFile(file) {
+  if (!file) return;
+  const isImage = file.type && file.type.startsWith("image/");
+  const isVideo = file.type && file.type.startsWith("video/");
+  if (!isImage && !isVideo) {
+    skinFileError("请选择图片、动图或视频文件");
+    return;
+  }
+  const max = 200 * 1024 * 1024;
+  if (file.size > max) {
+    skinFileError("皮肤文件不能超过 200 MB");
+    return;
+  }
+  const requestSeq = ++skinUploadSeq;
+  setSkinUploadPending(true);
+  $("set-msg").textContent = "正在上传皮肤…";
+  const queryName = encodeURIComponent(file.name || "skin");
+  fetch("/api/skin?name=" + queryName, {
+    method: "POST",
+    headers: { "Content-Type": file.type || (isVideo ? "video/mp4" : "image/png") },
+    body: file,
+  }).then(async (r) => {
+    const raw = await r.text();
+    let j = {};
+    try { j = raw ? JSON.parse(raw) : {}; } catch (_) { j = { url: raw.trim() }; }
+    if (!r.ok) throw new Error(j.error || "HTTP " + r.status);
+    if (requestSeq !== skinUploadSeq) return;
+    const item = (j && typeof j.skin === "object") ? j.skin : j;
+    const uploadedName = item && (item.name || item.file);
+    const url = item && (item.url || item.path || item.src ||
+      (uploadedName ? "/skin?name=" + encodeURIComponent(uploadedName) : ""));
+    if (!url || typeof url !== "string") throw new Error("服务器未返回皮肤地址");
+    skinDraft = normalizeSkin({
+      enabled: true,
+      type: isVideo ? "video" : "image",
+      url,
+      fit: $("set-skin-fit").value,
+      name: (file.name || item.name || "").slice(0, 160),
+      size: Number(item.size) || file.size,
+    });
+    renderSkinPreview(skinDraft);
+    $("set-msg").textContent = "皮肤已上传，点击保存后生效";
+    setSkinUploadPending(false);
+  }).catch((e) => {
+    if (requestSeq === skinUploadSeq) skinFileError("皮肤上传失败：" + (e.message || e));
+    else setSkinUploadPending(false);
+  });
+}
 const FONT_FAMILIES = [
   "Microsoft YaHei", "Microsoft YaHei UI", "SimHei", "SimSun", "KaiTi",
   "DengXian", "PingFang SC", "Segoe UI", "Arial", "Consolas",
 ];
+// 设置里的原生 select 展开层是系统白底直角; 用应用内圆角菜单替代显示
+let openSetSelect = null;
+function setSelectLabel(wrap, select) {
+  const label = wrap.querySelector(".set-select-label");
+  const opt = select.options[select.selectedIndex];
+  if (label) label.textContent = opt ? opt.textContent : (select.value || "");
+}
+function refreshSetSelects() {
+  document.querySelectorAll(".set-select").forEach((wrap) => {
+    const select = wrap.querySelector("select");
+    if (select) setSelectLabel(wrap, select);
+  });
+}
+function closeSetSelectMenus() {
+  if (!openSetSelect) return;
+  openSetSelect.menu.remove();
+  openSetSelect.wrap.classList.remove("open");
+  openSetSelect = null;
+}
+function openSetSelectMenu(wrap, select) {
+  if (openSetSelect && openSetSelect.wrap === wrap) {
+    closeSetSelectMenus();
+    return;
+  }
+  closeSetSelectMenus();
+  setSelectLabel(wrap, select);
+  const menu = document.createElement("div");
+  menu.className = "set-select-menu";
+  Array.from(select.options).forEach((o) => {
+    const item = document.createElement("div");
+    item.className = "set-select-option" + (o.value === select.value ? " active" : "");
+    item.textContent = o.textContent;
+    item.addEventListener("click", (e) => {
+      e.stopPropagation();
+      const before = openSetSelect;
+      select.value = o.value;
+      select.dispatchEvent(new Event("change", { bubbles: true }));
+      setSelectLabel(wrap, select);
+      if (openSetSelect === before) closeSetSelectMenus();
+    });
+    menu.appendChild(item);
+  });
+  document.body.appendChild(menu);
+  const r = wrap.getBoundingClientRect();
+  const maxHeight = Math.max(120, Math.min(260, window.innerHeight * 0.42));
+  menu.style.width = Math.max(140, r.width) + "px";
+  menu.style.maxHeight = maxHeight + "px";
+  const below = window.innerHeight - r.bottom - 8;
+  const above = r.top - 8;
+  let top = r.bottom + 6;
+  if (below < Math.min(menu.scrollHeight, maxHeight) && above > below)
+    top = Math.max(8, r.top - Math.min(menu.offsetHeight, maxHeight) - 6);
+  menu.style.left = Math.max(8, Math.min(r.left, window.innerWidth - menu.offsetWidth - 8)) + "px";
+  menu.style.top = Math.max(8, Math.min(top, window.innerHeight - menu.offsetHeight - 8)) + "px";
+  wrap.classList.add("open");
+  openSetSelect = { wrap: wrap, menu: menu };
+  const active = menu.querySelector(".active");
+  if (active) {
+    const itemTop = active.offsetTop;
+    const view = menu.clientHeight;
+    menu.scrollTop = Math.max(0, itemTop - view / 2 + active.offsetHeight / 2);
+  }
+}
+function setupRoundedSettingsSelects() {
+  ["set-proxy-mode", "set-ui-family", "set-lyrics-family", "set-skin-fit"].forEach((id) => {
+    const select = $(id);
+    if (!select || select.parentElement.classList.contains("set-select")) return;
+    const wrap = document.createElement("div");
+    wrap.className = "set-select";
+    const trigger = document.createElement("button");
+    trigger.type = "button";
+    trigger.className = "set-select-trigger";
+    const label = document.createElement("span");
+    label.className = "set-select-label";
+    trigger.appendChild(label);
+    select.parentElement.insertBefore(wrap, select);
+    wrap.appendChild(select);
+    wrap.appendChild(trigger);
+    select.tabIndex = -1;
+    select.addEventListener("change", () => setSelectLabel(wrap, select));
+    trigger.addEventListener("click", (e) => {
+      e.stopPropagation();
+      openSetSelectMenu(wrap, select);
+    });
+    setSelectLabel(wrap, select);
+  });
+  document.addEventListener("pointerdown", (e) => {
+    if (openSetSelect && !openSetSelect.wrap.contains(e.target) &&
+        !openSetSelect.menu.contains(e.target)) closeSetSelectMenus();
+  }, true);
+  document.addEventListener("scroll", (e) => {
+    if (openSetSelect && e.target === openSetSelect.menu) return;
+    closeSetSelectMenus();
+  }, true);
+  window.addEventListener("resize", closeSetSelectMenus);
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape") closeSetSelectMenus();
+  });
+}
 function fontOptions(families, select, current) {
   const names = Array.isArray(families) && families.length ? families.slice() : FONT_FAMILIES.slice();
   if (current && !names.includes(current)) names.push(current);
   select.innerHTML = names.map((n) => '<option value="' + esc(n) + '">' + esc(n) + "</option>").join("");
   select.value = current;
+  refreshSetSelects();
 }
 function collectSettingsForm() {
   return {
@@ -238,6 +655,7 @@ function collectSettingsForm() {
       lyrics_family: $("set-lyrics-family").value,
       lyrics_size: Number($("set-lyrics-size").value),
     },
+    skin: skinForSave(Object.assign({}, normalizeSkin(skinDraft), { fit: skinObjectFit($("set-skin-fit").value) })),
   };
 }
 function renderSettingsForm(override) {
@@ -254,8 +672,12 @@ function renderSettingsForm(override) {
   $("set-lyrics-size").value = String(f.lyrics_size);
   $("set-lyrics-size-val").textContent = String(f.lyrics_size);
   $("set-preview").style.fontFamily = cssFontFamily(f.ui_family);
+  skinDraft = normalizeSkin(o.skin || settings.skin);
+  $("set-skin-fit").value = skinObjectFit(skinDraft.fit);
+  renderSkinPreview(skinDraft);
   $("set-msg").textContent = "";
   syncProxyInputs();
+  refreshSetSelects();
 }
 function syncProxyInputs() {
   const on = $("set-proxy-mode").value === "custom";
@@ -263,6 +685,8 @@ function syncProxyInputs() {
   $("set-proxy-https").disabled = !on;
 }
 function renderSettingsFormDefault() {
+  skinUploadSeq++;
+  setSkinUploadPending(false);
   $("set-proxy-mode").value = DEFAULT_PROXY.mode;
   $("set-proxy-http").value = DEFAULT_PROXY.http;
   $("set-proxy-https").value = DEFAULT_PROXY.https;
@@ -273,9 +697,13 @@ function renderSettingsFormDefault() {
   $("set-ui-scale-val").textContent = "100%";
   $("set-lyrics-size-val").textContent = String(DEFAULT_FONT.lyrics_size);
   $("set-preview").style.fontFamily = cssFontFamily(DEFAULT_FONT.ui_family);
+  skinDraft = Object.assign({}, DEFAULT_SKIN);
+  $("set-skin-fit").value = DEFAULT_SKIN.fit;
+  renderSkinPreview(skinDraft);
   document.documentElement.style.setProperty("--font-scale", "1");
   $("set-msg").textContent = "已恢复默认，点保存后生效";
   syncProxyInputs();
+  refreshSetSelects();
 }
 async function openSettings() {
   const nativeFont = {};
@@ -305,12 +733,18 @@ async function openSettings() {
   }
   renderSettingsForm({ font: nativeFont });
   $("settings-modal").classList.remove("hidden");
+  refreshSetSelects();
 }
 function closeSettings() {
   applyFontSettings();  // 撤销未保存的实时字号预览
+  closeSetSelectMenus();
   $("settings-modal").classList.add("hidden");
 }
 async function saveSettingsForm() {
+  if (skinUploadPending) {
+    $("set-msg").textContent = "皮肤仍在上传，请稍候";
+    return;
+  }
   const draft = collectSettingsForm();
   const body = JSON.stringify(Object.assign({}, settingSnapshot(), draft));
   if (setTimer) { clearTimeout(setTimer); setTimer = null; }
@@ -324,8 +758,10 @@ async function saveSettingsForm() {
     userTouchedSettings = true;
     settings.proxy = draft.proxy;
     settings.font = draft.font;
+    settings.skin = normalizeSkin(draft.skin);
     bootSettings = JSON.parse(body);
     applyFontSettings();
+    applySkinSettings(settings.skin);
     const apiObj = desktopApi();
     if (apiObj && typeof apiObj.desktop_lyrics_font === "function") {
       try {
@@ -341,7 +777,10 @@ async function saveSettingsForm() {
 function setupSettingsUI() {
   $("btn-settings").addEventListener("click", openSettings);
   $("settings-close").addEventListener("click", closeSettings);
-  $("settings-modal").addEventListener("click", (e) => { if (e.target.id === "settings-modal") closeSettings(); });
+  $("settings-modal").addEventListener("click", (e) => {
+    if (!e.target.closest(".set-select")) closeSetSelectMenus();
+    if (e.target.id === "settings-modal") closeSettings();
+  });
   $("set-proxy-mode").addEventListener("change", syncProxyInputs);
   $("set-ui-family").addEventListener("change", () => {
     $("set-preview").style.fontFamily = cssFontFamily($("set-ui-family").value);
@@ -353,10 +792,25 @@ function setupSettingsUI() {
   $("set-lyrics-size").addEventListener("input", (e) => {
     $("set-lyrics-size-val").textContent = e.target.value;
   });
+  $("set-skin-fit").addEventListener("change", (e) => {
+    skinDraft = Object.assign({}, normalizeSkin(skinDraft), { fit: skinObjectFit(e.target.value) });
+    renderSkinPreview(skinDraft);
+  });
+  $("set-skin-file").addEventListener("change", (e) => loadSkinFile(e.target.files && e.target.files[0]));
+  $("set-skin-clear").addEventListener("click", () => {
+    skinUploadSeq++;
+    setSkinUploadPending(false);
+    skinDraft = Object.assign({}, DEFAULT_SKIN);
+    $("set-skin-fit").value = DEFAULT_SKIN.fit;
+    $("set-skin-file").value = "";
+    renderSkinPreview(skinDraft);
+    $("set-msg").textContent = "已清除皮肤，点击保存后生效";
+  });
   $("settings-reset").addEventListener("click", () => {
     renderSettingsFormDefault();
   });
   $("settings-save").addEventListener("click", saveSettingsForm);
+  setupRoundedSettingsSelects();
 }
 setupSettingsUI();
 
@@ -371,7 +825,9 @@ function showEmpty(html) {
 
 function renderSongs(songs, opts) {
   opts = opts || {};
-  $("empty").classList.add("hidden");
+  const e = $("empty");
+  e.classList.add("hidden");
+  e.innerHTML = "";
   const list = $("list");
   list.innerHTML = "";
   songs.forEach((s, i) => list.appendChild(songRow(s, i, opts)));
@@ -496,7 +952,138 @@ function renderSearchPager(view, j, got) {
   input.addEventListener("blur", jump);
 }
 
-// ---------------- 歌单: 远端(音源) ----------------
+// ---------------- 音源首页 ----------------
+function homeImg(url) {
+  if (!url) return "";
+  if (url.indexOf("hdslb.com") !== -1 || url.indexOf("gtimg.cn") !== -1 ||
+      url.indexOf("qpic.cn") !== -1 || url.indexOf("y.qq.com") !== -1 ||
+      url.indexOf("music.126.net") !== -1 || url.indexOf("p1.music") !== -1 ||
+      url.indexOf("p2.music") !== -1) {
+    return withTok("/imgproxy?url=" + encodeURIComponent(url));
+  }
+  return esc(url);
+}
+function homeSection(title, cards, kind) {
+  if (!cards || !cards.length) return "";
+  return '<section class="home-section"><div class="home-head"><h3>' + esc(title) +
+    '</h3><button class="home-refresh" data-home-refresh="' + esc(kind) + '">↻</button></div>' +
+    '<div class="home-grid">' + cards.map((c, i) =>
+      '<div class="home-card" data-home-kind="' + esc(kind) + '" data-home-idx="' + i + '">' +
+      '<div class="home-cover"' + (c.cover ? ' style="background-image:url(\'' + esc(homeImg(c.cover)) + '\')"' : "") + '>' +
+      '<span class="home-tag">' + esc(c.tag || "") + '</span></div>' +
+      '<div class="home-card-title">' + esc(c.title || "") + '</div>' +
+      '<div class="home-card-sub">' + esc(c.sub || "") + '</div></div>').join("") +
+    '</div></section>';
+}
+function renderHome(data, source) {
+  const e = $("empty");
+  e.classList.add("hidden");
+  e.innerHTML = "";
+  const host = $("list");
+  host.innerHTML = "";
+  const quick = data.quick || [];
+  host.insertAdjacentHTML("beforeend",
+    '<div class="home-quick">' + quick.map((c, i) =>
+      '<div class="quick-card" data-home-kind="quick" data-home-idx="' + i + '">' +
+      (c.cover ? '<div class="quick-bg" style="background-image:url(\'' + esc(homeImg(c.cover)) + '\')"></div>' : "") +
+      '<div class="quick-mask"></div><div class="quick-meta">' +
+      '<div class="quick-title">' + esc(c.title || "") + '</div>' +
+      '<div class="quick-sub">' + esc(c.sub || "") + '</div></div></div>').join("") + '</div>');
+  host.insertAdjacentHTML("beforeend", homeSection("推荐歌单", data.playlists, "playlists"));
+  host.insertAdjacentHTML("beforeend", homeSection("排行榜", data.charts, "charts"));
+  host.insertAdjacentHTML("beforeend", homeSection("精选活动", data.activities, "activities"));
+  if (!quick.length && !(data.playlists || []).length)
+    host.insertAdjacentHTML("beforeend", '<div class="empty"><p>暂无首页内容</p></div>');
+  host.scrollTop = 0;
+  $("home-data").dataset.source = source;
+  $("home-data").value = JSON.stringify(data);
+}
+async function showMusicHome(source) {
+  const view = state.view = { type: "home", source: source };
+  setCrumb((SRC_NAME[source] || source) + " · 推荐");
+  showEmpty('<div class="loading">首页加载中…</div>');
+  try {
+    const j = await api("/api/home?source=" + encodeURIComponent(source) + "&limit=30");
+    if (state.view !== view) return;
+    if (j.error) { showEmpty('<div class="loading">' + esc(j.error) + "</div>"); return; }
+    renderHome(j, source);
+  } catch (e) {
+    if (state.view !== view) return;
+    showEmpty('<div class="loading">首页加载失败: ' + esc(e) + "</div>");
+  }
+}
+async function openHomeCard(kind, idx, source) {
+  let data;
+  try { data = JSON.parse($("home-data").value || "{}"); } catch (e) { return; }
+  const c = (data[kind] || [])[idx];
+  if (!c) return;
+  if (c.action === "playlist" && c.ref && (source !== "qq" || !c.topid)) {
+    openPlaylist(source, c.ref, c.title || "歌单");
+    return;
+  }
+  if (c.action === "playlist" && c.ref && source === "qq" && c.topid) {
+    const v = state.view = { type: "recommend", source: source };
+    setCrumb((SRC_NAME[source] || source) + " · " + esc(c.title || "排行榜"));
+    showEmpty('<div class="loading">加载中…</div>');
+    const j = await api("/api/recommend?source=qq&limit=50&topid=" + encodeURIComponent(c.topid));
+    if (state.view !== v) return;
+    renderSongs(j.songs || [], { songs: j.songs || [] });
+    return;
+  }
+  if (c.action === "toplist" && c.topid) {
+    const tid = c.topid;
+    const v = state.view = { type: "recommend", source: source };
+    setCrumb((SRC_NAME[source] || source) + " · " + esc(c.title || "排行榜"));
+    showEmpty('<div class="loading">加载中…</div>');
+    const u = source === "qq"
+      ? "/api/recommend?source=qq&limit=50&topid=" + encodeURIComponent(tid)
+      : "/api/recommend?source=netease&limit=50&mode=toplist&topid=" + encodeURIComponent(tid);
+    const j = await api(u);
+    if (state.view !== v) return;
+    renderSongs(j.songs || [], { songs: j.songs || [] });
+    return;
+  }
+  if (c.action === "album" && (c.albumid || c.ref)) {
+    const aid = c.albumid || c.ref;
+    const v = state.view = { type: "recommend", source: source };
+    setCrumb((SRC_NAME[source] || source) + " · " + esc(c.title || "精选活动"));
+    showEmpty('<div class="loading">加载中…</div>');
+    const j = await api("/api/recommend?source=qq&limit=50&albumid=" + encodeURIComponent(aid));
+    if (state.view !== v) return;
+    renderSongs(j.songs || [], { songs: j.songs || [] });
+    return;
+  }
+  if (c.action === "songs") {
+    const v = state.view = { type: "recommend", source: source };
+    setCrumb((SRC_NAME[source] || source) + " · " + esc(c.title || "推荐"));
+    showEmpty('<div class="loading">加载中…</div>');
+    const j = await api("/api/recommend?source=" + encodeURIComponent(source) +
+                        "&limit=50&mode=" + encodeURIComponent(c.mode || ""));
+    if (state.view !== v) return;
+    renderSongs(j.songs || [], { songs: j.songs || [] });
+    return;
+  }
+  if (c.action === "search" && c.keyword) {
+    $("search-input").value = c.keyword;
+    doSearch(1);
+  }
+}
+function bindHome() {
+  $("list").addEventListener("click", (e) => {
+    const refresh = e.target.closest("[data-home-refresh]");
+    if (refresh) {
+      e.stopPropagation();
+      const source = $("home-data").dataset.source || state.source;
+      if (source === "netease" || source === "qq") showMusicHome(source);
+      return;
+    }
+    const card = e.target.closest("[data-home-kind]");
+    if (!card) return;
+    const src = $("home-data").dataset.source || state.source;
+    openHomeCard(card.dataset.homeKind, Number(card.dataset.homeIdx), src);
+  });
+}
+bindHome();
 async function openPlaylist(source, ref, name) {
   const view = state.view = { type: "playlist", source: source, ref: ref, name: name };
   setCrumb('<a id="crumb-back">‹ 返回</a> ' + esc(name));
@@ -530,6 +1117,25 @@ async function openSourceLists(source) {
   const pls = j.playlists || [];
   if (!pls.length) { showEmpty('<div class="empty-ic src-logo-lg">' + (SRC_LOGO[source] || "📂") + "</div><p>暂无歌单（请先登录该音源）</p>"); return; }
   renderPlaylistCards(pls, (p) => openPlaylist(source, p.id, p.name), source);
+}
+
+// 网易云 / QQ 音乐推荐页: 使用与搜索结果一致的歌曲列表, 点击即可播放或加入播放列表
+async function showMusicRecommend(source) {
+  const view = state.view = { type: "recommend", source: source };
+  setCrumb((SRC_NAME[source] || source) + " · 推荐");
+  showEmpty('<div class="loading">推荐加载中…</div>');
+  try {
+    const j = await api("/api/recommend?source=" + encodeURIComponent(source) + "&limit=30");
+    if (state.view !== view) return;
+    if (j.error) { showEmpty('<div class="loading">' + esc(j.error) + "</div>"); return; }
+    const songs = j.songs || [];
+    if (!songs.length) { showEmpty(srcEmptyHtml() + "<p>暂无推荐歌曲</p>"); return; }
+    renderSongs(songs, { songs: songs });
+    $("list").scrollTop = 0;
+  } catch (e) {
+    if (state.view !== view) return;
+    showEmpty('<div class="loading">推荐加载失败: ' + esc(e) + "</div>");
+  }
 }
 
 function renderPlaylistCards(pls, onOpen, source) {
@@ -1087,26 +1693,31 @@ function findQueue(s) {
 }
 
 function addToQueue(s) {
-  if (inQueue(s)) { toast("已在播放列表中"); return; }
-  state.queue.push(s);
-  // 首曲自动播放分支也要持久化并置 userTouchedQueue(经 saveQueue): 否则启动恢复守卫失效、首曲漏存
-  if (state.index < 0 && !state.feedMode) { playAt(state.queue.length - 1); saveQueue(); }
-  else { renderQueue(); saveQueue(); }
-  toast("已加入: " + s.title);
+  roomIntent("queue_add", { song: JSON.parse(JSON.stringify(s)) }, () => {
+    if (inQueue(s)) { toast("已在播放列表中"); return; }
+    state.queue.push(s);
+    // 首曲自动播放分支也要持久化并置 userTouchedQueue(经 saveQueue): 否则启动恢复守卫失效、首曲漏存
+    if (state.index < 0 && !state.feedMode) { playAt(state.queue.length - 1); saveQueue(); }
+    else { renderQueue(); saveQueue(); }
+    toast("已加入: " + s.title);
+  });
 }
 
 function playNow(s, fromList) {
-  // B站视频: 不加入播放列表, 维护独立的推荐/相关切换流
-  if (s.source === "bilibili") { playFeed(s, (fromList && fromList.length) ? fromList : [s]); return; }
-  exitFeed();
-  let i = findQueue(s);
-  if (i < 0) {
-    i = Math.min(Math.max(state.index + 1, 0), state.queue.length);
-    state.queue.splice(i, 0, s);
-  }
-  playAt(i);
-  renderQueue();
-  saveQueue();
+  roomIntent("play_song", { song: JSON.parse(JSON.stringify(s)),
+                            fromList: (fromList || []).map((x) => JSON.parse(JSON.stringify(x))) }, () => {
+    // B站视频: 不加入播放列表, 维护独立的推荐/相关切换流
+    if (s.source === "bilibili") { playFeed(s, (fromList && fromList.length) ? fromList : [s]); return; }
+    exitFeed();
+    let i = findQueue(s);
+    if (i < 0) {
+      i = Math.min(Math.max(state.index + 1, 0), state.queue.length);
+      state.queue.splice(i, 0, s);
+    }
+    playAt(i);
+    renderQueue();
+    saveQueue();
+  });
 }
 
 // 当前播放上下文: 推荐流播放时用独立的"当前视频列表", 否则用播放列表
@@ -1115,27 +1726,32 @@ function curSong() { return state.index >= 0 ? aq()[state.index] : null; }
 
 // B站推荐流播放: 进入 feed 模式, 用独立的当前视频列表作为前后切换序列(不占用/不修改播放列表)
 function playFeed(s, list) {
-  userTouchedQueue = true;   // 进入推荐流也算用户操作, 启动恢复不得覆盖
-  if (!state.feedMode) { state.feedMode = true; state.mainIndex = state.index; }
-  state.plView = "feed";
-  if (list && list.length && list !== state.feedQueue) state.feedQueue = list.slice();
-  let i = state.feedQueue.findIndex((q) => sameSong(q, s));
-  if (i < 0) {
-    i = state.index + 1;
-    if (i < 0 || i >= state.feedQueue.length) i = Math.max(0, state.feedQueue.length - 1);
-    state.feedQueue.splice(i, 0, s);
-  }
-  playAt(i);
-  renderQueue();
+  const copyList = (list || []).map((x) => JSON.parse(JSON.stringify(x)));
+  roomIntent("feed_enter", { song: JSON.parse(JSON.stringify(s)), list: copyList }, () => {
+    userTouchedQueue = true;   // 进入推荐流也算用户操作, 启动恢复不得覆盖
+    if (!state.feedMode) { state.feedMode = true; state.mainIndex = state.index; }
+    state.plView = "feed";
+    if (list && list.length && list !== state.feedQueue) state.feedQueue = list.slice();
+    let i = state.feedQueue.findIndex((q) => sameSong(q, s));
+    if (i < 0) {
+      i = state.index + 1;
+      if (i < 0 || i >= state.feedQueue.length) i = Math.max(0, state.feedQueue.length - 1);
+      state.feedQueue.splice(i, 0, s);
+    }
+    playAt(i);
+    renderQueue();
+  });
 }
 // 退出 B站推荐流: 当前视频列表立即清空, 播放列表不受影响
 function exitFeed() {
-  if (!state.feedMode) return;
-  state.feedMode = false;
-  state.feedQueue = [];
-  state.index = state.mainIndex >= 0 && state.mainIndex < state.queue.length ? state.mainIndex : -1;
-  state.plView = "feed";
-  renderQueue();
+  roomIntent("feed_exit", {}, () => {
+    if (!state.feedMode) return;
+    state.feedMode = false;
+    state.feedQueue = [];
+    state.index = state.mainIndex >= 0 && state.mainIndex < state.queue.length ? state.mainIndex : -1;
+    state.plView = "feed";
+    renderQueue();
+  });
 }
 
 let playVersion = 0;
@@ -1557,25 +2173,45 @@ function bindLongPress(el, fn) {
 // ---------------- 播放条 ----------------
 $("btn-play").addEventListener("click", () => {
   if (!audio.src) { if (aq().length) playAt(Math.max(0, state.index)); return; }
-  audio.paused ? audio.play() : audio.pause();
+  roomIntent(audio.paused ? "play" : "pause", {}, () => {
+    audio.paused ? audio.play() : audio.pause();
+  });
 });
-$("btn-prev").addEventListener("click", prev);
-$("btn-next").addEventListener("click", next);
+$("btn-prev").addEventListener("click", () => roomIntent("prev", {}, prev));
+$("btn-next").addEventListener("click", () => roomIntent("next", {}, next));
 $("btn-mode").addEventListener("click", () => {
   const order = ["loop", "single", "order", "shuffle"];
-  state.mode = order[(order.indexOf(state.mode) + 1) % order.length];
-  $("btn-mode").innerHTML = MODES[state.mode].icon;
-  $("btn-mode").title = MODES[state.mode].name;
-  toast(MODES[state.mode].name);
+  const nextMode = order[(order.indexOf(state.mode) + 1) % order.length];
+  roomIntent("set_mode", { mode: nextMode }, () => {
+    state.mode = nextMode;
+    $("btn-mode").innerHTML = MODES[state.mode].icon;
+    $("btn-mode").title = MODES[state.mode].name;
+    toast(MODES[state.mode].name);
+  });
 });
 
 audio.addEventListener("play", () => { state.playing = true; setPlayIcon(true); desktopPush(true); });
 audio.addEventListener("pause", () => { state.playing = false; setPlayIcon(false); savePos(); desktopPush(true); });
 audio.addEventListener("loadedmetadata", () => {
+  if (roomActive() || roomApplying()) return;
   const t = parseFloat(audio.dataset.resume || "0");
   if (t > 3 && audio.duration && t < audio.duration - 3) audio.currentTime = t;
 });
 audio.addEventListener("timeupdate", () => {
+  const c = roomClock();
+  if (c) {
+    const d = c.duration || audio.duration || 0;
+    const t = Math.min(c.pos, d || c.pos);
+    if (!seekDrag.on) {
+      $("t-cur").textContent = fmt(t);
+      $("t-dur").textContent = fmt(d);
+      $("seek-fill").style.width = (d ? (t / d * 100) : 0) + "%";
+    }
+    syncLyric();
+    syncLoSeek();
+    desktopPush(false);
+    return;
+  }
   if (seekDrag.on) return;
   const d = audio.duration || 0;
   $("t-cur").textContent = fmt(audio.currentTime);
@@ -1598,6 +2234,7 @@ audio.addEventListener("seeked", () => {
 });
 audio.addEventListener("ratechange", () => desktopPush(true));
 audio.addEventListener("ended", () => {
+  if (roomActive()) { if (typeof window.Listen.hostAdvance === "function") window.Listen.hostAdvance(); return; }
   settings.pos = null;  // 播完不再恢复
   if (state.mode === "single") { audio.currentTime = 0; audio.play(); return; }
   const i = nextIndex(1);
@@ -1605,7 +2242,7 @@ audio.addEventListener("ended", () => {
 });
 let skipGuard = 0;
 audio.addEventListener("error", () => {
-  if (!audio.src) return;
+  if (!audio.src || roomActive()) return;
   const s = curSong();
   const restricted = s && (s.source === "netease" || s.source === "qq") &&
     s.extra && s.extra.vip;
@@ -2030,10 +2667,12 @@ document.querySelectorAll(".src-btn").forEach((b) => {
     document.querySelectorAll(".src-btn").forEach((x) => x.classList.remove("active"));
     b.classList.add("active");
     clearSrcPlActive();
+    exitFeed();
     state.view = null;  // 退出下载管理等页面视图, 停止其轮询重渲染
     state.source = b.dataset.source;
     setCrumb("");
     if (state.source === "bilibili") showBiliRecommend();
+    else if (state.source === "netease" || state.source === "qq") showMusicHome(state.source);
     else showEmpty(srcEmptyHtml());
     $("search-input").value = "";
   });
@@ -2598,17 +3237,17 @@ function desktopReset() {
 function desktopPayload() {
   const s = curSong();
   const key = s ? songKey(s) : "";
-  // curPos() intentionally falls back to settings.pos when the restored song
-  // has not been loaded by the audio element yet.
+  // 房间模式用权威时间轴, 避免成员端本地续播污染桌面歌词。
+  const c = roomClock();
   const t = s ? curPos() : 0;
   const p = {
     key: key,
     title: s ? (s.title || "") : "",
     artist: s ? (s.artist || "") : "",
     time: Number.isFinite(t) ? Math.max(0, t) : 0,
-    duration: s ? ((audio.duration && Number.isFinite(audio.duration)) ? audio.duration : (s.duration || 0)) : 0,
-    playing: !!(s && audio.src && !audio.paused),
-    rate: Number.isFinite(audio.playbackRate) && audio.playbackRate > 0 ? audio.playbackRate : (settings.rate || 1),
+    duration: s ? ((c && c.duration) || (audio.duration && Number.isFinite(audio.duration) ? audio.duration : (s.duration || 0))) : 0,
+    playing: c ? c.playing : !!(s && audio.src && !audio.paused),
+    rate: c ? c.rate : (Number.isFinite(audio.playbackRate) && audio.playbackRate > 0 ? audio.playbackRate : (settings.rate || 1)),
     status: s ? (desktopLyrics.status || desktopStatusFor(s)) : "idle",
   };
   if (desktopLyrics.sentLineRevision !== desktopLyrics.lineRevision) {
@@ -2808,7 +3447,8 @@ function renderLyric(lines) {
 
 function syncLyric(force) {
   if (!lyricOpen || !lyricLines.length) return;
-  const t = audio.currentTime;
+  const c = roomClock();
+  const t = c ? c.pos : audio.currentTime;
   let idx = -1;
   for (let i = 0; i < lyricLines.length; i++) {
     if (lyricLines[i].t <= t + 0.2) idx = i; else break;
@@ -2978,13 +3618,15 @@ function setupVideo(s) {
   const vel = $("lo-video-el");
   const lyricEl = $("lo-lyric");
   const qSel = $("lo-quality");
+  const partSel = $("lo-part");
   if (s && s.source === "bilibili") {
     box.classList.remove("hidden");
-    lyricEl.classList.add("hidden");  // B站不显示"暂无歌词", 视频占满宽度
-    $("lyric-overlay").classList.add("video-mode");  // 视频模式下隐藏头部进度条
+    lyricEl.classList.add("hidden");
+    $("lyric-overlay").classList.add("video-mode");
     resetCmtUI();
     loadStats(s);
     loadQualities(s);
+    loadParts(s);
     setVideoSrc(s, biliQn);
     startVideoSync();
     loadDanmaku(s);
@@ -2998,7 +3640,7 @@ function setupVideo(s) {
     lyricEl.classList.remove("hidden");
     lyricEl.classList.add("solo");
     qSel.classList.add("hidden");
-    // 全屏下切到非视频源: 模拟一次 ESC 退出全屏(覆盖层保持打开, 显示歌词)
+    partSel.classList.add("hidden");
     if (box.classList.contains("fs")) {
       box.classList.remove("fs");
       syncFsCtl(false);
@@ -3008,13 +3650,15 @@ function setupVideo(s) {
   }
 }
 
-// 视频清晰度: biliQn 记录当前档位, loadQualities 拉取可选档位填充下拉框
-let biliQn = 64;  // 默认 720P, boot 时从 settings.qn 恢复
+// 视频清晰度: biliQn 记录用户保存的目标档位; null 表示自动选择最高可用档位
+let biliQn = null;
 function setVideoSrc(s, qn) {
   const vel = $("lo-video-el");
   const resumeAt = audio.currentTime;
-  vel.src = withTok("/proxy?source=bilibili&id=" + encodeURIComponent(s.id) +
-            "&kind=video&qn=" + qn + "&extra=" + encodeURIComponent(JSON.stringify(s.extra || {})));
+  let url = "/proxy?source=bilibili&id=" + encodeURIComponent(s.id) + "&kind=video";
+  if (qn != null) url += "&qn=" + encodeURIComponent(qn);
+  url += "&extra=" + encodeURIComponent(JSON.stringify(s.extra || {}));
+  vel.src = withTok(url);
   vel.muted = true;
   vel.load();
   vel.playbackRate = settings.rate || 1;
@@ -3038,17 +3682,59 @@ async function loadQualities(s) {
     if (!qs.length) return;
     // 从高到低排序展示
     qs.sort((a, b) => b.qn - a.qn);
+    // 保留用户保存的目标档位; 当前视频不可用时只向下回退，不覆盖目标偏好。
+    const chosen = biliQn == null
+      ? qs[0]
+      : (qs.find((q) => q.qn <= biliQn) || qs[qs.length - 1]);
     qSel.innerHTML = qs.map((q) =>
-      '<option value="' + q.qn + '"' + (q.qn === biliQn ? " selected" : "") + '>' + esc(q.desc) + '</option>').join("");
+      '<option value="' + q.qn + '"' + (q.qn === chosen.qn ? " selected" : "") + '>' + esc(q.desc) + '</option>').join("");
     qSel.classList.remove("hidden");
-    // 若当前档位不可用, 选最高可用
-    if (!qs.some((q) => q.qn === biliQn)) {
-      biliQn = qs[0].qn;
-      qSel.value = String(biliQn);
-      setVideoSrc(s, biliQn);
-    }
+    // 请求参数仍保留用户目标偏好; 但把当前视频实际请求改成回退后的档位，
+    // 避免上游在目标档位不存在时自行返回一个高于目标的流。
+    if (biliQn != null && chosen.qn !== biliQn) setVideoSrc(s, chosen.qn);
   } catch (e) { /* 拉取失败则不显示选择器 */ }
 }
+
+// 分P选择器: 拉取当前 BVID 的全部分P, 填充 #lo-part 下拉框
+// 切换时以正确的 cid 重新调 playFeed, 使音频/视频均换到新分P
+async function loadParts(s) {
+  const partSel = $("lo-part");
+  partSel.innerHTML = "";
+  partSel.classList.add("hidden");
+  try {
+    const j = await api("/api/playlist?source=bilibili&ref=" + encodeURIComponent(s.id));
+    const cur = curSong();
+    if (!cur || cur.source !== "bilibili" || cur.id !== s.id) return;
+    const parts = j.songs || [];
+    if (parts.length <= 1) return;
+    const curCid = (cur.extra || {}).cid;
+    parts.forEach((p, i) => {
+      const opt = document.createElement("option");
+      const cid = (p.extra || {}).cid;
+      opt.value = JSON.stringify(p.extra || {});
+      opt.textContent = "P" + (i + 1) + " " + (p.title || "");
+      if (cid && curCid && String(cid) === String(curCid)) opt.selected = true;
+      partSel.appendChild(opt);
+    });
+    if (partSel.selectedIndex < 0 && partSel.options.length)
+      partSel.options[0].selected = true;
+    partSel.classList.remove("hidden");
+  } catch (e) { /* 拉取失败不显示 */ }
+}
+
+$("lo-part").addEventListener("change", (e) => {
+  const s = curSong();
+  if (!s || s.source !== "bilibili" || state.index < 0) return;
+  let extra;
+  try { extra = JSON.parse(e.target.value); } catch (_) { return; }
+  const newSong = Object.assign({}, s, { extra: extra });
+  roomIntent("feed_part", { extra: extra, index: state.index }, () => {
+    // 分P切换属于同一个 BVID 内换页: 直接替换 feed 当前项, 不新增队列项
+    aq()[state.index] = newSong;
+    playAt(state.index);
+    renderQueue();
+  });
+});
 
 // ---------------- B站弹幕 ----------------
 let dmList = [];        // 已按 time 排序的弹幕
@@ -3217,7 +3903,7 @@ $("dm-input").addEventListener("pointerdown", (e) => e.stopPropagation());
 $("lo-quality").addEventListener("change", (e) => {
   const s = curSong();
   if (!s || s.source !== "bilibili") return;
-  biliQn = parseInt(e.target.value, 10) || 64;
+  biliQn = parseInt(e.target.value, 10) || null;
   settings.qn = biliQn;
   saveSettings();
   setVideoSrc(s, biliQn);
@@ -3225,11 +3911,13 @@ $("lo-quality").addEventListener("change", (e) => {
 // 倍速播放: 音频为主, 视频跟随
 $("lo-speed").addEventListener("change", (e) => {
   const r = parseFloat(e.target.value) || 1;
-  settings.rate = r;
-  audio.playbackRate = r;
-  $("lo-video-el").playbackRate = r;
-  saveSettings();
-  showVidCtl();
+  roomIntent("set_rate", { rate: r }, () => {
+    settings.rate = r;
+    audio.playbackRate = r;
+    $("lo-video-el").playbackRate = r;
+    saveSettings();
+    showVidCtl();
+  });
 });
 
 // 覆盖层进度条
@@ -3241,12 +3929,16 @@ function clampSeek(t, d) {
 }
 // seek 时长: 音频已加载用 audio.duration; 启动恢复未加载时回退歌单元数据
 function seekDur() {
+  const c = roomClock();
+  if (c && c.duration) return c.duration;
   if (audio.duration) return audio.duration;
   const s = curSong();
   return (s && s.duration) || 0;
 }
-// 当前进度: 音频未加载时用上次保存的进度
+// 当前进度: 房间模式用权威时间轴, 否则音频未加载时用上次保存的进度
 function curPos() {
+  const c = roomClock();
+  if (c) return c.pos;
   if (audio.src && audio.duration) return audio.currentTime;
   const s = curSong();
   if (s && settings.pos && settings.pos.key === songKey(s)) return settings.pos.time;
@@ -3257,13 +3949,15 @@ function seekTo(ratio) {
   const d = seekDur();
   if (!d || state.index < 0) return;
   const t = clampSeek(ratio * d, d);
-  if (!audio.src) {
-    const s = curSong();
-    settings.pos = { key: songKey(s), time: t };
-    playAt(state.index);
-  } else {
-    audio.currentTime = t;
-  }
+  roomIntent("seek", { time: t }, () => {
+    if (!audio.src) {
+      const s = curSong();
+      settings.pos = { key: songKey(s), time: t };
+      playAt(state.index);
+    } else {
+      audio.currentTime = t;
+    }
+  });
 }
 function bindSeekBar(barId, fillId, timeId) {
   const bar = $(barId);
@@ -3303,11 +3997,13 @@ bindSeekBar("v-seek-bar", "v-seek-fill", "v-t-cur");
 
 function syncLoSeek() {
   if (!lyricOpen || loSeek.on) return;
-  const d = audio.duration || 0;
-  const pct = (d ? audio.currentTime / d * 100 : 0) + "%";
+  const c = roomClock();
+  const d = c ? c.duration : (audio.duration || 0);
+  const t = c ? c.pos : audio.currentTime;
+  const pct = (d ? t / d * 100 : 0) + "%";
   $("lo-seek-fill").style.width = pct;
   $("v-seek-fill").style.width = pct;
-  const cur = fmt(audio.currentTime), dur = fmt(d);
+  const cur = fmt(t), dur = fmt(d);
   $("lo-t-cur").textContent = cur;
   $("lo-t-dur").textContent = dur;
   $("v-t-cur").textContent = cur;
@@ -3318,6 +4014,9 @@ function startVideoSync() {
   stopVideoSync();
   videoSyncTimer = setInterval(() => {
     if (!lyricOpen) return;
+    const c = roomClock();
+    // 房间模式: 本地 #audio / #lo-video-el 不是主媒体, 只更新歌词/进度, 不驱动本地播放。
+    if (c) { syncLyric(); syncLoSeek(); return; }
     // 跟随音频播放状态与进度
     if (audio.paused) { if (!vel.paused) vel.pause(); }
     else { if (vel.paused) vel.play().catch(() => {}); }
@@ -3461,7 +4160,9 @@ function bindVideoGesture(el, side) {
 function toggleAudioPlay() {
   // 启动恢复后音频尚未加载(无 src): 走 playAt 加载并播放
   if (!audio.src) { if (aq().length) playAt(Math.max(0, state.index)); return; }
-  if (audio.paused) audio.play().catch(() => {}); else audio.pause();
+  roomIntent(audio.paused ? "play" : "pause", {}, () => {
+    if (audio.paused) audio.play().catch(() => {}); else audio.pause();
+  });
 }
 // 空格键: 暂停/播放; 左右方向键: 快退/快进 5 秒 (输入框聚焦时不拦截)
 document.addEventListener("keydown", (e) => {
@@ -3942,8 +4643,8 @@ $("lo-cmt-list").addEventListener("scroll", (e) => {
   $("lo-pp").addEventListener("pointerdown", (e) => { e.stopPropagation(); toggleAudioPlay(); });
   // 视频底栏: 播放/上一首/下一首
   $("v-play").addEventListener("click", (e) => { e.stopPropagation(); toggleAudioPlay(); showVidCtl(); });
-  $("v-prev").addEventListener("click", (e) => { e.stopPropagation(); prev(); showVidCtl(); });
-  $("v-next").addEventListener("click", (e) => { e.stopPropagation(); next(); showVidCtl(); });
+  $("v-prev").addEventListener("click", (e) => { e.stopPropagation(); roomIntent("prev", {}, prev); showVidCtl(); });
+  $("v-next").addEventListener("click", (e) => { e.stopPropagation(); roomIntent("next", {}, next); showVidCtl(); });
   // 全屏按钮: 进入全屏前先收起评论区(复用上方小窗全屏的完整逻辑)
   $("lo-fs-btn").addEventListener("click", (e) => {
     e.stopPropagation();
@@ -4015,8 +4716,8 @@ $("pb-cover").addEventListener("click", () => {
 $("btn-desktop-lyrics").addEventListener("click", toggleDesktopLyrics);
 $("btn-desktop-unlock").addEventListener("click", toggleDesktopLyricsLock);
 $("lo-close").addEventListener("click", closeLyric);
-$("lo-prev").addEventListener("click", prev);
-$("lo-next").addEventListener("click", next);
+$("lo-prev").addEventListener("click", () => roomIntent("prev", {}, prev));
+$("lo-next").addEventListener("click", () => roomIntent("next", {}, next));
 $("lo-lyric").addEventListener("wheel", () => { lyricUserScroll = Date.now(); }, { passive: true });
 $("lo-lyric").addEventListener("touchmove", () => { lyricUserScroll = Date.now(); }, { passive: true });
 
@@ -4037,6 +4738,7 @@ async function boot() {
       if (typeof st.qn === "number" && st.qn >= 16) biliQn = st.qn;
       if (st.proxy && typeof st.proxy === "object") settings.proxy = Object.assign({}, DEFAULT_PROXY, st.proxy);
       if (st.font && typeof st.font === "object") settings.font = Object.assign({}, DEFAULT_FONT, st.font);
+      if (st.skin && typeof st.skin === "object") settings.skin = normalizeSkin(st.skin);
       applyFontSettings();
       audio.volume = settings.volume;
       audio.playbackRate = settings.rate || 1;
@@ -4045,14 +4747,16 @@ async function boot() {
       $("vol-val").textContent = Math.round(settings.volume * 100);
     }
   } catch (e) {}
+  applySkinSettings(settings.skin);
   $("btn-mode").innerHTML = MODES[state.mode].icon;
   renderQueue();
   refreshLoginState();
+  showMusicHome(state.source);
   try {
     const q = await api("/api/queue");
     // 只在队列仍属于未修改的启动上下文时应用旧快照:
     // 用户已加歌/播放/进入 feed 时, 不得覆盖当前队列, 也不得用主队列下标污染 feed 下标
-    if (!userTouchedQueue && !state.feedMode && q.songs && q.songs.length) {
+    if (!userTouchedQueue && !state.feedMode && !roomActive() && q.songs && q.songs.length) {
       state.queue = q.songs;
       state.index = Math.min(q.index ?? -1, q.songs.length - 1);
       renderQueue();

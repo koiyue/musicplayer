@@ -337,7 +337,7 @@ def _to_song(r):
                        "view": stat.get("view", 0), "like": stat.get("like", 0)})
 
 
-def recommend(bvid=None, limit=30, pn=1):
+def recommend(bvid=None, limit=30, pn=1, mode=None, topid=None, albumid=None):
     """bvid 为空 -> 热门视频(pn 分页); 否则 -> 该视频的相关推荐."""
     _ensure_buvid()
     out = []
@@ -378,6 +378,29 @@ def get_playlist(ref):
     return {"songs": out}
 
 
+def _durl_info(durl, with_sizes=False, with_meta=False, codec="avc"):
+    """把 playurl 的旧版 durl 分片整理成统一取流结构; 无可用地址返回 None."""
+    parts = [d for d in (durl or []) if isinstance(d, dict) and d.get("url")]
+    if not parts:
+        return None
+    urls = [d["url"] for d in parts]
+    sizes = []
+    for d in parts:
+        try:
+            sizes.append(int(d.get("size") or 0))
+        except (TypeError, ValueError):
+            sizes.append(0)
+    out = {"url": urls[0], "segments": urls,
+           "headers": {"Referer": "https://www.bilibili.com/", "User-Agent": UA}}
+    if with_sizes:
+        out["segment_sizes"] = sizes
+    if with_meta:
+        ext = os.path.splitext(urllib.parse.urlparse(urls[0]).path)[1].lower()
+        out["codec"] = codec
+        out["container"] = "flv" if ext == ".flv" else "mp4"
+    return out
+
+
 def get_stream(s):
     _ensure_buvid()
     bvid = s["id"]
@@ -396,11 +419,9 @@ def get_stream(s):
     dash = data.get("dash") or {}
     audios = dash.get("audio") or []
     if not audios:
-        durl = data.get("durl") or []
-        if durl:
-            return {"url": durl[0].get("url"),
-                    "headers": {"Referer": "https://www.bilibili.com/",
-                                "User-Agent": UA}}
+        info = _durl_info(data.get("durl"), with_sizes=True)
+        if info:
+            return info
         return {"error": "无可用音频流(可能大会员专属)"}
     # 选码率最高的音频
     best = max(audios, key=lambda a: a.get("bandwidth", 0))
@@ -697,12 +718,14 @@ def post_comment(s, text, root=0, parent=0):
 # 分辨率档位: qn -> 名称(与B站官方一致)
 QUALITIES = [(127, "8K"), (126, "杜比视界"), (125, "HDR"), (120, "4K"),
              (116, "1080P 60帧"), (112, "1080P 高码率"), (80, "1080P"),
-             (64, "720P"), (32, "480P"), (16, "360P")]
+             (74, "720P 60帧"), (64, "720P"), (32, "480P"),
+             (16, "360P")]
 
 
-def get_video(s, qn=None):
+def get_video(s, qn=None, room=False):
     """返回视频流地址(用于歌词页显示画面); 与音频分离, 前端静音播放并跟随音频进度.
-    qn: 指定分辨率档位(如 80=1080P), 取可用流中不超过该档位的最高清晰度."""
+    qn: 指定分辨率档位(如 80=1080P), 取不超过该档位的最高可用流;
+    未指定时取最高可用流. room=True 优先旧版 durl/AVC 渐进流, 清晰度不超过 480P."""
     _ensure_buvid()
     bvid = s["id"]
     extra = s.get("extra") or {}
@@ -712,28 +735,82 @@ def get_video(s, qn=None):
         if not pages:
             return {"error": "无法解析视频分P"}
         cid = pages[0].get("cid")
+
+    def _vid_qn(v):
+        try:
+            return int(v.get("id") or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    def _playurl(params):
+        j = http_get(API + "/x/player/wbi/playurl?" + _wbi_sign(params),
+                     headers=_headers())
+        return j.get("data") or {}
+
+    def _dash_result(data, room_cap):
+        vids = (data.get("dash") or {}).get("video") or []
+        ids = {_vid_qn(v) for v in vids}
+        support = [{"qn": q, "desc": d} for q, d in QUALITIES if q in ids]
+        if room:
+            if vids:
+                def _avc(v):
+                    return 1 if "avc" in (v.get("codecs") or "").lower() else 0
+                cands = [v for v in vids if _vid_qn(v) <= room_cap] or [min(vids, key=_vid_qn)]
+                pick = max(cands, key=lambda v: (_avc(v), _vid_qn(v), v.get("bandwidth") or 0))
+                u = pick.get("baseUrl") or pick.get("base_url")
+                mime = (pick.get("mimeType") or pick.get("mime_type") or "").lower()
+                return {"url": u, "segments": [u], "segment_sizes": [0],
+                        "qualities": support, "picked": pick.get("id"), "room": True,
+                        "codec": (pick.get("codecs") or "avc").split(".")[0],
+                        "container": mime.split("/")[-1].split(";")[0] or "mp4",
+                        "headers": {"Referer": "https://www.bilibili.com/", "User-Agent": UA}}
+            return {"error": "无可用视频流", "qualities": support}
+        if not vids:
+            durl = data.get("durl") or []
+            if durl:
+                urls = [d.get("url") for d in durl if d.get("url")]
+                if not urls:
+                    return {"error": "无可用视频流", "qualities": support}
+                return {"url": urls[0], "segments": urls, "qualities": support,
+                        "headers": {"Referer": "https://www.bilibili.com/", "User-Agent": UA}}
+            return {"error": "无可用视频流", "qualities": support}
+        # qn 是用户的目标清晰度: 选不超过目标的最高档位。
+        # 未指定目标时使用最高可用档位，避免首次播放被固定限制在 720P。
+        cap = int(qn) if qn is not None else max(_vid_qn(v) for v in vids)
+        cands = [v for v in vids if _vid_qn(v) <= cap]
+        if not cands:
+            cands = [min(vids, key=_vid_qn)]
+        pick = max(cands, key=lambda v: (_vid_qn(v), v.get("bandwidth") or 0))
+        return {"url": pick.get("baseUrl") or pick.get("base_url"),
+                "qualities": support, "picked": pick.get("id"),
+                "headers": {"Referer": "https://www.bilibili.com/", "User-Agent": UA}}
+
+    if room:
+        try:
+            cap = min(max(1, int(qn)), 32) if qn is not None else 32
+        except (TypeError, ValueError):
+            cap = 32
+        try:
+            data = _playurl({"bvid": bvid, "cid": cid, "fnval": 0, "fourk": 0,
+                             "qn": cap, "fnver": 0, "otype": "json", "platform": "html5"})
+        except Exception:
+            data = {}
+        info = _durl_info(data.get("durl"), with_sizes=True, with_meta=True)
+        if info:
+            info.update({"qualities": [], "picked": data.get("quality") or cap,
+                         "room": True})
+            return info
+        try:
+            data = _playurl({"bvid": bvid, "cid": cid, "fnval": 16, "fourk": 1, "qn": cap})
+        except Exception as e:
+            return {"error": str(e), "qualities": []}
+        info = _durl_info(data.get("durl"), with_sizes=True, with_meta=True)
+        if info:
+            info.update({"qualities": [], "picked": data.get("quality") or cap,
+                         "room": True})
+            return info
+        return _dash_result(data, cap)
     params = {"bvid": bvid, "cid": cid, "fnval": 16, "fourk": 1}
     if qn:
         params["qn"] = int(qn)
-    url = API + "/x/player/wbi/playurl?" + _wbi_sign(params)
-    j = http_get(url, headers=_headers())
-    data = j.get("data") or {}
-    vids = (data.get("dash") or {}).get("video") or []
-    ids = {v.get("id") for v in vids}
-    support = [{"qn": q, "desc": d} for q, d in QUALITIES if q in ids]
-    if not vids:
-        durl = data.get("durl") or []
-        if durl:
-            return {"url": durl[0].get("url"),
-                    "qualities": support,
-                    "headers": {"Referer": "https://www.bilibili.com/", "User-Agent": UA}}
-        return {"error": "无可用视频流", "qualities": support}
-    # 选不超过 qn 档位的最高清晰度流(默认 720p 省带宽)
-    cap = int(qn) if qn else 64
-    cands = [v for v in vids if (v.get("id") or 0) <= cap]
-    if not cands:
-        cands = [min(vids, key=lambda v: v.get("id") or 0)]
-    pick = max(cands, key=lambda v: (v.get("id") or 0, v.get("bandwidth") or 0))
-    return {"url": pick.get("baseUrl") or pick.get("base_url"),
-            "qualities": support, "picked": pick.get("id"),
-            "headers": {"Referer": "https://www.bilibili.com/", "User-Agent": UA}}
+    return _dash_result(_playurl(params), None)
