@@ -15,10 +15,10 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from . import secure_store, song
-from .common import http_get, UA
+from .common import http_get, UA, data_dir
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-DATA_DIR = os.path.join(BASE_DIR, "data")
+DATA_DIR = data_dir()
 COOKIE_FILE = os.path.join(DATA_DIR, "douyin_cookie.json")
 CACHE_FILE = os.path.join(DATA_DIR, "douyin_cache.json")
 

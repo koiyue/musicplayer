@@ -463,28 +463,56 @@ const QR_LOGIN = {
     },
   },
 };
-const LOGIN_OFFLINE = [["qq", "QQ音乐"], ["douyin", "抖音"]];
+const LOGIN_WEB_ONLY = [["qq", "QQ音乐"], ["douyin", "抖音"]];
 
 let qrTimer = null;
 let qrSeq = 0;
+let qrBlocked = false;
 function stopQr() {
   if (qrTimer) { clearInterval(qrTimer); qrTimer = null; }
   qrSeq++;
+}
+
+// 网页登录: 打开原生 WebView 里的官方登录页, 登录后由原生回收 Cookie
+function openWebLogin(key) {
+  const native = window.MHNative;
+  if (native && native.openWebLogin) {
+    try { native.openWebLogin(key); return; } catch (e) {}
+  }
+  toast("当前环境不支持网页登录");
 }
 
 function renderLoginList() {
   stopQr();
   $("login-body").innerHTML =
     Object.keys(QR_LOGIN).map((k) =>
-      '<button class="login-row" data-qr="' + k + '">' + esc(QR_LOGIN[k].name) +
-      " <span>扫码 ›</span></button>").join("") +
-    LOGIN_OFFLINE.map(([k, n]) =>
-      '<div class="login-row off">' + esc(n) + " <span>暂不支持扫码</span></div>").join("") +
-    '<p class="login-note">QQ音乐与抖音暂不支持手机端扫码，请在电脑版 MusicHub 登录后再使用。</p>';
+      '<button class="login-row" data-src="' + k + '">' + esc(QR_LOGIN[k].name) +
+      " <span>网页 / 扫码 ›</span></button>").join("") +
+    LOGIN_WEB_ONLY.map(([k, n]) =>
+      '<button class="login-row" data-src="' + k + '">' + esc(n) +
+      " <span>网页登录 ›</span></button>").join("") +
+    '<p class="login-note">扫码被风控时请用网页登录：在官方页面输入账号密码，成功后自动保存登录态。</p>';
+}
+
+function renderLoginSource(key) {
+  const cfg = QR_LOGIN[key];
+  const name = cfg ? cfg.name : (SRC_NAME[key] || key);
+  $("login-body").innerHTML =
+    '<div class="login-panel"><div class="login-tip">' + esc(name) + " 登录方式</div>" +
+    '<button id="lg-web" type="button" class="login-big primary">网页登录（账号 / 密码）</button>' +
+    (cfg ? '<button id="lg-qr" type="button" class="login-big">扫码登录</button>' : "") +
+    '<button id="lg-back" type="button" class="login-big">返回</button>' +
+    '<p class="login-note">' + (cfg
+      ? "扫码被风控时请用网页登录；网页登录由官方页面处理验证码，登录成功后自动保存。"
+      : "该音源暂未提供扫码，请在官方网页登录，登录成功后自动保存。") + "</p></div>";
+  $("lg-web").onclick = () => openWebLogin(key);
+  if (cfg) $("lg-qr").onclick = () => openQr(key);
+  $("lg-back").onclick = renderLoginList;
 }
 
 function loadQrImage(cfg) {
   stopQr();
+  qrBlocked = false;
   const seq = qrSeq;
   $("qr-mask").classList.add("hidden");
   $("qr-tip").textContent = cfg.tip;
@@ -515,8 +543,11 @@ function loadQrImage(cfg) {
       $("qr-tip").textContent = msg;
     } else {
       stopQr();
+      qrBlocked = kind === "blocked";
       $("qr-mask").classList.remove("hidden");
-      $("qr-mask").textContent = msg + "，点击刷新";
+      $("qr-mask").textContent = kind === "blocked"
+        ? "扫码被风控，点击改用网页登录"
+        : msg + "，点击刷新";
       $("qr-tip").textContent = msg;
     }
   }, 2000);
@@ -530,10 +561,13 @@ function openQr(key) {
     '<div class="qr-wrap"><img id="qr-img" alt="登录二维码">' +
     '<div id="qr-mask" class="qr-mask hidden"></div></div>' +
     '<div class="login-actions"><button id="qr-back" type="button">返回</button>' +
+    '<button id="qr-web" type="button">网页登录</button>' +
     '<button id="qr-refresh" type="button" class="primary">刷新二维码</button></div></div>';
   $("qr-back").onclick = renderLoginList;
+  $("qr-web").onclick = () => openWebLogin(key);
   $("qr-refresh").onclick = () => loadQrImage(cfg);
-  $("qr-mask").onclick = () => loadQrImage(cfg);
+  // 被风控时点击蒙层直接切到网页登录, 其余情况刷新二维码
+  $("qr-mask").onclick = () => (qrBlocked ? openWebLogin(key) : loadQrImage(cfg));
   loadQrImage(cfg);
 }
 
@@ -550,7 +584,7 @@ $("login-open").addEventListener("click", () => {
 $("login-close").addEventListener("click", closeLogin);
 $("login-body").addEventListener("click", (e) => {
   const row = e.target.closest(".login-row");
-  if (row && row.dataset.qr) openQr(row.dataset.qr);
+  if (row && row.dataset.src) renderLoginSource(row.dataset.src);
 });
 $("video-back").addEventListener("click", closeVideo);
 $("pcover").addEventListener("click", () => {
@@ -563,5 +597,11 @@ $("pcover").addEventListener("click", () => {
   const v = new URLSearchParams(location.search).get("v");
   if (v) $("ver").textContent = "v" + v;
 })();
+// 原生网页登录成功后回调
+window.mhLoginDone = function () {
+  closeLogin();
+  toast("登录成功");
+  loadHome();
+};
 renderSources();
 loadHome();

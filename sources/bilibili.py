@@ -10,12 +10,12 @@ import urllib.parse
 import urllib.request
 
 from . import secure_store, song
-from .common import http_get, http_post, UA
+from .common import http_get, http_post, UA, data_dir
 
 API = "https://api.bilibili.com"
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-DATA_DIR = os.path.join(BASE_DIR, "data")
+DATA_DIR = data_dir()
 COOKIE_FILE = os.path.join(DATA_DIR, "bilibili_cookie.json")
 MIXIN_TAB = [46, 47, 18, 2, 53, 8, 23, 32, 15, 50, 10, 31, 58, 3, 45, 35, 27, 43, 5,
              49, 33, 9, 42, 19, 29, 28, 14, 39, 12, 38, 41, 13, 37, 48, 7, 16, 24, 55,

@@ -163,7 +163,13 @@ body { padding-bottom: calc(var(--player-h) + env(safe-area-inset-bottom)); }
   border-bottom: 1px solid var(--line); color: var(--text); font-size: 15px;
 }
 .login-row span { color: var(--sub); }
-.login-row.off { color: var(--sub); opacity: .55; }
+.login-panel { padding-top: 12px; }
+.login-big {
+  display: block; width: 100%; margin-top: 10px; padding: 13px;
+  border: 1px solid var(--line); border-radius: 12px;
+  background: var(--bg2); color: var(--text); font-size: 15px;
+}
+.login-big.primary { background: var(--acc); border-color: var(--acc); color: #fff; }
 .login-note { color: var(--sub); font-size: 12px; line-height: 1.6; padding: 12px 2px 0; }
 .qr-panel { padding-top: 12px; }
 .login-tip { color: var(--sub); font-size: 13px; margin-bottom: 8px; }
@@ -179,7 +185,7 @@ body { padding-bottom: calc(var(--player-h) + env(safe-area-inset-bottom)); }
   padding: 0 16px; line-height: 1.6;
 }
 .qr-mask.hidden { display: none; }
-.login-actions { display: flex; gap: 10px; justify-content: flex-end; margin-top: 10px; }
+.login-actions { display: flex; flex-wrap: wrap; gap: 10px; justify-content: flex-end; margin-top: 10px; }
 .login-actions button {
   border: 1px solid var(--line); background: var(--bg2); color: var(--text);
   padding: 9px 16px; border-radius: 10px; font-size: 14px;

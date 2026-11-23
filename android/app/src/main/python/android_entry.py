@@ -30,3 +30,23 @@ def start(data_dir):
         _httpd, port = server.serve_auto(8787)
         _port = port
         return port
+
+
+def save_cookie(source, cookie):
+    """保存原生 WebView 网页登录得到的 Cookie.
+
+    返回 True 表示已写入且登录态有效. 供 Kotlin 在网页登录完成后调用.
+    """
+    cookie = (cookie or "").strip()
+    if not cookie:
+        return False
+    from sources import bilibili, douyin, netease, qq
+
+    mod = {"netease": netease, "bilibili": bilibili, "qq": qq, "douyin": douyin}.get(source)
+    if mod is None:
+        return False
+    try:
+        r = mod.manual_cookie(cookie)
+    except Exception:
+        return False
+    return bool(isinstance(r, dict) and (r.get("logged_in") or r.get("ok")))
