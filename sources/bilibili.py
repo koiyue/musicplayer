@@ -720,6 +720,41 @@ QUALITIES = [(127, "8K"), (126, "杜比视界"), (125, "HDR"), (120, "4K"),
              (116, "1080P 60帧"), (112, "1080P 高码率"), (80, "1080P"),
              (74, "720P 60帧"), (64, "720P"), (32, "480P"),
              (16, "360P")]
+_QUALITY_DESC = dict(QUALITIES)
+
+
+def _declared_qualities(data):
+    """从 playurl 返回中解析可用清晰度档位.
+
+    部分视频(长视频/合集等)只返回 durl 渐进流, 没有 dash.video; 此时必须用
+    support_formats / accept_quality 里服务端声明的档位, 否则前端列表为空。
+    """
+    out, seen = [], set()
+    for f in data.get("support_formats") or []:
+        if not isinstance(f, dict):
+            continue
+        try:
+            q = int(f.get("quality"))
+        except (TypeError, ValueError):
+            continue
+        desc = (f.get("new_description") or f.get("display_desc")
+                or _QUALITY_DESC.get(q) or "")
+        if q > 0 and desc and q not in seen:
+            seen.add(q)
+            out.append({"qn": q, "desc": desc})
+    if out:
+        return out
+    ds = data.get("accept_description") or []
+    for i, q in enumerate(data.get("accept_quality") or []):
+        try:
+            q = int(q)
+        except (TypeError, ValueError):
+            continue
+        desc = ds[i] if i < len(ds) else _QUALITY_DESC.get(q, "")
+        if q > 0 and desc and q not in seen:
+            seen.add(q)
+            out.append({"qn": q, "desc": desc})
+    return out
 
 
 def get_video(s, qn=None, room=False):
@@ -750,7 +785,8 @@ def get_video(s, qn=None, room=False):
     def _dash_result(data, room_cap):
         vids = (data.get("dash") or {}).get("video") or []
         ids = {_vid_qn(v) for v in vids}
-        support = [{"qn": q, "desc": d} for q, d in QUALITIES if q in ids]
+        support = _declared_qualities(data) or [
+            {"qn": q, "desc": d} for q, d in QUALITIES if q in ids]
         if room:
             if vids:
                 def _avc(v):
@@ -772,6 +808,7 @@ def get_video(s, qn=None, room=False):
                 if not urls:
                     return {"error": "无可用视频流", "qualities": support}
                 return {"url": urls[0], "segments": urls, "qualities": support,
+                        "picked": data.get("quality"),
                         "headers": {"Referer": "https://www.bilibili.com/", "User-Agent": UA}}
             return {"error": "无可用视频流", "qualities": support}
         # qn 是用户的目标清晰度: 选不超过目标的最高档位。

@@ -21,11 +21,30 @@
   L.rev = 0;
   L.transport = "webrtc";
   L.generation = 0;
+  L.video = { mode: "C", failReason: "", autoplayBlocked: false, userActivated: false };
+  L.network = {
+    state: "detecting", reason: "", candTypes: [], relaySeen: false,
+    connectMs: 0, rttMs: 0, reconnectCount: 0, lastFailure: "", startedAt: 0,
+  };
+  L.metrics = { corrections: [], videoFallbacks: [], events: [] };
   let memberPc = null, memberDc = null, remoteStream = null;
-  L.debug = () => ({ role: L.role, active: L.active, room_id: L.room && L.room.room_id,
-                     seq: L.seq, rev: L.rev, transport: L.transport,
-                     members: L.members.slice(), slots: L.slots.map((s) => s.state),
-                     fallback_urls: L.room && L.room.fallback_urls });
+  let timelineTimer = null, pingTimer = null;
+  function logMetric(kind, data) {
+    const rec = Object.assign({ kind: kind, ts: Date.now(), role: L.role }, data || {});
+    L.metrics.events.push(rec);
+    if (L.metrics.events.length > 100) L.metrics.events.shift();
+    // 脱敏: 只记录枚举、数值与原因, 不记录 grant/SDP/完整媒体 URL。
+    if (window.console && console.info) console.info("[一起听]", rec.kind, rec.reason || "", rec.value == null ? "" : rec.value);
+  }
+  L.logMetric = logMetric;
+  L.debug = () => {
+    const c = window.MusicHubPlayer && window.MusicHubPlayer.clock ? window.MusicHubPlayer.clock() : null;
+    return { role: L.role, active: L.active, transport: L.transport, seq: L.seq, rev: L.rev,
+             room_id: L.room && L.room.room_id, members: L.members.length,
+             slots: L.slots.map((s) => s.state), base: L.base, reason: L.fallbackReason,
+             timeline: c, video: Object.assign({}, L.video),
+             network: Object.assign({}, L.network), metrics: L.metrics.events.slice(-20) };
+  };
 
   const $ = (id) => document.getElementById(id);
   const clone = (v) => v == null ? v : JSON.parse(JSON.stringify(v));
@@ -87,20 +106,84 @@
 
   function snapshot() { return window.MusicHubPlayer.snapshot(); }
   function applyIntent(p) { window.MusicHubPlayer.applyIntent(p); }
+  function stateFrom(st) {
+    if (!st || typeof st !== "object") return null;
+    return st.timeline && typeof st.timeline === "object"
+      ? Object.assign({}, st.timeline, st) : Object.assign({}, st);
+  }
+  function canApplyState(st) {
+    const raw = stateFrom(st);
+    if (!raw || !L.active) return false;
+    const c = window.MusicHubPlayer.clock && window.MusicHubPlayer.clock();
+    if (!c) return true;
+    const rev = Number(raw.song_rev), seq = Number(raw.state_seq);
+    const curRev = Number(c.song_rev) || 0, curSeq = Number(c.state_seq) || 0;
+    if (Number.isFinite(rev) && rev < curRev) return false;
+    if (Number.isFinite(seq) && rev === curRev && seq < curSeq) return false;
+    return true;
+  }
+  function applySnapshot(st, reason) {
+    if (!canApplyState(st)) { logMetric("stale_state_rejected", { reason: reason || "old_version" }); return false; }
+    const raw = stateFrom(st);
+    window.MusicHubPlayer.apply(st);
+    window.MusicHubPlayer.setTimeline(Object.assign({}, raw, {
+      anchor_wall_ms: Number(raw.anchor_wall_ms || 0) || Date.now(),
+      server_time_ms: Number(raw.server_time_ms || 0) || 0,
+      reason: reason || "state_sync",
+    }), { guard: true, render: false });
+    window.MusicHubPlayer.tick();
+    return true;
+  }
+  function startTimelineTicker() {
+    if (timelineTimer) clearInterval(timelineTimer);
+    timelineTimer = setInterval(() => {
+      if (L.active && window.MusicHubPlayer.tick) window.MusicHubPlayer.tick();
+    }, 100);
+    if (pingTimer) clearInterval(pingTimer);
+    pingTimer = setInterval(() => {
+      if (L.active && L.transport === "webrtc") {
+        const p = { kind: "ping", ts: Date.now() };
+        if (L.role === "member") sendData(p);
+        else L.slots.forEach((s) => { if (s.dc && s.dc.readyState === "open") { try { s.dc.send(JSON.stringify(p)); } catch (e) {} } });
+      }
+    }, 2000);
+  }
+  function stopTimelineTicker() {
+    if (timelineTimer) { clearInterval(timelineTimer); timelineTimer = null; }
+    if (pingTimer) { clearInterval(pingTimer); pingTimer = null; }
+  }
   function updateTimeline(st) {
-    L.timeline = { basePos: Number(st && st.time) || 0, baseTs: now(),
-                   rate: Number(st && st.rate) || 1,
-                   playing: !!(st && st.playing), duration: Number(st && st.duration) || 0 };
+    if (!L.active) return;
+    const raw = stateFrom(st) || {};
+    window.MusicHubPlayer.setTimeline(Object.assign({}, raw, {
+      anchor_wall_ms: Number(raw.anchor_wall_ms || 0) || Date.now(),
+      server_time_ms: Number(raw.server_time_ms || 0) || 0,
+    }), { guard: false, render: false });
+    window.MusicHubPlayer.tick();
+  }
+  function eventState(ev) {
+    return ev && ev.payload && ev.payload.state ? ev.payload.state : null;
   }
 
   async function commitProposal(p) {
     if (L.role !== "host") return;
     applyIntent(p);
-    const st = snapshot();
-    if (p.type === "play") st.playing = true;
-    if (p.type === "pause") st.playing = false;
-    if (p.type === "seek") st.time = Math.max(0, Number((p.payload || {}).time) || 0);
-    if (p.type === "set_rate") st.rate = Number((p.payload || {}).rate) || 1;
+    let st = snapshot();
+    const c = window.MusicHubPlayer.clock();
+    if (c) {
+      const status = p.type === "play" ? "playing" : p.type === "pause" ? "paused" :
+        p.type === "seek" ? ((c.status === "buffering" || c.buffered) ? "buffering" : "seeking") :
+        p.type === "room_status" ? ((p.payload || {}).status || c.status) :
+        (p.type === "media_reload" ? "preparing" : c.status);
+      st = Object.assign({}, st, {
+        time: p.type === "seek" ? Math.max(0, Number((p.payload || {}).time) || 0) : c.pos,
+        status: status, playing: status === "playing",
+        song_rev: c.song_rev, state_seq: c.state_seq,
+        anchor_wall_ms: Date.now(), server_time_ms: 0,
+        reason: (p.payload && p.payload.reason) || p.type,
+      });
+      if (p.type === "set_rate") st.rate = Number((p.payload || {}).rate) || 1;
+    }
     updateTimeline(st);
     L.seq += 1; L.rev += 1;
     const hash = await stateHash(st);
@@ -113,6 +196,11 @@
     const ev = { v: ROOM_VERSION, room_id: L.room.room_id, seq: L.seq, rev: L.rev,
                  state_hash: hash, type: "commit", actor: p.actor || L.room.host_id,
                  ts: now(), transport: L.transport,
+                 song_key: st.song_key || "", song_rev: Number(st.song_rev) || 0,
+                 state_seq: Number(st.state_seq) || 0,
+                 status: st.status || "playing",
+                 anchor_wall_ms: Number(st.anchor_wall_ms) || Date.now(),
+                 server_time_ms: Number(st.server_time_ms) || 0,
                  members: L.members.slice(), chat_tail: L.chat.slice(-50),
                  payload: { proposal: p, state: st } };
     L.lastEvent = Object.assign({}, ev, {
@@ -197,11 +285,21 @@
     if (!ev || ev.type !== "commit") return;
     if (ev.seq <= L.seq) return;
     if (ev.seq > L.seq + 1) { requestResync(); return; }
+    const st = eventState(ev);
+    if (st && !canApplyState(st)) {
+      logMetric("stale_event_rejected", { reason: "song_rev_or_state_seq", value: ev.seq });
+      return;
+    }
     L.seq = ev.seq; L.rev = ev.rev || ev.seq;
-    if (ev.payload && ev.payload.state) {
-      const st = ev.payload.state;
-      window.MusicHubPlayer.apply(st);
-      updateTimeline(st);
+    if (st) {
+      const anchored = Object.assign({}, st, {
+        anchor_wall_ms: Number(ev.anchor_wall_ms || (st.anchor_wall_ms) || 0) || Date.now(),
+        server_time_ms: Number(ev.server_time_ms || (st.server_time_ms) || 0) || 0,
+        state_seq: Math.max(Number(st.state_seq) || 0, ev.seq),
+      });
+      window.MusicHubPlayer.apply(anchored);
+      window.MusicHubPlayer.setTimeline(anchored, { guard: true, render: false });
+      window.MusicHubPlayer.tick();
     }
     if (ev.members) L.members = ev.members.slice();
     if (ev.chat_tail) { L.chat = ev.chat_tail.slice(-50); if (window.ListenUI) window.ListenUI.renderChat(); }
@@ -288,6 +386,35 @@
     });
   }
 
+  function observeCandidates(pc) {
+    const n = L.network;
+    n.startedAt = Date.now();
+    n.state = "detecting"; n.candTypes = []; n.relaySeen = false; n.reason = "";
+    pc.onicecandidate = (e) => {
+      const c = e.candidate;
+      if (!c || !c.candidate) return;
+      const m = /candidate:[^\s]+\s+\d+\s+\w+\s+\d+\s+\S+\s+\d+\s+typ\s+(\w+)/.exec(c.candidate);
+      const typ = m ? m[1] : "unknown";
+      if (n.candTypes.indexOf(typ) < 0) n.candTypes.push(typ);
+      if (typ === "relay") {
+        n.relaySeen = true; n.state = "relay";
+        n.reason = "本版未配置 TURN，若出现 relay 需排查";
+        logMetric("network", { reason: "relay_detected" });
+      }
+    };
+    if (typeof pc.getStats === "function") {
+      const timer = setInterval(async () => {
+        if (!L.active || pc.connectionState === "closed") { clearInterval(timer); return; }
+        try {
+          const stats = await pc.getStats();
+          stats.forEach((r) => {
+            if (r.type !== "candidate-pair" || !r.nominated) return;
+            if (r.currentRoundTripTime != null) n.rttMs = Math.round(r.currentRoundTripTime * 1000);
+          });
+        } catch (e) { clearInterval(timer); }
+      }, 5000);
+    }
+  }
   function pcConfig() {
     return { iceServers: [{ urls: ICE_STUN }], bundlePolicy: "max-bundle",
              rtcpMuxPolicy: "require", iceCandidatePoolSize: 0 };
@@ -318,13 +445,19 @@
                                     offer: "", answer: "" }));
     L.base = j.loopback_url; L.fallback_urls = j.fallback_urls || [];
     L.transport = "webrtc"; L.fallbackReason = "";
-    L.generation += 1;
-    L.chat = [];
+    L.generation += 1; L.chat = [];
     L.seq = 0; L.rev = 0; L.lastEvent = null; L.hostProposalSeq = 0;
+    L.video = { mode: "B", failReason: "", autoplayBlocked: false, userActivated: false };
+    L.network = { state: "detecting", reason: "", candTypes: [], relaySeen: false,
+                  connectMs: 0, rttMs: 0, reconnectCount: 0, lastFailure: "", startedAt: Date.now() };
+    startTimelineTicker();
     const st = snapshot(); updateTimeline(st);
-    const hash = await stateHash(st);
     const initial = { v: ROOM_VERSION, room_id: j.room_id, seq: 1, rev: 1,
-      state_hash: hash, type: "commit", actor: j.host_id, ts: now(), transport: L.transport,
+      state_hash: await stateHash(st), type: "commit", actor: j.host_id, ts: now(), transport: L.transport,
+      song_key: st.song_key || "", song_rev: Number(st.song_rev) || 0,
+      state_seq: Number(st.state_seq) || 1, status: st.status || "idle",
+      anchor_wall_ms: Number(st.anchor_wall_ms) || Date.now(),
+      server_time_ms: 0,
       payload: { proposal: { type: "state" }, state: st } };
     const r = await fetch("/api/room/commit", { method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ event: initial, state: st, members: L.members, chat_tail: [],
@@ -382,19 +515,33 @@
         }
         if (window.ListenUI) window.ListenUI.render();
       }
+      if (m.kind === "pong") {
+        L.network.rttMs = Math.max(0, Date.now() - (Number(m.ts) || Date.now()));
+      }
+      if (m.kind === "ping") { try { dc.send(JSON.stringify({ kind: "pong", ts: m.ts })); } catch (e) {} }
       if (m.kind === "resync") {
         const live = L.members.slice(), tail = L.chat.slice(-50);
+        const fresh = snapshot();
         const resync = Object.assign({}, L.lastEvent || {}, {
           v: ROOM_VERSION, room_id: L.room.room_id, seq: L.seq, rev: L.rev,
           type: "commit", actor: L.room.host_id, ts: now(), transport: L.transport,
+          song_key: fresh.song_key || "", song_rev: Number(fresh.song_rev) || 0,
+          state_seq: Number(fresh.state_seq) || L.seq,
+          status: fresh.status || "playing",
+          anchor_wall_ms: Number(fresh.anchor_wall_ms) || Date.now(),
           members: live, chat_tail: tail,
-          payload: Object.assign({}, (L.lastEvent && L.lastEvent.payload) || {}, { state: snapshot() }) });
+          payload: Object.assign({}, (L.lastEvent && L.lastEvent.payload) || {}, { state: fresh }) });
         dc.send(JSON.stringify({ kind: "event", event: resync }));
       }
     };
-    dc.onclose = () => { s.state = "offline"; if (window.ListenUI) window.ListenUI.render(); };
-    pc.onicecandidate = () => {};
+    dc.onclose = () => { s.state = "offline"; L.network.state = "retrying"; L.network.lastFailure = "datachannel_closed"; if (window.ListenUI) window.ListenUI.render(); };
+    observeCandidates(pc);
     pc.onconnectionstatechange = () => {
+      if (pc.connectionState === "connected") {
+        L.network.state = "lan";
+        L.network.connectMs = Date.now() - (L.network.startedAt || Date.now());
+        logMetric("connection", { reason: "webrtc_connected", value: L.network.connectMs });
+      }
       if (pc.connectionState === "failed") enableHttpFallback("ice_failed");
     };
     try { attachTracks(pc, await hostTracks()); } catch (e) {}
@@ -431,10 +578,16 @@
     L.role = "member"; L.active = true; L.room = inv; L.member_id = inv.member_id;
     L.seq = 0; L.rev = 0; L.generation = 0; L.chat = []; L.members = [];
     L.lastEvent = null; L.fallbackReason = ""; L.transport = "webrtc";
+    L.video = { mode: "C", failReason: "", autoplayBlocked: false, userActivated: false };
+    L.network = { state: "detecting", reason: "", candTypes: [], relaySeen: false,
+                  connectMs: 0, rttMs: 0, reconnectCount: 0, lastFailure: "", startedAt: Date.now() };
+    startTimelineTicker();
+    window.MusicHubPlayer.setStatus("reconnecting", "join_room", false);
     L.grant = inv.grant; L.fallback_urls = inv.fallback_urls || [];
     L.base = await chooseBase(L.fallback_urls, inv.grant);
     const pc = new RTCPeerConnection(pcConfig());
     memberPc = pc;
+    observeCandidates(pc);
     remoteStream = new MediaStream();
     pc.ontrack = (e) => {
       remoteStream.addTrack(e.track);
@@ -446,12 +599,15 @@
         memberDc.onmessage = (ev) => {
           let m; try { m = JSON.parse(ev.data); } catch (_) { return; }
           if (m.kind === "event") handleEvent(m.event);
-          if (m.kind === "anchor" && m.payload && m.payload.state) updateTimeline(m.payload.state);
+          if (m.kind === "anchor" && m.payload && m.payload.state && canApplyState(m.payload.state))
+            window.MusicHubPlayer.setTimeline(m.payload.state, { guard: true, render: false });
+          if (m.kind === "ping") { try { memberDc.send(JSON.stringify({ kind: "pong", ts: m.ts })); } catch (e) {} }
+          if (m.kind === "pong") L.network.rttMs = Math.max(0, Date.now() - (Number(m.ts) || Date.now()));
           if (m.kind === "room_state") {
             L.seq = m.seq || 0; L.rev = m.rev || 0;
             L.members = (m.event && m.event.members) || m.members || [];
             L.chat = (m.event && m.event.chat_tail) || m.chat || [];
-            if (m.state) { window.MusicHubPlayer.apply(m.state); updateTimeline(m.state); }
+            if (m.state) applySnapshot(m.state, "room_state");
             if (window.ListenUI) { window.ListenUI.renderChat(); window.ListenUI.render(); }
           }
         };
@@ -473,6 +629,11 @@
     const timeout = setTimeout(() => enableHttpFallback("webrtc_timeout"), 12000);
     dcReady.then(() => { clearTimeout(timeout); if (window.ListenUI) window.ListenUI.render(); });
     pc.onconnectionstatechange = () => {
+      if (pc.connectionState === "connected") {
+        L.network.state = "lan";
+        L.network.connectMs = Date.now() - (L.network.startedAt || Date.now());
+        logMetric("connection", { reason: "webrtc_connected", value: L.network.connectMs });
+      }
       if (pc.connectionState === "failed") enableHttpFallback("ice_failed");
     };
     if (window.ListenUI) window.ListenUI.render();
@@ -481,21 +642,57 @@
   L.joinRoom = joinRoom;
 
   function UI_hideRemoteVideo() {
-    const box = $("lo-video");
+    const box = $("lo-video"), overlay = $("lyric-overlay");
     if (box) box.classList.add("hidden");
+    if (overlay && !L.active) overlay.classList.add("hidden");
+    if (window.ListenUI) window.ListenUI.setSoundButton(false);
   }
+  function autoplayReason(err) {
+    return err && err.name === "NotAllowedError" ? "NotAllowedError"
+      : err && err.name === "AbortError" ? "not_ready"
+      : err && err.name === "NotSupportedError" ? "media_error"
+      : err && err.message ? String(err.message).slice(0, 40) : "not_ready";
+  }
+  function setVideoFailure(reason, mode) {
+    L.video = L.video || {};
+    L.video.failReason = reason || "not_ready";
+    L.video.autoplayBlocked = reason === "NotAllowedError";
+    L.video.mode = mode || "C";
+    logMetric("video_fallback", { reason: L.video.failReason, value: L.video.mode });
+    if (window.ListenUI && window.ListenUI.setSoundButton)
+      window.ListenUI.setSoundButton(true, L.video.failReason);
+    if (window.ListenUI && window.ListenUI.showRemoteVideo) window.ListenUI.showRemoteVideo();
+    if (window.ListenUI && window.ListenUI.render) window.ListenUI.render();
+  }
+  function playRemoteMedia() {
+    L.video.userActivated = true;
+    const v = $("room-remote-video"), a = $("room-fallback-audio");
+    [v, a].forEach((el) => { if (!el) return; const p = el.play(); if (p && p.catch) p.catch((e) => setVideoFailure(autoplayReason(e), "C")); });
+    if (L.video.autoplayBlocked) { L.video.autoplayBlocked = false; L.video.failReason = ""; }
+    logMetric("video_user_activation", { reason: "play_clicked" });
+  }
+  L.playRemoteMedia = playRemoteMedia;
   function mountRemote() {
     const v = $("room-remote-video");
     if (!v || !remoteStream) return;
     v.classList.remove("hidden");
-    const box = $("lo-video");
-    if (box) box.classList.remove("hidden");
+    const tracks = remoteStream.getTracks ? remoteStream.getTracks() : [];
+    const hasVideo = tracks.some((t) => t.kind === "video" && t.readyState === "live");
+    const hasAudio = tracks.some((t) => t.kind === "audio" && t.readyState === "live");
+    L.video.mode = hasVideo ? "B" : "C";
     if (v.srcObject !== remoteStream) v.srcObject = remoteStream;
     v.muted = false;
-    const p = v.play(); if (p && p.catch) p.catch(() => toast("点击开启一起听声音", 4000));
+    if (L.video.userActivated) {
+      const p = v.play(); if (p && p.catch) p.catch((e) => setVideoFailure(autoplayReason(e), hasVideo ? "B" : "C"));
+    } else {
+      setVideoFailure("NotAllowedError", hasVideo ? "B" : "C");
+    }
     const a = window.MusicHubPlayer.audio;
     a.pause(); a.removeAttribute("src"); a.load();
-    if (window.ListenUI) window.ListenUI.setSoundButton(true);
+    if (window.ListenUI) {
+      window.ListenUI.showRemoteVideo();
+      window.ListenUI.setSoundButton(true, L.video.failReason);
+    }
   }
 
   async function chooseBase(urls, grant) {
@@ -513,7 +710,13 @@
       const j = await fetch(L.base + "/room/state?grant=" + encodeURIComponent(L.grant), { mode: "cors" }).then((r) => r.json());
       if (!j.ok) return;
       L.seq = j.seq; L.rev = j.rev; L.members = j.members || []; L.chat = j.chat_tail || [];
-      if (j.state) { window.MusicHubPlayer.apply(j.state); updateTimeline(j.state); }
+      if (j.state) {
+        window.MusicHubPlayer.setStatus("reconnecting", "http_state_resync", false);
+        applySnapshot(Object.assign({}, j.state, {
+          server_time_ms: Number(j.server_time || 0) * 1000 || 0,
+          state_seq: Math.max(Number((j.state || {}).state_seq) || 0, L.seq),
+        }), "http_reconnect");
+      }
       if (window.ListenUI) window.ListenUI.render();
     } catch (e) {}
   }
@@ -524,7 +727,10 @@
                             "&since=" + L.seq + "&wait=5", { mode: "cors" }).then((r) => r.json());
       if (j.ok) {
         (j.events || []).forEach(handleEvent);
-        if (j.state) updateTimeline(j.state);
+        if (!j.events || !j.events.length) {
+          const st = j.state;
+          if (st && canApplyState(st)) window.MusicHubPlayer.setTimeline(st, { guard: true, render: false });
+        }
         L.members = j.members || L.members;
         L.chat = j.chat_tail || L.chat;
         if (window.ListenUI) { window.ListenUI.renderChat(); window.ListenUI.render(); }
@@ -545,15 +751,24 @@
     if (L.anchorTimer) clearInterval(L.anchorTimer);
     L.anchorTimer = setInterval(async () => {
       if (L.role !== "host" || !L.active) return;
-      if (L.role === "host" && L.transport === "webrtc")
-        sendData({ kind: "anchor", payload: { state: snapshot() } });
-      const st = snapshot(); updateTimeline(st);
+      const st = snapshot();
+      const anchor = Object.assign({}, st, {
+        status: st.status || "playing", reason: "anchor",
+        anchor_wall_ms: Date.now(), server_time_ms: 0,
+        song_rev: Number(st.song_rev) || 0,
+        state_seq: Number(st.state_seq) || L.seq,
+      });
+      if (L.transport === "webrtc") sendData({ kind: "anchor", payload: { state: anchor } });
       try {
         await fetch("/api/room/commit", { method: "POST", headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ event: { v: ROOM_VERSION, room_id: L.room.room_id,
             seq: L.seq, rev: L.rev, state_hash: "", type: "anchor", actor: L.room.host_id,
-            ts: now(), transport: L.transport, payload: { state: st } },
-            state: st, members: L.members, chat_tail: L.chat.slice(-50),
+            ts: now(), transport: L.transport,
+            song_key: anchor.song_key || "", song_rev: anchor.song_rev,
+            state_seq: anchor.state_seq, status: anchor.status,
+            anchor_wall_ms: anchor.anchor_wall_ms,
+            payload: { state: anchor } },
+            state: anchor, members: L.members, chat_tail: L.chat.slice(-50),
             transport: L.transport, generation: L.generation }) });
       } catch (e) {}
     }, 2000);
@@ -562,17 +777,33 @@
   function enableHttpFallback(reason) {
     if (L.transport === "http" || !L.active) return;
     L.transport = "http"; L.fallbackReason = reason || "";
+    L.network.state = "lan"; L.network.lastFailure = reason || "";
+    L.network.reconnectCount += 1;
+    logMetric("network", { reason: "http_fallback", value: reason || "" });
     toast("WebRTC 不可用，已自动切换 LAN 回退", 4000);
     if (L.role === "member") {
       const gen = L.generation + 1;
       L.generation = gen;
       const v = $("room-remote-video"), a = $("room-fallback-audio");
-      if (v) { v.classList.remove("hidden"); const box = $("lo-video"); if (box) box.classList.remove("hidden"); v.srcObject = null; v.muted = true; v.src = L.base + "/room/stream?kind=video&grant=" + encodeURIComponent(L.grant) + "&gen=" + gen; v.play().catch(() => {}); }
-      if (a) { a.src = L.base + "/room/stream?kind=audio&grant=" + encodeURIComponent(L.grant) + "&gen=" + gen; a.play().catch(() => {}); }
+      L.video.mode = "C";
+      L.video.failReason = "webrtc_fallback";
+      if (v) {
+        v.classList.remove("hidden");
+        if (window.ListenUI && window.ListenUI.showRemoteVideo) window.ListenUI.showRemoteVideo();
+        v.srcObject = null; v.muted = true;
+        v.src = L.base + "/room/stream?kind=video&grant=" + encodeURIComponent(L.grant) + "&gen=" + gen;
+        const pv = v.play(); if (pv && pv.catch) pv.catch((e) => setVideoFailure(autoplayReason(e), "C"));
+      }
+      if (a) {
+        a.src = L.base + "/room/stream?kind=audio&grant=" + encodeURIComponent(L.grant) + "&gen=" + gen;
+        const pa = a.play(); if (pa && pa.catch) pa.catch((e) => setVideoFailure(autoplayReason(e), "C"));
+      }
       const localAudio = window.MusicHubPlayer.audio;
       localAudio.pause(); localAudio.removeAttribute("src"); localAudio.load();
+      if (window.ListenUI) window.ListenUI.setSoundButton(true, L.video.failReason);
       syncHttpState(); pollHttpEvents();
     }
+    window.MusicHubPlayer.setStatus("reconnecting", "http_fallback", false);
     if (window.ListenUI) window.ListenUI.render();
   }
   L.enableHttpFallback = enableHttpFallback;
@@ -588,6 +819,10 @@
     const v = $("room-remote-video"), a = $("room-fallback-audio");
     if (v) { v.pause(); v.srcObject = null; v.removeAttribute("src"); v.classList.add("hidden"); }
     if (a) { a.pause(); a.removeAttribute("src"); }
+    L.network.state = "detecting"; L.network.lastFailure = "";
+    L.network.reconnectCount += 1;
+    L.video = { mode: L.role === "host" ? "B" : "C", failReason: "", autoplayBlocked: false, userActivated: false };
+    logMetric("network", { reason: "webrtc_retry" });
     toast("已重置为 WebRTC，请重新生成/粘贴邀请码");
     if (window.ListenUI) window.ListenUI.render();
   }
@@ -610,6 +845,7 @@
     L.active = false;
     if (L.anchorTimer) clearInterval(L.anchorTimer);
     if (captureTimer) clearInterval(captureTimer);
+    stopTimelineTicker();
     L.slots.forEach((s) => { try { s.dc && s.dc.close(); } catch (e) {} try { s.pc && s.pc.close(); } catch (e) {} });
     if (memberPc) { try { memberPc.close(); } catch (e) {} }
     const v = $("room-remote-video"), a = $("room-fallback-audio");
@@ -617,11 +853,11 @@
     if (a) { a.pause(); a.removeAttribute("src"); }
     UI_hideRemoteVideo();
     if (L.role === "host") { try { await fetch("/api/room/close", { method: "POST" }); } catch (e) {} }
+    window.MusicHubPlayer.reset();
     L.role = ""; L.transport = "webrtc"; L.room = null; L.slots = []; L.members = []; L.chat = [];
+    L.video = { mode: "C", failReason: "", autoplayBlocked: false, userActivated: false };
+    L.network.state = "detecting"; L.network.lastFailure = "";
     if (window.ListenUI) window.ListenUI.render();
   }
   L.leaveRoom = leaveRoom;
-  L.debug = () => ({ role: L.role, active: L.active, transport: L.transport, seq: L.seq,
-                     rev: L.rev, members: L.members.length, slots: L.slots.map((s) => s.state),
-                     room_id: L.room && L.room.room_id, base: L.base, reason: L.fallbackReason });
 })();

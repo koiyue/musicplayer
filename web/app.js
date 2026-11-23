@@ -14,6 +14,7 @@ const state = {
   feedQueue: [],                    // 当前视频列表: 仅推荐视频播放上下文, 不持久化, 退出即清空
   plView: "feed",                   // 推荐流时右栏查看的列表: feed=当前视频列表, main=默认播放列表
   mainIndex: -1,                    // 进入推荐流前播放列表的当前下标(供持久化用)
+  feedLocked: false,                // 当前视频列表来自收藏等固定集合: 播到末尾不自动续拉推荐
 };
 
 const $ = (id) => document.getElementById(id);
@@ -33,23 +34,203 @@ function withTok(url) {
   return url + (url.indexOf("?") === -1 ? "?" : "&") + "t=" + encodeURIComponent(MH_TOKEN);
 }
 const audio = $("audio");
-// ---------------- 一起听: 播放器桥接 ----------------
+// Windows 系统媒体提示(SMTC): 网页 Media Session + 原生窗口媒体控件双通道
+const mediaSession = navigator.mediaSession;
+const mediaInfo = { title: "未在播放", artist: "—", album: "MusicHub" };
+let mediaState = "none";
+const MediaPosition = { duration: 0, position: 0, rate: 1 };
+function mediaBridge() {
+  return window.pywebview && window.pywebview.api ? window.pywebview.api : null;
+}
+function mediaPush(force) {
+  const api = mediaBridge();
+  if (!api || !api.update_media) return;
+  const sig = JSON.stringify([mediaInfo, mediaState, Math.round(MediaPosition.position || 0),
+                              Math.round(MediaPosition.duration || 0), MediaPosition.rate]);
+  if (!force && sig === mediaPush.sig) return;
+  mediaPush.sig = sig;
+  try {
+    Promise.resolve(api.update_media(
+      Object.assign({}, mediaInfo), mediaState,
+      { duration: MediaPosition.duration, position: MediaPosition.position,
+        playbackRate: MediaPosition.rate })).catch(() => {});
+  } catch (e) {}
+}
+// ---------------- 一起听: 统一会话时间轴 ----------------
 // Listen.* 由 web/listen.js 注入; app.js 保持无房间时行为不变。
+const ROOM_STATUS_TEXT = {
+  idle: "未加载", preparing: "准备中", paused: "已暂停", playing: "播放中",
+  buffering: "缓冲中", seeking: "跳转中", reconnecting: "重连中", ended: "已结束", error: "错误",
+};
+const perfNow = () => (window.performance && typeof window.performance.now === "function")
+  ? window.performance.now() : Date.now();
+function roomDefaultTimeline() {
+  const wall = Date.now(), mono = perfNow();
+  return {
+    song_key: "", song_rev: 0, state_seq: 0, status: "idle",
+    status_text: ROOM_STATUS_TEXT.idle, reason: "",
+    basePos: 0, baseTs: wall, baseMono: mono,
+    anchorWallMs: wall, anchorHostMonoMs: mono, serverTimeMs: 0, clockOffsetMs: 0,
+    rate: 1, playing: false, duration: 0, qn: 16,
+    driftMs: 0, correction: "none", buffered: false,
+  };
+}
+let roomRateTimer = null;
 const Listen = {
   active: false, role: "", applying: null, suppressPersist: false,
-  timeline: { basePos: 0, baseTs: Date.now(), rate: 1, playing: false, duration: 0 },
+  timeline: roomDefaultTimeline(), loadedMediaKey: "", loadedVideoKey: "",
 };
 window.Listen = Listen;
 function roomActive() { return !!(window.Listen && window.Listen.active); }
 function roomApplying() { return !!(window.Listen && window.Listen.applying); }
+function roomStateFlat(st) {
+  if (!st || typeof st !== "object") return {};
+  return st.timeline && typeof st.timeline === "object"
+    ? Object.assign({}, st.timeline, st) : Object.assign({}, st);
+}
 function roomClock() {
   if (!roomActive()) return null;
-  const t = window.Listen.timeline || {};
+  const t = window.Listen.timeline || roomDefaultTimeline();
+  const mono = perfNow();
+  const baseMono = Number(t.baseMono);
+  const elapsed = Number.isFinite(baseMono) ? Math.max(0, mono - baseMono)
+    : Math.max(0, Date.now() - (Number(t.baseTs) || Date.now()));
+  const status = t.status || (t.playing ? "playing" : "paused");
+  const playing = status === "playing";
   const rate = Number(t.rate) || 1;
-  const base = Number(t.basePos) || 0;
-  const ts = Number(t.baseTs) || Date.now();
-  return { pos: Math.max(0, base + (t.playing ? (Date.now() - ts) / 1000 * rate : 0)),
-           rate: rate, playing: !!t.playing, duration: Number(t.duration) || 0 };
+  const duration = Math.max(0, Number(t.duration) || 0);
+  let pos = Math.max(0, Number(t.basePos) || 0);
+  if (playing) pos += elapsed / 1000 * rate;
+  if (duration) pos = Math.min(pos, duration);
+  return {
+    pos: pos, rate: rate, playing: playing, duration: duration,
+    status: status, status_text: ROOM_STATUS_TEXT[status] || "同步中",
+    song_key: t.song_key || "", song_rev: Number(t.song_rev) || 0,
+    state_seq: Number(t.state_seq) || 0,
+    anchor_wall_ms: Number(t.anchorWallMs) || Number(t.baseTs) || Date.now(),
+    anchor_host_mono_ms: Number(t.anchorHostMonoMs) || baseMono,
+    server_time_ms: Number(t.serverTimeMs) || 0,
+    clock_offset_ms: Number(t.clockOffsetMs) || 0,
+    reason: t.reason || "", drift_ms: Number(t.driftMs) || 0,
+    correction: t.correction || "none", buffered: !!t.buffered,
+    qn: Number(t.qn) || 16,
+  };
+}
+function roomCanApply(st) {
+  const raw = roomStateFlat(st);
+  const cur = window.Listen.timeline || roomDefaultTimeline();
+  let rev = Number(raw.song_rev), seq = Number(raw.state_seq);
+  const curRev = Number(cur.song_rev) || 0, curSeq = Number(cur.state_seq) || 0;
+  if (!Number.isFinite(rev)) rev = curRev;
+  if (!Number.isFinite(seq)) seq = curSeq;
+  if (rev < curRev) return false;
+  if (rev === curRev && seq < curSeq) return false;
+  const wall = Number(raw.anchor_wall_ms || 0), curWall = Number(cur.anchorWallMs || 0);
+  if (rev === curRev && seq === curSeq && wall && curWall && wall < curWall) return false;
+  return true;
+}
+function roomSetTimeline(st, opts) {
+  if (!roomActive()) return false;
+  const raw = roomStateFlat(st || {});
+  const old = window.Listen.timeline || roomDefaultTimeline();
+  const before = roomClock() || { pos: 0, duration: 0, rate: 1, state_seq: 0, song_rev: 0, qn: 16, status: "idle" };
+  if (opts && opts.guard && !roomCanApply(raw)) return false;
+  const song = curSong();
+  const key = String(raw.song_key || (song ? songKey(song) : old.song_key) || "");
+  const status = String(raw.status || (raw.playing ? "playing" : "paused"));
+  const playing = status === "playing";
+  const duration = Math.max(0, Number(raw.duration != null ? raw.duration : before.duration) || 0);
+  let pos = Number(raw.time != null ? raw.time : (raw.anchor_pos_s != null ? raw.anchor_pos_s : before.pos)) || 0;
+  pos = Math.max(0, duration ? Math.min(pos, duration) : pos);
+  const nowWall = Date.now();
+  const anchorWall = Number(raw.anchor_wall_ms || raw.wall_ms || 0) || nowWall;
+  const serverMs = Number(raw.server_time_ms || 0) || 0;
+  let latency = nowWall - anchorWall;
+  if (!Number.isFinite(latency) || latency < 0 || latency > 2000) latency = 0;
+  const mono = perfNow();
+  const songRev = Number.isFinite(Number(raw.song_rev)) ? Number(raw.song_rev) : (Number(old.song_rev) || 0);
+  const stateSeq = Number.isFinite(Number(raw.state_seq)) ? Number(raw.state_seq) : (Number(old.state_seq) || 0) + 1;
+  const qn = Number(raw.qn || before.qn || 16) || 16;
+  const rate = Number(raw.rate || before.rate || 1) || 1;
+  window.Listen.timeline = {
+    song_key: key, song_rev: songRev, state_seq: stateSeq,
+    status: status, status_text: ROOM_STATUS_TEXT[status] || "同步中", reason: raw.reason || "",
+    basePos: pos, baseTs: anchorWall, baseMono: mono - latency,
+    anchorWallMs: anchorWall, anchorHostMonoMs: mono,
+    serverTimeMs: serverMs, clockOffsetMs: nowWall - anchorWall,
+    rate: rate, playing: playing, duration: duration, qn: qn,
+    driftMs: Number(raw.drift_ms || 0) || 0,
+    correction: raw.correction || "none",
+    buffered: status === "buffering" || status === "reconnecting" || status === "preparing",
+  };
+  if (!opts || opts.render !== false) roomTick();
+  return true;
+}
+function roomSetStatus(status, reason, propagate) {
+  if (!roomActive()) return;
+  const c = roomClock();
+  if (!c || !ROOM_STATUS_TEXT[status]) return;
+  if (c.status === status && c.reason === reason) return;
+  roomSetTimeline(Object.assign({}, c, {
+    time: c.pos, status: status, reason: reason || "",
+    state_seq: c.state_seq + 1, anchor_wall_ms: Date.now(),
+  }));
+  if (propagate && !roomApplying()) {
+    roomPropose("room_status", { status: status, reason: reason || "",
+      time: c.pos, song_key: c.song_key, song_rev: c.song_rev });
+  }
+  if (window.ListenUI && window.ListenUI.renderSync) window.ListenUI.renderSync(roomClock());
+}
+function roomCorrectDrift(c) {
+  if (roomApplying() || window.Listen.role !== "host" || !audio.src ||
+      !Number.isFinite(audio.duration) || c.status !== "playing") return;
+  const actual = audio.currentTime || 0;
+  const driftMs = (actual - c.pos) * 1000;
+  const abs = Math.abs(driftMs);
+  let correction = abs <= 200 ? "none" : abs <= 500 ? "rate" : abs <= 1000 ? "reanchor" : "seek";
+  if (correction === "seek") {
+    try { audio.currentTime = c.pos; } catch (e) {}
+  } else if (correction === "reanchor") {
+    roomSetTimeline(Object.assign({}, c, {
+      time: actual, state_seq: c.state_seq + 1, reason: "drift_reanchor",
+      correction: correction, anchor_wall_ms: Date.now(),
+    }), { render: false });
+  } else if (correction === "rate") {
+    if (roomRateTimer) clearTimeout(roomRateTimer);
+    audio.playbackRate = settings.rate * (driftMs < 0 ? 1.03 : 0.97);
+    roomRateTimer = setTimeout(() => { audio.playbackRate = settings.rate; roomRateTimer = null; }, 1000);
+  } else if (roomRateTimer) {
+    clearTimeout(roomRateTimer); roomRateTimer = null; audio.playbackRate = settings.rate;
+  }
+  window.Listen.timeline.driftMs = driftMs;
+  window.Listen.timeline.correction = correction;
+}
+function roomTick() {
+  if (!roomActive()) return;
+  const c = roomClock();
+  if (!c) return;
+  const d = c.duration || (Number.isFinite(audio.duration) ? audio.duration : 0);
+  const t = Math.min(c.pos, d || c.pos);
+  if (!seekDrag.on) {
+    $("t-cur").textContent = fmt(t);
+    $("t-dur").textContent = fmt(d);
+    $("seek-fill").style.width = (d ? (t / d * 100) : 0) + "%";
+  }
+  syncLyric();
+  syncLoSeek();
+  desktopPush(false);
+  roomCorrectDrift(c);
+  if (window.ListenUI && window.ListenUI.renderSync) window.ListenUI.renderSync(c);
+}
+function roomResetTimeline() {
+  if (roomRateTimer) { clearTimeout(roomRateTimer); roomRateTimer = null; }
+  window.Listen.active = false;
+  window.Listen.timeline = roomDefaultTimeline();
+  window.Listen.loadedMediaKey = "";
+  window.Listen.loadedVideoKey = "";
+  window.Listen.suppressPersist = false;
+  window.Listen.applying = null;
+  if (window.ListenUI && window.ListenUI.renderSync) window.ListenUI.renderSync(null);
 }
 function withApply(origin, fn) {
   const ctx = window.Listen;
@@ -72,98 +253,197 @@ function roomApplyIntent(p) {
   if (!p || typeof p !== "object") return;
   const t = p.type, pl = p.payload || {};
   if (t === "chat" || t === "state" || t === "transport" || t === "hello") return;
+  const before = roomSnapshot();
   withApply("remote", () => {
     Listen.suppressPersist = true;
     if (t === "play") audio.play().catch(() => {});
     else if (t === "pause") audio.pause();
     else if (t === "seek") { if (audio.src && audio.duration) audio.currentTime = Math.max(0, Number(pl.time) || 0); }
-    else if (t === "set_rate") { settings.rate = Number(pl.rate) || 1; audio.playbackRate = settings.rate; $("lo-video-el").playbackRate = settings.rate; }
+    else if (t === "set_rate") {
+      settings.rate = Number(pl.rate) || 1;
+      audio.playbackRate = settings.rate;
+      $("lo-video-el").playbackRate = settings.rate;
+      $("room-remote-video").playbackRate = settings.rate;
+      $("room-fallback-audio").playbackRate = settings.rate;
+    }
     else if (t === "set_mode") { state.mode = pl.mode || state.mode; $("btn-mode").innerHTML = MODES[state.mode].icon; }
     else if (t === "prev") prev();
     else if (t === "next" || t === "advance") next();
     else if (t === "play_song" && pl.song) playNow(pl.song, pl.fromList || null);
     else if (t === "queue_add" && pl.song) addToQueue(pl.song);
-    else if (t === "feed_enter" && pl.song) playFeed(pl.song, pl.list || []);
+    else if (t === "feed_enter" && pl.song) playFeed(pl.song, pl.list || [], !!pl.lock);
+    else if (t === "feed_exit") exitFeed();
     else if (t === "feed_part") {
       const i = Number(pl.index), s = aq()[i];
       if (s) { aq()[i] = Object.assign({}, s, { extra: pl.extra || {} }); playAt(i); renderQueue(); }
     }
+    else if (t === "play_index") playIndexLocal(Number(pl.index), !!pl.main);
+    else if (t === "queue_remove") removeAt(Number(pl.index), !!pl.main);
+    else if (t === "queue_clear") clearRoomQueueLocal(!!pl.main);
+    else if (t === "queue_reorder") applyQueueReorder(Number(pl.from), Number(pl.target), !!pl.main);
+    else if (t === "media_reload") {
+      biliQn = Number(pl.qn) || null;
+      settings.qn = biliQn;
+      saveSettings();
+      const s = curSong();
+      if (s && s.source === "bilibili" && lyricOpen) setVideoSrc(s, biliQn);
+    }
     Listen.suppressPersist = false;
-    const st = roomSnapshot();
-    if (t === "play") st.playing = true;
-    if (t === "pause") st.playing = false;
-    if (t === "seek") st.time = Math.max(0, Number(pl.time) || 0);
-    Listen.timeline = { basePos: Number(st.time) || 0, baseTs: Date.now(),
-                        rate: st.rate, playing: !!st.playing, duration: st.duration };
+    const after = roomSnapshot();
+    const songChanged = before.song_key !== after.song_key;
+    const reload = t === "media_reload" || t === "feed_part";
+    const statusOverride = (t === "room_status" || t === "buffer" || t === "reconnect" || t === "error" || t === "ended")
+      ? (ROOM_STATUS_TEXT[pl.status] ? pl.status : before.status) : "";
+    let status = before.status;
+    if (t === "play") status = "playing";
+    else if (t === "pause") status = "paused";
+    else if (t === "seek") status = (before.buffered || before.status === "buffering") ? "buffering" :
+      (before.status === "paused" ? "paused" : "seeking");
+    else if (statusOverride) status = statusOverride;
+    else if (t === "media_reload") status = "preparing";
+    else if (songChanged || reload) status = "playing";
+    let time = before.time;
+    if (songChanged || t === "feed_part") time = 0;
+    else if (t === "seek") time = Math.max(0, Number(pl.time) || 0);
+    else if (statusOverride && pl.time != null) time = Math.max(0, Number(pl.time) || 0);
+    else if (t === "play" || t === "pause" || reload) time = before.time;
+    let duration = before.duration;
+    const nowSong = curSong();
+    if (Number.isFinite(audio.duration) && audio.duration > 0) duration = audio.duration;
+    else if (songChanged && nowSong) duration = Number(nowSong.duration) || 0;
+    const revBump = (songChanged || reload || t === "media_reload") ? 1 : 0;
+    roomSetTimeline(Object.assign({}, after, {
+      song_key: after.song_key, song_rev: after.song_rev + revBump,
+      state_seq: after.state_seq + 1, status: status, time: time, duration: duration,
+      rate: t === "set_rate" ? (Number(pl.rate) || 1) : before.rate,
+      qn: t === "media_reload" ? (Number(pl.qn) || 16) : after.qn,
+      anchor_wall_ms: Date.now(), server_time_ms: 0, reason: pl.reason || t,
+      drift_ms: 0, correction: "none",
+    }));
     renderQueue(); markPlayingRows();
   });
 }
 function roomSnapshot() {
   const s = curSong();
   const c = roomClock();
+  const status = c ? c.status : (audio.src ? (audio.paused ? "paused" : "playing") : "idle");
+  const tl = Object.assign({}, Listen.timeline);
+  const timeline = Object.assign({}, tl, {
+    song_key: s ? songKey(s) : (c ? c.song_key : ""),
+    song_rev: c ? c.song_rev : (Number(tl.song_rev) || 0),
+    state_seq: c ? c.state_seq : (Number(tl.state_seq) || 0),
+    status: status, status_text: ROOM_STATUS_TEXT[status] || "同步中",
+    time: c ? c.pos : (audio.currentTime || 0),
+    duration: c ? c.duration : (Number.isFinite(audio.duration) ? audio.duration : ((s && s.duration) || 0)),
+    rate: c ? c.rate : (audio.playbackRate || settings.rate || 1),
+    playing: c ? c.playing : (!audio.paused && !!audio.src),
+    qn: c ? c.qn : (biliQn || 16),
+    anchor_wall_ms: c ? c.anchor_wall_ms : Date.now(),
+    anchor_host_mono_ms: c ? c.anchor_host_mono_ms : perfNow(),
+    server_time_ms: c ? c.server_time_ms : 0,
+    clock_offset_ms: c ? c.clock_offset_ms : 0,
+    reason: c ? c.reason : "", drift_ms: c ? c.drift_ms : 0,
+    correction: c ? c.correction : "none", buffered: c ? c.buffered : false,
+  });
   return {
     song: s ? JSON.parse(JSON.stringify(s)) : null,
-    song_key: s ? songKey(s) : "",
+    song_key: timeline.song_key,
     queue: JSON.parse(JSON.stringify(state.queue || [])),
     feedQueue: JSON.parse(JSON.stringify(state.feedQueue || [])),
     index: state.index, feedMode: !!state.feedMode,
+    feedLocked: !!state.feedLocked,
     mainIndex: state.mainIndex, plView: state.plView, mode: state.mode,
-    playing: c ? c.playing : (!audio.paused && !!audio.src),
-    time: c ? c.pos : (audio.currentTime || 0),
-    duration: c ? c.duration : (audio.duration || (s && s.duration) || 0),
-    rate: c ? c.rate : (audio.playbackRate || settings.rate || 1),
-    qn: biliQn || 16, generation: 0,
+    playing: timeline.playing, time: timeline.time, duration: timeline.duration,
+    rate: timeline.rate, qn: timeline.qn, generation: timeline.song_rev,
+    song_rev: timeline.song_rev, state_seq: timeline.state_seq,
+    status: timeline.status, status_text: timeline.status_text,
+    anchor_wall_ms: timeline.anchor_wall_ms,
+    anchor_host_mono_ms: timeline.anchor_host_mono_ms,
+    server_time_ms: timeline.server_time_ms,
+    clock_offset_ms: timeline.clock_offset_ms,
+    reason: timeline.reason, drift_ms: timeline.drift_ms,
+    correction: timeline.correction, buffered: timeline.buffered,
+    timeline: timeline,
   };
 }
 function roomApplyState(st) {
   if (!st || typeof st !== "object") return;
+  const raw = roomStateFlat(st);
+  if (!roomCanApply(raw)) return;
   withApply("snapshot", () => {
     Listen.suppressPersist = true;
     if (Array.isArray(st.queue)) state.queue = JSON.parse(JSON.stringify(st.queue));
     if (Array.isArray(st.feedQueue)) state.feedQueue = JSON.parse(JSON.stringify(st.feedQueue));
     state.feedMode = !!st.feedMode;
+    state.feedLocked = !!st.feedLocked;
     state.mainIndex = Number.isFinite(st.mainIndex) ? st.mainIndex : -1;
     state.plView = st.plView || "feed";
     state.mode = st.mode || "loop";
     if (Number.isFinite(st.index)) state.index = st.index;
-    settings.rate = Number(st.rate) || 1;
+    const qn = Number(raw.qn || 16) || 16;
+    settings.rate = Number(raw.rate || 1) || 1;
     audio.playbackRate = settings.rate;
+    $("lo-video-el").playbackRate = settings.rate;
+    $("room-remote-video").playbackRate = settings.rate;
+    $("room-fallback-audio").playbackRate = settings.rate;
     const loSpeed = $("lo-speed");
     if (loSpeed) loSpeed.value = String(settings.rate);
     const s = curSong();
+    mediaUpdateMetadata(s);
+    mediaUpdateState();
+    mediaUpdatePosition();
     if (s) {
+      const key = songKey(s);
+      const mediaKey = key + "|" + (Number(raw.song_rev) || 0) + "|" + qn;
       $("pb-title").textContent = s.title || "";
       $("pb-artist").textContent = (s.artist || "—") + " · " + (SRC_NAME[s.source] || s.source);
       const pcs = coverSrc(s);
       $("pb-cover").innerHTML = pcs ? '<img src="' + esc(pcs) + '">' : "♪";
-      audio.dataset.key = songKey(s);
+      audio.dataset.key = key;
       audio.dataset.resume = "";
       if (Listen.role === "host") {
-        audio.src = proxyUrl(s);
-        if (st.playing) audio.play().catch(() => {}); else audio.pause();
+        biliQn = qn;
+        if (Listen.loadedMediaKey !== mediaKey) {
+          audio.src = proxyUrl(s);
+          Listen.loadedMediaKey = mediaKey;
+        }
+        if (s.source === "bilibili" && lyricOpen && Listen.loadedVideoKey !== mediaKey) {
+          setupVideo(s);
+          Listen.loadedVideoKey = mediaKey;
+        }
+        if (raw.playing) audio.play().catch(() => {}); else audio.pause();
       } else {
-        audio.removeAttribute("src");
-        audio.load();
+        if (audio.hasAttribute("src")) { audio.pause(); audio.removeAttribute("src"); audio.load(); }
+        const vel = $("lo-video-el");
+        if (vel && vel.getAttribute("src")) { vel.pause(); vel.removeAttribute("src"); vel.load(); }
+        if (s.source === "bilibili" && window.ListenUI && window.ListenUI.showRemoteVideo)
+          window.ListenUI.showRemoteVideo();
       }
       if (desktopLyrics.enabled) desktopBeginSong(s);
-      if (lyricOpen) setupVideo(s);
+      if (lyricOpen) {
+        if (Listen.role === "host" && s.source !== "bilibili") setupVideo(s);
+        else if (Listen.role !== "host" && window.ListenUI && window.ListenUI.showRemoteVideo)
+          window.ListenUI.showRemoteVideo();
+      }
       loadLyrics(s);
     }
-    const t = Number(st.time) || 0;
-    Listen.timeline = { basePos: t, baseTs: Date.now(), rate: settings.rate,
-                        playing: !!st.playing, duration: Number(st.duration) || 0 };
-    if (Listen.role === "host" && s && Math.abs(audio.currentTime - t) > 0.5 && audio.duration)
-      audio.currentTime = t;
+    roomSetTimeline(raw, { origin: "apply", render: false });
     renderQueue(); markPlayingRows();
     const modeBtn = $("btn-mode");
     if (modeBtn) { modeBtn.innerHTML = MODES[state.mode].icon; modeBtn.title = MODES[state.mode].name; }
     Listen.suppressPersist = false;
+    roomTick();
   });
 }
 window.MusicHubPlayer = {
   snapshot: roomSnapshot,
   apply: roomApplyState,
   applyIntent: roomApplyIntent,
+  setTimeline: roomSetTimeline,
+  setStatus: roomSetStatus,
+  canApply: roomCanApply,
+  tick: roomTick,
+  reset: roomResetTimeline,
   clock: roomClock,
   withApply: withApply,
   propose: roomPropose,
@@ -207,7 +487,7 @@ function toast(msg, ms) {
     t.id = "toast";
     t.style.cssText = "position:fixed;bottom:110px;left:50%;transform:translateX(-50%);" +
       "background:rgba(0,0,0,.85);color:#fff;padding:10px 22px;border-radius:20px;" +
-      "font-size:14px;z-index:300;pointer-events:none;transition:opacity .3s;max-width:70vw;";
+      "font-size:14px;z-index:1200;pointer-events:none;transition:opacity .3s;max-width:70vw;";
     document.body.appendChild(t);
   }
   t.textContent = msg;
@@ -245,13 +525,15 @@ async function api(path) {
   const r = await fetch(path);
   return r.json();
 }
-const SRC_NAME = { netease: "网易", qq: "QQ", migu: "咪咕", bilibili: "B站", local: "已下载" };
+const SRC_NAME = { netease: "网易", qq: "QQ", migu: "咪咕", bilibili: "B站", douyin: "抖音", local: "已下载" };
 // 各音源品牌 logo(官方图标 / 内联 SVG, 无外网依赖)
+const DOUYIN_LOGO = '<img src="/web/img/douyin.png" alt="抖音">';
 const SRC_LOGO = {
   netease: '<img src="/web/img/netease.png" alt="网易云音乐">',
   qq: '<img src="/web/img/qq.png" alt="QQ音乐">',
   migu: '<img src="/web/img/migu.png" alt="咪咕音乐">',
   bilibili: '<img src="/web/img/bilibili.png" alt="哔哩哔哩">',
+  douyin: DOUYIN_LOGO,
 };
 
 // 队列持久化(防抖)
@@ -734,10 +1016,30 @@ async function openSettings() {
   renderSettingsForm({ font: nativeFont });
   $("settings-modal").classList.remove("hidden");
   refreshSetSelects();
+  refreshMemStats();
+  if (memStatsTimer) clearInterval(memStatsTimer);
+  memStatsTimer = setInterval(refreshMemStats, 3000);
+}
+let memStatsTimer = null;
+async function refreshMemStats() {
+  const apiObj = desktopApi();
+  if (!apiObj || typeof apiObj.memory_stats !== "function") {
+    $("set-mem-total").textContent = "—";
+    $("set-mem-procs").textContent = "—";
+    $("set-mem-reclaims").textContent = "—";
+    return;
+  }
+  try {
+    const st = await apiObj.memory_stats();
+    $("set-mem-total").textContent = Math.round(st.tree_private_ws_mb || 0) + " MB";
+    $("set-mem-procs").textContent = (st.process_count || 1) + " 个";
+    $("set-mem-reclaims").textContent = (st.reclaims || 0) + " 次";
+  } catch (e) {}
 }
 function closeSettings() {
   applyFontSettings();  // 撤销未保存的实时字号预览
   closeSetSelectMenus();
+  if (memStatsTimer) { clearInterval(memStatsTimer); memStatsTimer = null; }
   $("settings-modal").classList.add("hidden");
 }
 async function saveSettingsForm() {
@@ -857,7 +1159,15 @@ function songRow(s, i, opts) {
     e.stopPropagation();
     addToQueue(s);
   });
-  row.addEventListener("click", () => playNow(s, opts.songs));
+  row.addEventListener("click", () => {
+    if (s.source === "douyin") {
+      // 点击抖音视频: 用该视频所在的列表刷新视频播放列表(固定集合, 不自动追加推荐)
+      playFeed(s, (opts.songs && opts.songs.length) ? opts.songs : [s], true);
+      dyPlOpen(s);
+      return;
+    }
+    playNow(s, opts.songs);
+  });
   bindLongPress(row, () => openCtxMenu(s, opts));
   return row;
 }
@@ -865,7 +1175,10 @@ function songRow(s, i, opts) {
 function coverSrc(s) {
   // B站封面(hdslb.com)有防盗链, 走本地图片代理
   const c = s.cover || "";
-  if (c && (s.source === "bilibili" || c.indexOf("hdslb.com") !== -1))
+  if (c && (s.source === "bilibili" || s.source === "douyin" ||
+            c.indexOf("hdslb.com") !== -1 || c.indexOf("byte") !== -1 ||
+            c.indexOf("douyin") !== -1 || c.indexOf("ixigua") !== -1 ||
+            c.indexOf("pstatp.com") !== -1 || c.indexOf("snssdk.com") !== -1))
     return withTok("/imgproxy?url=" + encodeURIComponent(c));
   return c;
 }
@@ -885,9 +1198,20 @@ function setCrumb(html) {
   c.innerHTML = html;
 }
 
+function setSearchEnabled(on) {
+  const input = $("search-input"), btn = $("btn-search");
+  if (!input || !btn) return;
+  const box = input.closest(".searchbox");
+  if (box) box.classList.toggle("hidden", !on);
+  btn.classList.toggle("hidden", !on);
+  input.disabled = !on;
+  btn.disabled = !on;
+  if (!on) input.value = "";
+}
 // ---------------- 搜索 ----------------
 const SEARCH_LIMIT = 30;
 async function doSearch(page) {
+  if (state.source === "douyin") { toast("抖音推荐流不支持搜索"); return; }
   page = Math.max(1, parseInt(page, 10) || 1);
   const kw = $("search-input").value.trim();
   if (!kw) return;
@@ -895,10 +1219,20 @@ async function doSearch(page) {
   setCrumb("「" + esc(kw) + "」的搜索结果 · " + (SRC_NAME[state.source] || ""));
   showEmpty('<div class="loading">搜索中…</div>');
   try {
-    const j = await api("/api/search?source=" + state.source +
-      "&keyword=" + encodeURIComponent(kw) + "&limit=" + SEARCH_LIMIT + "&page=" + page);
-    if (state.view !== view) return;  // 期间已发起新搜索或切换页面, 丢弃旧结果
-    if (j.error) { showEmpty('<div class="loading">' + esc(j.error) + "</div>"); return; }
+    let j = null;
+    const bridge = window.pywebview && window.pywebview.api;
+    if (state.source === "douyin" && page === 1 && bridge && bridge.douyin_search) {
+      // 抖音搜索必须由页面脚本生成 a_bogus 签名；纯接口会返回 verify_check。
+      try { j = await bridge.douyin_search(kw, SEARCH_LIMIT, 1); } catch (e) { j = null; }
+      if (state.view !== view) return;
+      if (!j || !(j.songs || []).length) j = null;
+    }
+    if (!j) {
+      j = await api("/api/search?source=" + state.source +
+        "&keyword=" + encodeURIComponent(kw) + "&limit=" + SEARCH_LIMIT + "&page=" + page);
+      if (state.view !== view) return;  // 期间已发起新搜索或切换页面, 丢弃旧结果
+    }
+    if (j.error && !(j.songs || []).length) { showEmpty('<div class="loading">' + esc(j.error) + "</div>"); return; }
     const songs = j.songs || [];
     if (!songs.length && page === 1) {
       showEmpty('<div class="empty-ic">🔍</div><p>没有找到相关结果</p>');
@@ -958,7 +1292,9 @@ function homeImg(url) {
   if (url.indexOf("hdslb.com") !== -1 || url.indexOf("gtimg.cn") !== -1 ||
       url.indexOf("qpic.cn") !== -1 || url.indexOf("y.qq.com") !== -1 ||
       url.indexOf("music.126.net") !== -1 || url.indexOf("p1.music") !== -1 ||
-      url.indexOf("p2.music") !== -1) {
+      url.indexOf("p2.music") !== -1 || url.indexOf("byte") !== -1 ||
+      url.indexOf("douyin") !== -1 || url.indexOf("ixigua") !== -1 ||
+      url.indexOf("pstatp.com") !== -1 || url.indexOf("snssdk.com") !== -1) {
     return withTok("/imgproxy?url=" + encodeURIComponent(url));
   }
   return esc(url);
@@ -998,6 +1334,590 @@ function renderHome(data, source) {
   $("home-data").dataset.source = source;
   $("home-data").value = JSON.stringify(data);
 }
+// ---------------- 抖音推荐流(独立播放列表 + 无限下拉) ----------------
+const dyFeed = { songs: [], nextIndex: 1, loading: false, hasMore: true };
+// 推荐流是"无限下拉", 长期使用会无限累积数据与 DOM 卡片; 设上限并裁掉最旧的部分。
+const DY_FEED_MAX = 360;
+
+function trimDyFeed() {
+  const grid = $("dy-feed");
+  if (dyFeed.songs.length > DY_FEED_MAX) {
+    const drop = dyFeed.songs.length - DY_FEED_MAX;
+    dyFeed.songs.splice(0, drop);
+    if (grid) {
+      for (let i = 0; i < drop && grid.firstChild; i++) grid.removeChild(grid.firstChild);
+    }
+  }
+  trimFeedQueue(DY_FEED_MAX);
+}
+
+function trimFeedQueue(max) {
+  if (state.feedQueue.length <= max) return;
+  const drop = state.feedQueue.length - max;
+  // 当前播放项若落在被裁剪区间, 保留它及其之前的内容, 避免下标错位
+  if (state.index >= 0 && state.index < drop) return;
+  state.feedQueue.splice(0, drop);
+  if (state.index >= 0) state.index -= drop;
+  if (state.mainIndex >= 0) state.mainIndex = Math.max(0, state.mainIndex - drop);
+}
+
+async function fetchDouyinFeed(reset) {
+  if (dyFeed.loading) return [];
+  if (!reset && !dyFeed.hasMore) return [];
+  dyFeed.loading = true;
+  try {
+    const idx = reset ? 1 : dyFeed.nextIndex;
+    const j = await api("/api/douyin/feed?limit=20&index=" + idx);
+    if (reset) { dyFeed.songs = []; dyFeed.nextIndex = 1; dyFeed.hasMore = true; }
+    const songs = j.songs || [];
+    songs.forEach((s) => {
+      const k = songKey(s);
+      if (!dyFeed.songs.some((x) => songKey(x) === k)) dyFeed.songs.push(s);
+    });
+    dyFeed.nextIndex = j.next_index || (idx + 1);
+    dyFeed.hasMore = songs.length > 0;
+    trimDyFeed();
+    return songs;
+  } catch (e) {
+    return [];
+  } finally {
+    dyFeed.loading = false;
+  }
+}
+function dySongCard(s) {
+  const card = document.createElement("div");
+  card.className = "vg-card";
+  const cover = coverSrc(s);
+  card.innerHTML =
+    '<div class="vg-cover">' +
+    (cover ? '<img loading="lazy" src="' + esc(cover) + '" onerror="this.parentNode.innerHTML=\'♪\'">' : "♪") +
+    (s.duration ? '<span class="vg-dur">' + fmt(s.duration) + "</span>" : "") +
+    "</div>" +
+    '<div class="vg-title">' + esc(s.title) + "</div>" +
+    '<div class="vg-sub">' + esc(s.artist ? "@" + s.artist : "抖音") + "</div>";
+  card.addEventListener("click", () => {
+    playFeed(s, dyFeed.songs);
+    dyPlOpen(s);
+  });
+  bindLongPress(card, () => openCtxMenu(s, {
+    songs: dyFeed.songs,
+    // 抖音走独立播放列表: 菜单里的"立即播放"不能落到主播放列表
+    onPlay: (x) => { playFeed(x, dyFeed.songs); dyPlOpen(x); },
+  }));
+  return card;
+}
+function appendDyCards(songs) {
+  const wrap = $("dy-feed");
+  if (!wrap) return;
+  songs.forEach((s) => wrap.appendChild(dySongCard(s)));
+  // 与 B 站推荐一致: 页面最多保留 100 张卡片, 超出时移除最早的
+  while (wrap.childElementCount > 100) wrap.removeChild(wrap.firstElementChild);
+}
+async function loadMoreDouyin(view) {
+  if (dyFeed.loading || !dyFeed.hasMore) return;
+  const before = dyFeed.songs.length;
+  const songs = await fetchDouyinFeed(false);
+  if (state.view !== view || !songs.length) return;
+  appendDyCards(dyFeed.songs.slice(before));
+  // 当前播放的是抖音视频时, 新拉到的推荐内容追加到视频播放列表末尾
+  if (state.feedMode && !state.feedLocked) {
+    const cur = curSong();
+    if (cur && cur.source === "douyin") {
+      dyFeed.songs.slice(before).forEach((s) => {
+        if (!state.feedQueue.some((x) => songKey(x) === songKey(s))) state.feedQueue.push(s);
+      });
+      renderQueue();
+    }
+  }
+  fillDouyinViewport(view);
+}
+async function fillDouyinViewport(view) {
+  const content = $("content");
+  for (let i = 0; i < 3; i++) {
+    if (state.view !== view || dyFeed.loading || !dyFeed.hasMore) return;
+    if (content.scrollHeight > content.clientHeight + 80) return;
+    await loadMoreDouyin(view);
+  }
+}
+async function showDouyinFeed() {
+  const view = state.view = { type: "douyinfeed", source: "douyin" };
+  setCrumb("抖音 · 推荐");
+  showEmpty('<div class="loading">抖音推荐加载中…</div>');
+  dyFeed.songs = []; dyFeed.nextIndex = 1; dyFeed.hasMore = true; dyFeed.loading = false;
+  await fetchDouyinFeed(true);
+  if (state.view !== view) return;
+  if (!dyFeed.songs.length) { showEmpty(srcEmptyHtml()); return; }
+  $("empty").classList.add("hidden");
+  const list = $("list");
+  list.innerHTML = "";
+  const grid = document.createElement("div");
+  grid.className = "video-grid";
+  grid.id = "dy-feed";
+  list.appendChild(grid);
+  appendDyCards(dyFeed.songs);
+  $("content").scrollTop = 0;
+  fillDouyinViewport(view);
+}
+// 当前播放的抖音视频所属推荐列表有新内容时, 追加到视频播放列表末尾
+async function extendDouyinForPlayback() {
+  if (state.feedMode && state.feedLocked) return;
+  if (state.source !== "douyin" || dyFeed.loading || !dyFeed.hasMore) return;
+  const cur = curSong();
+  if (!cur || cur.source !== "douyin") return;
+  const view = state.view;
+  const before = dyFeed.songs.length;
+  const songs = await fetchDouyinFeed(false);
+  if (!songs.length) return;
+  if (view && view.type === "douyinfeed") appendDyCards(dyFeed.songs.slice(before));
+  if (!state.feedMode) return;
+  dyFeed.songs.slice(before).forEach((s) => {
+    if (!state.feedQueue.some((x) => songKey(x) === songKey(s))) state.feedQueue.push(s);
+  });
+  trimFeedQueue(DY_FEED_MAX * 2);  // 视频播放列表同样限制上限
+  renderQueue();
+}
+
+// ---------------- 抖音专用视频播放器 ----------------
+// 画面用静音 <video> 跟随音频时间轴: 声音仍由主播放器输出, 播放/暂停/切歌/歌词与全局状态保持一致。
+const dyPl = { open: false, song: null, timer: null, seek: { on: false } };
+// 点赞/收藏只记在本机, 点击立即生效, 不做任何远端同步
+const dyActs = { liked: {}, collected: {} };
+try {
+  const saved = JSON.parse(localStorage.getItem("mh_dy_acts") || "{}");
+  if (saved && typeof saved === "object") {
+    dyActs.liked = saved.liked || {};
+    dyActs.collected = saved.collected || {};
+  }
+} catch (e) {}
+function dyActsSave() {
+  try { localStorage.setItem("mh_dy_acts", JSON.stringify(dyActs)); } catch (e) {}
+}
+// 评论点赞: 官方接口需要签名, 这里做本地点赞状态(只影响本机显示)
+const dyCmtLikes = {};
+try {
+  const savedLikes = JSON.parse(localStorage.getItem("mh_dy_cmt_likes") || "{}");
+  if (savedLikes && typeof savedLikes === "object") Object.assign(dyCmtLikes, savedLikes);
+} catch (e) {}
+function dyCmtLikesSave() {
+  try { localStorage.setItem("mh_dy_cmt_likes", JSON.stringify(dyCmtLikes)); } catch (e) {}
+}
+let dySwipeMoved = false;
+const dyCmt = { song: "", cursor: 0, hasMore: false, total: 0, loading: false, ids: {} };
+const dyDrag = { id: null, x0: 0, y0: 0, mode: null, start: 0, dur: 0, ratio: 0 };
+function dySuppressClick() {
+  dySwipeMoved = true;
+  setTimeout(() => { dySwipeMoved = false; }, 350);
+}
+function dyVideoUrl(s) {
+  return withTok("/proxy?source=douyin&id=" + encodeURIComponent(s.id) +
+    "&kind=video&extra=" + encodeURIComponent(JSON.stringify(s.extra || {})));
+}
+function dyPlLoad(s) {
+  if (!s || s.source !== "douyin") return;
+  const prev = dyPl.song;
+  const changed = !prev || songKey(prev) !== songKey(s);
+  dyPl.song = s;
+  const v = $("dy-video");
+  const key = songKey(s);
+  if (v.dataset.key !== key) {
+    v.dataset.key = key;
+    // 换源即可让旧媒体(解码器/缓冲)释放, 不要在空 src 上再 load():
+    // 那会与紧随其后的新源加载竞争, 首次切换时视频可能停在空缓冲。
+    try { v.pause(); } catch (e) {}
+    v.src = dyVideoUrl(s);
+    reclaimOnMedia();
+  }
+  v.play().catch(() => {});
+  const st = s.stats || {};
+  const created = st.create_time ? new Date(st.create_time * 1000) : null;
+  $("dy-author").textContent = (s.artist ? "@" + s.artist : "@抖音用户") +
+    (created ? " · " + (created.getMonth() + 1) + "月" + created.getDate() + "日" : "");
+  $("dy-desc").textContent = s.title || "";
+  const av = st.author_avatar || "";
+  $("dy-avatar").classList.toggle("hidden", !av);
+  if (av) $("dy-avatar-img").src = withTok("/imgproxy?url=" + encodeURIComponent(av));
+  $("dy-like").classList.toggle("on", !!dyActs.liked[String(s.id)]);
+  $("dy-collect").classList.toggle("on", !!dyActs.collected[String(s.id)]);
+  if (dyActs.collected[String(s.id)]) dySaveLocalFavorite(s, true);
+  $("dy-like-n").textContent = fmtCount((st.digg || 0) + (dyActs.liked[String(s.id)] ? 1 : 0));
+  $("dy-cmt-n").textContent = fmtCount(st.comment || 0);
+  $("dy-collect-n").textContent = fmtCount((st.collect || 0) + (dyActs.collected[String(s.id)] ? 1 : 0));
+  $("dy-share-n").textContent = fmtCount(st.share || 0);
+  if (changed) dyCmtReset();
+  dyPlPaint();
+}
+function dyCelebrate(kind, on, btn) {
+  const pop = $("dy-pop");
+  if (pop) {
+    const phrases = kind === "like"
+      ? (on ? ["喜欢！已为你点亮", "这份快乐收藏啦", "心动 +1"] : ["已收回喜欢"])
+      : (on ? ["收藏成功，慢慢回味", "好内容，替你留住啦", "已加入你的宝藏"] : ["已移出收藏"]);
+    pop.textContent = phrases[Math.floor(Math.random() * phrases.length)];
+    pop.classList.remove("hidden");
+    pop.style.animation = "none";
+    void pop.offsetWidth;
+    pop.style.animation = "";
+  }
+  if (btn && on) {
+    btn.classList.remove("pop");
+    void btn.offsetWidth;
+    btn.classList.add("pop");
+    const r = btn.getBoundingClientRect();
+    const host = $("dy-player");
+    const hr = host.getBoundingClientRect();
+    for (let i = 0; i < 8; i++) {
+      const sp = document.createElement("span");
+      sp.className = "dy-spark";
+      const a = Math.PI * 2 * i / 8;
+      sp.style.setProperty("--dx", Math.cos(a) * 50 + "px");
+      sp.style.setProperty("--dy", Math.sin(a) * 50 + "px");
+      sp.style.left = (r.left - hr.left + r.width / 2) + "px";
+      sp.style.top = (r.top - hr.top + r.height / 2) + "px";
+      host.appendChild(sp);
+      setTimeout(() => sp.remove(), 760);
+    }
+  }
+}
+function dyPlPaint() {
+  const v = $("dy-video");
+  const c = roomClock();
+  const d = (c && c.duration) || v.duration || audio.duration || (dyPl.song && dyPl.song.duration) || 0;
+  const t = c ? Math.min(c.pos, d || c.pos) : (v.currentTime || 0);
+  $("dy-fill").style.width = (d ? t / d * 100 : 0) + "%";
+  $("dy-time").textContent = fmt(t) + " / " + fmt(d);
+  const playing = c ? (c.playing && !c.buffered) : !audio.paused;
+  $("dy-player").classList.toggle("paused", !playing);
+}
+function dyPlTick() {
+  if (!dyPl.open) return;
+  const v = $("dy-video");
+  const c = roomClock();
+  const playing = c ? (c.playing && !c.buffered) : !audio.paused;
+  if (playing) { if (v.paused) v.play().catch(() => {}); }
+  else if (!v.paused) v.pause();
+  const target = c ? c.pos : audio.currentTime;
+  if (v.duration && target > 0 && Math.abs(v.currentTime - target) > 0.8) {
+    try { v.currentTime = Math.min(target, Math.max(v.duration - 0.1, 0)); } catch (e) {}
+  }
+  if (!dyPl.seek.on) dyPlPaint();
+}
+function dyPlOpen(s) {
+  if (!s || s.source !== "douyin") return;
+  reclaimOnMedia();
+  if (lyricOpen) closeLyric();
+  dyPl.open = true;
+  $("dy-player").classList.remove("hidden");
+  dyPlLoad(s);
+  if (dyPl.timer) clearInterval(dyPl.timer);
+  dyPl.timer = setInterval(dyPlTick, 400);
+  dyPlTick();
+}
+function dyPlClose() {
+  if (!dyPl.open) return;
+  dyPl.open = false;
+  if (dyPl.timer) { clearInterval(dyPl.timer); dyPl.timer = null; }
+  $("dy-player").classList.add("hidden");
+  const v = $("dy-video");
+  try { v.pause(); v.removeAttribute("src"); v.load(); } catch (e) {}
+  v.dataset.key = "";
+  dyPl.song = null;
+  dyCmtReset();
+}
+function dyPlToggle() {
+  if (roomActive()) return;
+  if (audio.paused) audio.play().catch(() => {}); else audio.pause();
+  dyPlPaint();
+}
+// ---- 点赞 / 收藏 / 分享 ----
+function dyBaseCount(kind) {
+  const st = (dyPl.song && dyPl.song.stats) || {};
+  return Number(kind === "like" ? (st.digg || 0) : (st.collect || 0)) || 0;
+}
+function dySaveLocalFavorite(s, on) {
+  localPl(on ? "add" : "remove", { id: "dy_favorites", song: s }).catch(() => {});
+}
+function dyActDo(kind) {
+  const s = dyPl.song;
+  if (!s) return;
+  const map = kind === "like" ? dyActs.liked : dyActs.collected;
+  const btn = kind === "like" ? $("dy-like") : $("dy-collect");
+  const num = kind === "like" ? $("dy-like-n") : $("dy-collect-n");
+  const key = String(s.id);
+  const on = !map[key];
+  const base = dyBaseCount(kind);
+  if (on) map[key] = true; else delete map[key];
+  dyActsSave();
+  btn.classList.toggle("on", on);
+  num.textContent = fmtCount(Math.max(0, base + (on ? 1 : 0)));
+  dyCelebrate(kind, on, btn);
+  if (kind === "collect") dySaveLocalFavorite(s, on);
+}
+function dyShareCopy(url) {
+  const done = () => toast("分享链接已复制");
+  const legacy = () => {
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(url).then(done).catch(legacyExec);
+      return;
+    }
+    legacyExec();
+  };
+  const legacyExec = () => {
+    const ta = document.createElement("textarea");
+    ta.value = url;
+    ta.style.cssText = "position:fixed;left:-9999px;top:0;opacity:0";
+    document.body.appendChild(ta);
+    ta.select();
+    try { if (document.execCommand("copy")) done(); else toast(url); }
+    catch (e) { toast(url); }
+    ta.remove();
+  };
+  // 桌面端优先走 Win32 剪贴板, WebView2 里 navigator.clipboard 经常不可用
+  const bridge = window.pywebview && window.pywebview.api;
+  if (bridge && bridge.copy_text) {
+    bridge.copy_text(url).then((j) => { if (j && j.ok) done(); else legacy(); })
+      .catch(legacy);
+    return;
+  }
+  legacy();
+}
+function dyShareDirect() {
+  const s = dyPl.song;
+  if (!s) return;
+  dyShareCopy((s.extra && s.extra.share_url) || ("https://www.douyin.com/video/" + s.id));
+}
+// ---- 评论区(触底分页) ----
+function dyCmtReset() {
+  dyCmt.song = "";
+  dyCmt.cursor = 0;
+  dyCmt.hasMore = false;
+  dyCmt.total = 0;
+  dyCmt.loading = false;
+  dyCmt.ids = {};
+  $("dy-cmt-panel").classList.add("hidden");
+  $("dy-player").classList.remove("cmt-open");
+  $("dy-cmt-list").innerHTML = "";
+  $("dy-cmt-title").textContent = "评论";
+  const st = (dyPl.song && dyPl.song.stats) || {};
+  $("dy-cmt-n").textContent = fmtCount(st.comment || 0);
+}
+function dyCmtClose() {
+  $("dy-cmt-panel").classList.add("hidden");
+  $("dy-player").classList.remove("cmt-open");
+}
+function dyCmtToggle() {
+  const panel = $("dy-cmt-panel");
+  if (!panel.classList.contains("hidden")) { dyCmtClose(); return; }
+  const s = dyPl.song;
+  if (!s) return;
+  panel.classList.remove("hidden");
+  $("dy-player").classList.add("cmt-open");
+  if (dyCmt.song === String(s.id)) return;
+  dyCmtLoad(s, false);
+}
+function dyCmtFoot(text) {
+  const list = $("dy-cmt-list");
+  let foot = list.querySelector(".dy-cmt-foot");
+  if (!foot) {
+    foot = document.createElement("div");
+    foot.className = "dy-cmt-foot";
+  }
+  foot.textContent = text;
+  list.appendChild(foot);
+}
+function dyCmtItemHtml(c) {
+  const cid = String(c.cid || "");
+  const liked = !!dyCmtLikes[cid];
+  const base = Number(c.like) || 0;
+  const meta = [cmtTime(c.time), c.ip || "", c.reply ? "回复 " + fmtCount(c.reply) : ""]
+    .filter(Boolean).join(" · ");
+  return '<div class="dy-cmt-item">' +
+    (c.avatar
+      ? '<img class="dy-cmt-face" loading="lazy" src="' +
+        esc(withTok("/imgproxy?url=" + encodeURIComponent(c.avatar))) +
+        '" onerror="this.className=\'dy-cmt-face ph\'">'
+      : '<div class="dy-cmt-face ph">♪</div>') +
+    '<div class="dy-cmt-main">' +
+      '<div class="dy-cmt-name">' + esc(c.user || "抖音用户") + "</div>" +
+      '<div class="dy-cmt-text">' + esc(c.text || "") + "</div>" +
+      '<div class="dy-cmt-meta"><span class="dy-cmt-sub">' + esc(meta) + "</span>" +
+        '<button class="dy-cmt-like' + (liked ? " on" : "") + '" data-cid="' + esc(cid) +
+          '" data-n="' + base + '">' +
+          '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 21s-7.5-4.7-9.7-9A5.6 5.6 0 0 1 12 5.6 5.6 5.6 0 0 1 21.7 12C19.5 16.3 12 21 12 21z"/></svg>' +
+          "<b>" + fmtCount(base + (liked ? 1 : 0)) + "</b>" +
+        "</button>" +
+      "</div>" +
+    "</div></div>";
+}
+async function dyCmtLoad(s, more) {
+  if (dyCmt.loading) return;
+  if (more && (!dyCmt.hasMore || dyCmt.song !== String(s.id))) return;
+  dyCmt.loading = true;
+  const listEl = $("dy-cmt-list");
+  if (!more) {
+    dyCmt.song = String(s.id);
+    dyCmt.cursor = 0;
+    dyCmt.hasMore = false;
+    dyCmt.total = 0;
+    dyCmt.ids = {};
+    listEl.innerHTML = '<div class="dy-cmt-loading">加载中…</div>';
+  } else {
+    dyCmtFoot("加载中…");
+  }
+  try {
+    const j = await api("/api/douyin/comments?id=" + encodeURIComponent(s.id) +
+      "&cursor=" + dyCmt.cursor + "&count=20");
+    if (dyPl.song !== s || dyCmt.song !== String(s.id)) return;
+    const list = (j && j.comments) || [];
+    dyCmt.total = Number(j && j.total) || dyCmt.total;
+    dyCmt.cursor = Number(j && j.cursor) || (dyCmt.cursor + list.length);
+    dyCmt.hasMore = !!(j && j.has_more);
+    if (!more) listEl.innerHTML = "";
+    const add = [];
+    list.forEach((c) => {
+      const cid = String(c.cid || "");
+      if (!cid || dyCmt.ids[cid]) return;
+      dyCmt.ids[cid] = true;
+      add.push(c);
+    });
+    if (add.length) listEl.insertAdjacentHTML("beforeend", add.map(dyCmtItemHtml).join(""));
+    if (!more && !add.length) {
+      dyCmtFoot((j && j.error) || "暂无评论");
+      return;
+    }
+    const st = s.stats || {};
+    $("dy-cmt-title").textContent = "评论 " + fmtCount(dyCmt.total || st.comment || 0);
+    $("dy-cmt-n").textContent = fmtCount(st.comment || dyCmt.total || 0);
+    dyCmtFoot(dyCmt.hasMore ? "上滑加载更多" : "没有更多评论了");
+  } catch (e) {
+    if (dyPl.song !== s) return;
+    if (more) dyCmtFoot("加载失败，上滑重试");
+    else listEl.innerHTML = '<div class="dy-cmt-loading">' +
+      esc(String((e && e.message) || e || "评论加载失败")) + "</div>";
+  } finally {
+    dyCmt.loading = false;
+  }
+}
+// 评论列表触底继续加载
+$("dy-cmt-list").addEventListener("scroll", () => {
+  if (!dyPl.open || dyCmt.loading || !dyCmt.hasMore) return;
+  const el = $("dy-cmt-list");
+  if (el.scrollTop + el.clientHeight >= el.scrollHeight - 120) {
+    const s = dyPl.song;
+    if (s) dyCmtLoad(s, true);
+  }
+});
+// 评论点赞(本地状态)
+$("dy-cmt-list").addEventListener("click", (e) => {
+  const btn = e.target.closest(".dy-cmt-like");
+  if (!btn) return;
+  const cid = btn.dataset.cid || "";
+  if (!cid) return;
+  const on = !dyCmtLikes[cid];
+  if (on) dyCmtLikes[cid] = true; else delete dyCmtLikes[cid];
+  dyCmtLikesSave();
+  btn.classList.toggle("on", on);
+  const base = Number(btn.dataset.n || 0);
+  const num = btn.querySelector("b");
+  if (num) num.textContent = fmtCount(base + (on ? 1 : 0));
+});
+$("dy-like").addEventListener("click", () => dyActDo("like"));
+$("dy-collect").addEventListener("click", () => dyActDo("collect"));
+$("dy-share").addEventListener("click", dyShareDirect);
+$("dy-cmt").addEventListener("click", dyCmtToggle);
+$("dy-cmt-close").addEventListener("click", dyCmtClose);
+$("dy-close").addEventListener("click", dyPlClose);
+$("dy-video").addEventListener("click", () => {
+  if (dySwipeMoved) { dySwipeMoved = false; return; }
+  dyPlToggle();
+});
+$("dy-bigplay").addEventListener("click", () => { audio.play().catch(() => {}); dyPlPaint(); });
+// 进度条: 拖动时只画 UI, 松手后统一 seek 音频与视频
+function dyBarRatio(e) {
+  const r = $("dy-bar").getBoundingClientRect();
+  return Math.min(Math.max((e.clientX - r.left) / (r.width || 1), 0), 1);
+}
+$("dy-bar").addEventListener("pointerdown", (e) => {
+  dyPl.seek.on = true;
+  $("dy-bar").setPointerCapture(e.pointerId);
+  $("dy-fill").style.width = dyBarRatio(e) * 100 + "%";
+});
+$("dy-bar").addEventListener("pointermove", (e) => {
+  if (!dyPl.seek.on) return;
+  $("dy-fill").style.width = dyBarRatio(e) * 100 + "%";
+});
+function dySeekEnd(e) {
+  if (!dyPl.seek.on) return;
+  dyPl.seek.on = false;
+  const v = $("dy-video");
+  const c = roomClock();
+  const d = (c && c.duration) || v.duration || audio.duration || (dyPl.song && dyPl.song.duration) || 0;
+  if (!d) return;
+  const t = Math.min(Math.max(dyBarRatio(e) * d, 1), Math.max(d - 1, 0));
+  roomIntent("seek", { time: t }, () => { audio.currentTime = t; });
+  if (v.duration) { try { v.currentTime = Math.min(t, Math.max(v.duration - 0.1, 0)); } catch (err) {} }
+  dyPlPaint();
+}
+$("dy-bar").addEventListener("pointerup", dySeekEnd);
+$("dy-bar").addEventListener("pointercancel", dySeekEnd);
+// 画面手势: 左右拖动快进快退, 上下滑动切换视频
+$("dy-video").addEventListener("pointerdown", (e) => {
+  if (e.pointerType === "mouse" && e.button !== 0) return;
+  const v = $("dy-video");
+  const c = roomClock();
+  dyDrag.id = e.pointerId;
+  dyDrag.x0 = e.clientX;
+  dyDrag.y0 = e.clientY;
+  dyDrag.mode = null;
+  dyDrag.ratio = 0;
+  dyDrag.start = c ? c.pos : (v.currentTime || 0);
+  dyDrag.dur = (c && c.duration) || v.duration || audio.duration || 0;
+  try { v.setPointerCapture(e.pointerId); } catch (err) {}
+});
+$("dy-video").addEventListener("pointermove", (e) => {
+  if (dyDrag.id !== e.pointerId) return;
+  const dx = e.clientX - dyDrag.x0, dy = e.clientY - dyDrag.y0;
+  if (!dyDrag.mode) {
+    if (Math.abs(dx) < 10 && Math.abs(dy) < 10) return;
+    dyDrag.mode = Math.abs(dx) > Math.abs(dy) ? "seek" : "switch";
+  }
+  if (dyDrag.mode === "seek" && dyDrag.dur) {
+    const w = $("dy-video").clientWidth || innerWidth;
+    dyDrag.ratio = Math.min(Math.max(dyDrag.start / dyDrag.dur + dx * 0.7 / w, 0), 1);
+    const t = dyDrag.ratio * dyDrag.dur;
+    $("dy-fill").style.width = dyDrag.ratio * 100 + "%";
+    $("dy-time").textContent = fmt(t) + " / " + fmt(dyDrag.dur);
+  }
+});
+function dyDragEnd(e) {
+  if (dyDrag.id !== e.pointerId) return;
+  const mode = dyDrag.mode, ratio = dyDrag.ratio, dur = dyDrag.dur;
+  const dy = e.clientY - dyDrag.y0;
+  dyDrag.id = null;
+  dyDrag.mode = null;
+  if (e.type === "pointercancel") return;
+  if (mode === "seek" && dur) {
+    dySuppressClick();
+    const t = Math.min(Math.max(ratio * dur, 1), Math.max(dur - 1, 0));
+    roomIntent("seek", { time: t }, () => { audio.currentTime = t; });
+    const v = $("dy-video");
+    if (v.duration) { try { v.currentTime = Math.min(t, Math.max(v.duration - 0.1, 0)); } catch (err) {} }
+    dyPlPaint();
+  } else if (mode === "switch") {
+    dySuppressClick();
+    if (Math.abs(dy) > 60) { if (dy > 0) prev(); else next(); }
+  }
+}
+$("dy-video").addEventListener("pointerup", dyDragEnd);
+$("dy-video").addEventListener("pointercancel", dyDragEnd);
+document.addEventListener("keydown", (e) => {
+  if (!dyPl.open) return;
+  if (e.target && e.target.closest && e.target.closest("input,textarea,select")) return;
+  if (e.key === "Escape") { dyPlClose(); return; }
+  if (e.key === "ArrowUp") { e.preventDefault(); prev(); }
+  else if (e.key === "ArrowDown") { e.preventDefault(); next(); }
+  else if (e.key === " ") { e.preventDefault(); dyPlToggle(); }
+});
+
 async function showMusicHome(source) {
   const view = state.view = { type: "home", source: source };
   setCrumb((SRC_NAME[source] || source) + " · 推荐");
@@ -1006,19 +1926,58 @@ async function showMusicHome(source) {
     const j = await api("/api/home?source=" + encodeURIComponent(source) + "&limit=30");
     if (state.view !== view) return;
     if (j.error) { showEmpty('<div class="loading">' + esc(j.error) + "</div>"); return; }
+    if (source === "douyin") {
+      let songs = (j.songs || []).slice(0, 30);
+      if (songs.length) {
+        renderSongs(songs, { songs: songs });
+        $("list").insertAdjacentHTML("afterbegin",
+          '<div class="home-head"><h3>抖音推荐流</h3>' +
+          '<button class="home-refresh" id="douyin-feed-refresh">↻</button></div>');
+        const refresh = $("douyin-feed-refresh");
+        if (refresh) refresh.addEventListener("click", (e) => {
+          e.stopPropagation();
+          showMusicHome(source);
+        });
+        return;
+      }
+      const r = await api("/api/recommend?source=douyin&limit=30&mode=feed");
+      if (state.view !== view) return;
+      renderHome(j, source);
+      $("list").insertAdjacentHTML("beforeend",
+        '<section class="home-section"><div class="home-head"><h3>抖音推荐流</h3></div>' +
+        '<p class="set-hint">' + esc(r.error || "暂无推荐内容，可粘贴抖音分享链接播放") + "</p>" +
+        "</section>");
+      return;
+    }
     renderHome(j, source);
   } catch (e) {
     if (state.view !== view) return;
     showEmpty('<div class="loading">首页加载失败: ' + esc(e) + "</div>");
   }
 }
+async function openHomeRecommend(source, mode, title) {
+  const v = state.view = { type: "recommend", source: source };
+  setCrumb((SRC_NAME[source] || source) + " · " + esc(title));
+  showEmpty('<div class="loading">加载中…</div>');
+  const j = await api("/api/recommend?source=" + encodeURIComponent(source) +
+                      "&limit=50&mode=" + encodeURIComponent(mode || ""));
+  if (state.view !== v) return;
+  if (j.error && !(j.songs || []).length) { showEmpty('<div class="loading">' + esc(j.error) + "</div>"); return; }
+  renderSongs(j.songs || [], { songs: j.songs || [] });
+}
 async function openHomeCard(kind, idx, source) {
   let data;
   try { data = JSON.parse($("home-data").value || "{}"); } catch (e) { return; }
   const c = (data[kind] || [])[idx];
   if (!c) return;
-  if (c.action === "playlist" && c.ref && (source !== "qq" || !c.topid)) {
+  if (c.action === "playlist" && c.ref && (source !== "qq" || !c.topid) && source !== "douyin") {
     openPlaylist(source, c.ref, c.title || "歌单");
+    return;
+  }
+  if (c.action === "playlist" && c.ref && source === "douyin") {
+    state.source = "douyin";
+    if (c.keyword) { $("search-input").value = c.keyword; doSearch(1); }
+    else openHomeRecommend(source, c.mode || "hot", c.title || "推荐");
     return;
   }
   if (c.action === "playlist" && c.ref && source === "qq" && c.topid) {
@@ -1074,7 +2033,8 @@ function bindHome() {
     if (refresh) {
       e.stopPropagation();
       const source = $("home-data").dataset.source || state.source;
-      if (source === "netease" || source === "qq") showMusicHome(source);
+      if (source === "douyin") showDouyinFeed();
+      else if (source === "netease" || source === "qq") showMusicHome(source);
       return;
     }
     const card = e.target.closest("[data-home-kind]");
@@ -1706,8 +2666,12 @@ function addToQueue(s) {
 function playNow(s, fromList) {
   roomIntent("play_song", { song: JSON.parse(JSON.stringify(s)),
                             fromList: (fromList || []).map((x) => JSON.parse(JSON.stringify(x))) }, () => {
-    // B站视频: 不加入播放列表, 维护独立的推荐/相关切换流
-    if (s.source === "bilibili") { playFeed(s, (fromList && fromList.length) ? fromList : [s]); return; }
+    // 视频类音源: 不加入主播放列表, 用视频列表作为前后切换序列
+    if (s.source === "bilibili" || s.source === "douyin") {
+      playFeed(s, (fromList && fromList.length) ? fromList : [s], s.source === "douyin");
+      if (s.source === "douyin") dyPlOpen(s);
+      return;
+    }
     exitFeed();
     let i = findQueue(s);
     if (i < 0) {
@@ -1724,12 +2688,15 @@ function playNow(s, fromList) {
 function aq() { return state.feedMode ? state.feedQueue : state.queue; }
 function curSong() { return state.index >= 0 ? aq()[state.index] : null; }
 
-// B站推荐流播放: 进入 feed 模式, 用独立的当前视频列表作为前后切换序列(不占用/不修改播放列表)
-function playFeed(s, list) {
+// 推荐流播放: 进入 feed 模式, 用独立的当前视频列表作为前后切换序列(不占用/不修改播放列表)
+// lockExtend=true 表示列表是固定集合(如收藏), 播到末尾不再自动续拉推荐
+function playFeed(s, list, lockExtend) {
   const copyList = (list || []).map((x) => JSON.parse(JSON.stringify(x)));
-  roomIntent("feed_enter", { song: JSON.parse(JSON.stringify(s)), list: copyList }, () => {
+  roomIntent("feed_enter", { song: JSON.parse(JSON.stringify(s)), list: copyList,
+                             lock: !!lockExtend }, () => {
     userTouchedQueue = true;   // 进入推荐流也算用户操作, 启动恢复不得覆盖
     if (!state.feedMode) { state.feedMode = true; state.mainIndex = state.index; }
+    state.feedLocked = !!lockExtend;
     state.plView = "feed";
     if (list && list.length && list !== state.feedQueue) state.feedQueue = list.slice();
     let i = state.feedQueue.findIndex((q) => sameSong(q, s));
@@ -1744,9 +2711,11 @@ function playFeed(s, list) {
 }
 // 退出 B站推荐流: 当前视频列表立即清空, 播放列表不受影响
 function exitFeed() {
+  dyPlClose();
   roomIntent("feed_exit", {}, () => {
     if (!state.feedMode) return;
     state.feedMode = false;
+    state.feedLocked = false;
     state.feedQueue = [];
     state.index = state.mainIndex >= 0 && state.mainIndex < state.queue.length ? state.mainIndex : -1;
     state.plView = "feed";
@@ -1762,8 +2731,24 @@ function playAt(i) {
   playVersion++;
   clearTimeout(skipTimer);
   skipTimer = null;
+  const previousKey = curSong() ? songKey(curSong()) : "";
+  const songChanged = previousKey !== songKey(q[i]);
+  if (roomActive() && !roomApplying() && songChanged) {
+    const c = roomClock();
+    if (c) window.MusicHubPlayer.setTimeline(Object.assign({}, c, {
+      time: 0, status: "preparing", reason: "song_changed",
+      song_rev: c.song_rev + 1, state_seq: c.state_seq + 1,
+      anchor_wall_ms: Date.now(), correction: "none", drift_ms: 0,
+    }), { render: false });
+  }
   state.index = i;
   const s = q[i];
+  mediaUpdateMetadata(s);
+  mediaUpdateState();
+  // 抖音推荐流: 播到最后一条时自动续拉后续推荐
+  if (state.feedMode && s && s.source === "douyin" && i >= q.length - 2) {
+    extendDouyinForPlayback();
+  }
   if (desktopLyrics.enabled) desktopBeginSong(s);
   $("pb-title").textContent = s.title;
   $("pb-artist").textContent = (s.artist || "—") + " · " + (SRC_NAME[s.source] || s.source);
@@ -1779,15 +2764,26 @@ function playAt(i) {
     audio.dataset.resume = "";
   }
   audio.play().catch(() => {});
+  if (songChanged) reclaimOnMedia();
   renderQueue();
   markPlayingRows();
   if (lyricOpen) {
-    // 覆盖层打开时切歌: 自动刷新视频/歌词与标题信息
-    $("lo-title").textContent = s.title;
-    $("lo-artist").textContent = (s.artist || "—") + " · " + (SRC_NAME[s.source] || s.source);
-    const cs = coverSrc(s);
-    $("lo-bg").style.backgroundImage = cs ? 'url("' + esc(cs) + '")' : "";
-    setupVideo(s);
+    if (s.source === "douyin") {
+      // 抖音视频走专用播放器, 作为同一个全屏覆盖层
+      dyPlOpen(s);
+    } else {
+      // 覆盖层打开时切歌: 自动刷新视频/歌词与标题信息
+      $("lo-title").textContent = s.title;
+      $("lo-artist").textContent = (s.artist || "—") + " · " + (SRC_NAME[s.source] || s.source);
+      const cs = coverSrc(s);
+      $("lo-bg").style.backgroundImage = cs ? 'url("' + esc(cs) + '")' : "";
+      setupVideo(s);
+    }
+  }
+  // 抖音视频播放器打开时, 切歌同步换视频源
+  if (dyPl.open) {
+    if (s.source === "douyin") dyPlLoad(s);
+    else dyPlClose();
   }
   // 桌面歌词不依赖覆盖层是否打开。
   if (desktopLyrics.enabled) loadLyrics(s);
@@ -1806,6 +2802,8 @@ function markPlayingRows() {
 function nextIndex(step) {
   const n = aq().length;
   if (!n) return -1;
+  // 抖音推荐流: 第一条不再回绕到最后一条
+  if (state.feedMode && state.source === "douyin" && step < 0 && state.index <= 0) return -1;
   if (state.mode === "shuffle") {
     if (n === 1) return 0;
     let r;
@@ -1862,8 +2860,7 @@ function plRow(s, i, showMain) {
   });
   row.addEventListener("click", () => {
     if (plDragged) { plDragged = false; return; }
-    if (showMain) { exitFeed(); playAt(i); saveQueue(); renderQueue(); }
-    else { playAt(i); saveQueue(); }
+    roomIntent("play_index", { index: i, main: !!showMain }, () => playIndexLocal(i, showMain));
   });
   bindRowTouch(row, i, showMain, s);
   return row;
@@ -1888,7 +2885,44 @@ function removeSwiped(q0, s, showMain) {
   removeAt(i, showMain);
 }
 
+function playIndexLocal(i, main) {
+  if (main) { exitFeed(); playAt(i); saveQueue(); renderQueue(); }
+  else { playAt(i); saveQueue(); }
+}
+function clearRoomQueueLocal(main) {
+  if (state.feedMode && !main) {
+    state.feedQueue = []; state.index = -1;
+    audio.pause(); audio.removeAttribute("src"); resetPlayerBar(); renderQueue();
+    return;
+  }
+  state.queue = [];
+  state.mainIndex = -1;
+  if (!state.feedMode) {
+    state.index = -1;
+    audio.pause(); audio.removeAttribute("src"); resetPlayerBar();
+  }
+  renderQueue(); saveQueue();
+}
+function applyQueueReorder(from, target, main) {
+  const q = main ? state.queue : aq();
+  if (!(target >= 0 && target !== from && from < q.length)) return;
+  const [moved] = q.splice(from, 1);
+  q.splice(target, 0, moved);
+  const fix = (v) => {
+    if (v === from) return target;
+    let p = v > from ? v - 1 : v;
+    if (p >= target) p += 1;
+    return p;
+  };
+  if (main && state.feedMode) state.mainIndex = fix(state.mainIndex);
+  else if (!main || !state.feedMode) state.index = fix(state.index);
+  renderQueue(); saveQueue();
+}
 function removeAt(i, showMain) {
+  roomIntent("queue_remove", { index: i, main: !!showMain }, () => removeAtLocal(i, showMain));
+  return;
+}
+function removeAtLocal(i, showMain) {
   const q = showMain ? state.queue : aq();
   const wasPlaying = !showMain && i === state.index;
   q.splice(i, 1);
@@ -1920,6 +2954,7 @@ function resetPlayerBar() {
   settings.pos = null;
   stopAsr();
   desktopReset();
+  mediaReset();
   saveSettings();
 }
 
@@ -2085,18 +3120,8 @@ function dragEnd() {
   const q = main ? state.queue : aq();
   // target 即"排除被拖行"序列中的插入下标, 直接数据驱动落位
   if (target >= 0 && target !== from && from < q.length) {
-    const [moved] = q.splice(from, 1);
-    q.splice(target, 0, moved);
-    // 修正当前播放下标
-    const fix = (v) => {
-      if (v === from) return target;
-      let p = v > from ? v - 1 : v;
-      if (p >= target) p += 1;
-      return p;
-    };
-    if (main && state.feedMode) state.mainIndex = fix(state.mainIndex);
-    else if (!main || !state.feedMode) state.index = fix(state.index);
-    saveQueue();
+    roomIntent("queue_reorder", { from: from, target: target, main: !!main },
+               () => applyQueueReorder(from, target, main));
   }
   renderQueue();
 }
@@ -2116,7 +3141,15 @@ function openCtxMenu(s, opts) {
   const menu = ensureCtxMount();
   menu.innerHTML = "";
   const items = [
-    { t: "▶ 立即播放", fn: () => playNow(s, opts.songs) },
+    { t: "▶ 立即播放", fn: () => {
+        if (opts.onPlay) { opts.onPlay(s); return; }
+        if (s.source === "douyin") {
+          playFeed(s, (opts.songs && opts.songs.length) ? opts.songs : [s], true);
+          dyPlOpen(s);
+          return;
+        }
+        playNow(s, opts.songs);
+      } },
     { t: "＋ 加入播放列表", fn: () => addToQueue(s) },
     { t: "★ 收藏到歌单", fn: () => collectSong(s) },
     { t: "⬇ 下载", fn: () => downloadSong(s) },
@@ -2190,15 +3223,31 @@ $("btn-mode").addEventListener("click", () => {
   });
 });
 
-audio.addEventListener("play", () => { state.playing = true; setPlayIcon(true); desktopPush(true); });
-audio.addEventListener("pause", () => { state.playing = false; setPlayIcon(false); savePos(); desktopPush(true); });
+audio.addEventListener("play", () => { state.playing = true; setPlayIcon(true); desktopPush(true); mediaUpdateState(); mediaUpdatePosition(); });
+audio.addEventListener("pause", () => { state.playing = false; setPlayIcon(false); savePos(); desktopPush(true); mediaUpdateState(); mediaUpdatePosition(); });
+audio.addEventListener("waiting", () => { if (roomActive()) roomSetStatus("buffering", "media_waiting", true); });
+audio.addEventListener("playing", () => {
+  if (roomActive() && !roomApplying()) {
+    const c = roomClock();
+    if (c && (c.status === "buffering" || c.status === "reconnecting" || c.status === "preparing"))
+      roomSetStatus("playing", "media_playing", true);
+  }
+});
+audio.addEventListener("canplay", () => {
+  if (roomActive() && !roomApplying()) {
+    const c = roomClock();
+    if (c && c.status === "preparing") roomSetStatus(c.playing ? "playing" : "paused", "media_ready", true);
+  }
+});
 audio.addEventListener("loadedmetadata", () => {
+  mediaUpdatePosition();
   if (roomActive() || roomApplying()) return;
   const t = parseFloat(audio.dataset.resume || "0");
   if (t > 3 && audio.duration && t < audio.duration - 3) audio.currentTime = t;
 });
 audio.addEventListener("timeupdate", () => {
   const c = roomClock();
+  mediaUpdatePosition();
   if (c) {
     const d = c.duration || audio.duration || 0;
     const t = Math.min(c.pos, d || c.pos);
@@ -2231,13 +3280,24 @@ audio.addEventListener("timeupdate", () => {
 audio.addEventListener("seeked", () => {
   if (asr.active) { asr.lines = []; asr.partial = ""; }  // 跳转后旧识别行时间轴失效, 从新位置重新积累
   desktopPush(true);
+  mediaUpdatePosition();
 });
-audio.addEventListener("ratechange", () => desktopPush(true));
-audio.addEventListener("ended", () => {
-  if (roomActive()) { if (typeof window.Listen.hostAdvance === "function") window.Listen.hostAdvance(); return; }
+audio.addEventListener("ratechange", () => { desktopPush(true); mediaUpdatePosition(); });
+audio.addEventListener("ended", async () => {
+  if (roomActive()) {
+    if (window.Listen.role === "host" && typeof window.Listen.hostAdvance === "function") {
+      if (window.MusicHubPlayer.setStatus) window.MusicHubPlayer.setStatus("ended", "media_ended", false);
+      window.Listen.hostAdvance();
+    }
+    return;
+  }
   settings.pos = null;  // 播完不再恢复
   if (state.mode === "single") { audio.currentTime = 0; audio.play(); return; }
-  const i = nextIndex(1);
+  let i = nextIndex(1);
+  if (i < 0 && state.feedMode && state.source === "douyin") {
+    await extendDouyinForPlayback();
+    i = nextIndex(1);
+  }
   if (i >= 0) { playAt(i); saveQueue(); }
 });
 let skipGuard = 0;
@@ -2266,20 +3326,22 @@ audio.addEventListener("error", () => {
 // 进度条拖动 (Pointer Events, 鼠标/触摸统一)
 const seekBar = $("seek-bar");
 const seekDrag = { on: false, pid: null };
+function roomSeekDur() { const c = roomClock(); return (c && c.duration) || 0; }
 function seekFromEvent(e) {
   const r = seekBar.getBoundingClientRect();
   const x = Math.min(Math.max(e.clientX - r.left, 0), r.width);
   const ratio = r.width ? x / r.width : 0;
+  const d = roomActive() ? roomSeekDur() : (audio.duration || 0);
   $("seek-fill").style.width = ratio * 100 + "%";
-  $("t-cur").textContent = fmt(ratio * (audio.duration || 0));
+  $("t-cur").textContent = fmt(ratio * d);
   const tip = $("seek-tip");
-  tip.textContent = fmt(ratio * (audio.duration || 0));
+  tip.textContent = fmt(ratio * d);
   tip.style.left = x + "px";
   tip.classList.add("show");
   return ratio;
 }
 seekBar.addEventListener("pointerdown", (e) => {
-  if (!audio.duration) return;
+  if (!audio.duration && !roomSeekDur()) return;
   seekDrag.on = true;
   seekDrag.pid = e.pointerId;
   seekBar.setPointerCapture(e.pointerId);
@@ -2294,7 +3356,10 @@ seekBar.addEventListener("pointerup", (e) => {
   seekDrag.on = false;
   seekBar.classList.remove("dragging");
   $("seek-tip").classList.remove("show");
-  if (audio.duration) audio.currentTime = seekDrag.ratio * audio.duration;
+  const d = roomActive() ? roomSeekDur() : (audio.duration || 0);
+  if (!d) return;
+  const t = clampSeek(seekDrag.ratio * d, d);
+  roomIntent("seek", { time: t }, () => { audio.currentTime = t; });
 });
 seekBar.addEventListener("pointercancel", () => {
   seekDrag.on = false;
@@ -2413,9 +3478,13 @@ async function showBiliRecommend() {
 }
 $("content").addEventListener("scroll", () => {
   hideCardPlayer();
-  if (!state.view || state.view.type !== "bili_rec") return;
+  if (!state.view) return;
   const el = $("content");
-  if (el.scrollTop + el.clientHeight >= el.scrollHeight - 160) loadMoreRec();
+  if (state.view.type === "bili_rec") {
+    if (el.scrollTop + el.clientHeight >= el.scrollHeight - 160) loadMoreRec();
+  } else if (state.view.type === "douyinfeed") {
+    if (el.scrollTop + el.clientHeight >= el.scrollHeight - 240) loadMoreDouyin(state.view);
+  }
 });
 
 // 推荐卡片内嵌预览播放器: 悬停时封面变视频, 自带弹幕/声音/进度条/触控手势/控件自动隐藏
@@ -2662,16 +3731,60 @@ function bindCardHover(card, s) {
     if (cardP && cardP.card === card) hideCardPlayer();
   });
 }
+async function showDouyinFavorites() {
+  const view = state.view = { type: "douyinfavorites", source: "douyin" };
+  state.source = "douyin";
+  setCrumb("抖音 · 我的收藏");
+  showEmpty('<div class="loading">正在读取收藏…</div>');
+  const local = await api("/api/localplaylist?pid=dy_favorites").catch(() => ({ songs: [] }));
+  if (state.view !== view) return;
+  const localSongs = (local.songs || []).filter((s) => s && s.source === "douyin");
+  const bridge = window.pywebview && window.pywebview.api;
+  const draw = (remoteSongs, remoteError, pending) => {
+    const seen = new Set();
+    const songs = [];
+    localSongs.concat(remoteSongs).forEach((s) => {
+      const k = String(s.id || "");
+      if (!k || seen.has(k)) return;
+      seen.add(k);
+      songs.push(s);
+    });
+    if (!songs.length) {
+      showEmpty('<div class="empty-ic src-logo-lg">' + DOUYIN_LOGO + "</div><p>" +
+        esc(pending ? "正在读取账号收藏…" : (remoteError || "还没有收藏，点亮视频右侧的星星吧")) + "</p>");
+      return;
+    }
+    renderSongs(songs, { songs: songs });
+    $("list").insertAdjacentHTML("afterbegin",
+      '<div class="home-head"><h3>我的抖音收藏</h3><span class="set-hint">' +
+      "本地 " + localSongs.length + " 条 · 抖音账号 " + remoteSongs.length + " 条" +
+      (remoteError ? " · " + esc(remoteError) : "") + "</span></div>");
+    $("content").scrollTop = 0;
+  };
+  // 先展示本地收藏, 账号收藏在后台补充, 不阻塞页面
+  draw([], "", !!bridge);
+  if (!bridge || !bridge.douyin_favorites) return;
+  let r;
+  try {
+    r = await bridge.douyin_favorites(80);
+  } catch (e) {
+    r = { songs: [], error: String((e && e.message) || e || "账号收藏读取失败") };
+  }
+  if (state.view !== view) return;
+  draw((r && r.songs) || [], (r && r.error) || "", false);
+}
+
 document.querySelectorAll(".src-btn").forEach((b) => {
   b.addEventListener("click", () => {
     document.querySelectorAll(".src-btn").forEach((x) => x.classList.remove("active"));
     b.classList.add("active");
     clearSrcPlActive();
-    exitFeed();
     state.view = null;  // 退出下载管理等页面视图, 停止其轮询重渲染
     state.source = b.dataset.source;
     setCrumb("");
+    setSearchEnabled(state.source !== "douyin");
     if (state.source === "bilibili") showBiliRecommend();
+    else if (state.source === "douyin") showDouyinFeed();
     else if (state.source === "netease" || state.source === "qq") showMusicHome(state.source);
     else showEmpty(srcEmptyHtml());
     $("search-input").value = "";
@@ -2682,7 +3795,8 @@ document.querySelectorAll(".src-pl").forEach((b) => {
     document.querySelectorAll(".src-btn").forEach((x) => x.classList.remove("active"));
     clearSrcPlActive();
     b.classList.add("active");
-    openSourceLists(b.dataset.source);
+    if (b.dataset.source === "douyin") showDouyinFavorites();
+    else openSourceLists(b.dataset.source);
   });
 });
 $("btn-mylists").addEventListener("click", openLocalLists);
@@ -2697,19 +3811,12 @@ $("pl-clear").addEventListener("click", async () => {
   const showMain = state.feedMode && state.plView === "main";
   const q = showMain ? state.queue : aq();
   if (!q.length) return;
-  if (state.feedMode && !showMain) { state.feedQueue = []; state.index = -1; audio.pause(); audio.removeAttribute("src"); resetPlayerBar(); renderQueue(); return; }
-  if (!await showConfirm("确定清空播放列表？")) return;
-  state.queue = [];
-  state.mainIndex = -1;
-  // 推荐流中清空默认播放列表: 不打断正在播放的视频
-  if (!state.feedMode) {
-    state.index = -1;
-    audio.pause();
-    audio.removeAttribute("src");
-    resetPlayerBar();
+  if (state.feedMode && !showMain) {
+    roomIntent("queue_clear", { main: false }, () => clearRoomQueueLocal(false));
+    return;
   }
-  renderQueue();
-  saveQueue();
+  if (!await showConfirm("确定清空播放列表？")) return;
+  roomIntent("queue_clear", { main: !!showMain }, () => clearRoomQueueLocal(showMain));
 });
 // 右栏标签: 推荐流下切换查看"当前视频列表"/"默认播放列表"
 $("pl-tabs").addEventListener("click", (e) => {
@@ -2854,13 +3961,17 @@ async function refreshLoginState() {
     const b = await api("/api/bili/status");
     state.biliLoggedIn = !!(b.logged_in);
     state.biliVip = !!(b.vip);
-    const bl = $("btn-login"), bq = $("btn-qqlogin"), bb = $("btn-bililogin");
+    const d = await api("/api/douyin/status");
+    state.douyinLoggedIn = !!(d.logged_in);
+    const bl = $("btn-login"), bq = $("btn-qqlogin"), bb = $("btn-bililogin"), bd = $("btn-douyinlogin");
     bl.title = state.loggedIn ? "网易云账号（已登录）" : "网易云登录";
     bq.title = state.qqLoggedIn ? "QQ音乐账号（已登录）" : "QQ音乐登录";
     bb.title = state.biliLoggedIn ? ("哔哩哔哩账号（已登录" + (state.biliVip ? " · 大会员" : "") + "）") : "哔哩哔哩登录";
+    if (bd) bd.title = state.douyinLoggedIn ? "抖音 Cookie（已配置）" : "抖音 Cookie";
     bl.classList.toggle("logged-in", state.loggedIn);
     bq.classList.toggle("logged-in", state.qqLoggedIn);
     bb.classList.toggle("logged-in", state.biliLoggedIn);
+    if (bd) bd.classList.toggle("logged-in", state.douyinLoggedIn);
     const nl = $("ne-logout");
     if (nl) nl.classList.toggle("hidden", !state.loggedIn);
   } catch (e) {}
@@ -3022,6 +4133,155 @@ $("bili-logout").addEventListener("click", async () => {
     await fetch("/api/bili/logout", { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
     $("bili-cookie-msg").textContent = "已退出登录";
     $("bili-logout").classList.add("hidden");
+    refreshLoginState();
+  } catch (e) {}
+});
+
+// ---------------- 抖音登录 ----------------
+let douyinPollTimer = null;
+let douyinNativeTimer = null;
+let douyinQrSrc = "";
+function stopDouyinPoll() { clearInterval(douyinPollTimer); douyinPollTimer = null; }
+function stopDouyinNativePoll() { clearInterval(douyinNativeTimer); douyinNativeTimer = null; }
+function douyinBridge() { return window.pywebview && window.pywebview.api ? window.pywebview.api : null; }
+async function cancelDouyinQR() {
+  stopDouyinPoll();
+  const bridge = douyinBridge();
+  if (bridge && bridge.douyin_qr_cancel) {
+    try { await bridge.douyin_qr_cancel(); } catch (e) {}
+  }
+}
+function showDouyinTab(tab) {
+  document.querySelectorAll(".dlt").forEach((x) => x.classList.toggle("active", x.dataset.tab === tab));
+  $("douyin-pane-qr").classList.toggle("hidden", tab !== "qr");
+  $("douyin-pane-inapp").classList.toggle("hidden", tab !== "inapp");
+  $("douyin-pane-cookie").classList.toggle("hidden", tab !== "cookie");
+  if (tab === "qr") refreshDouyinQR(); else { stopDouyinPoll(); cancelDouyinQR(); }
+}
+async function refreshDouyinQR() {
+  stopDouyinPoll();
+  douyinQrSrc = "";
+  $("douyin-qr-mask").textContent = "";
+  $("douyin-qr-tip").textContent = "用抖音 App 扫码登录";
+  $("douyin-qr-msg").textContent = "";
+  $("douyin-qr-img").removeAttribute("src");
+  const bridge = douyinBridge();
+  if (!bridge || !bridge.douyin_qr_login || !bridge.douyin_qr_status) {
+    $("douyin-qr-tip").textContent = "扫码登录需要桌面客户端";
+    $("douyin-qr-msg").textContent = "浏览器模式下请使用「粘贴 Cookie」";
+    return;
+  }
+  try {
+    const s = await api("/api/douyin/status");
+    if (s.logged_in) {
+      $("douyin-qr-mask").textContent = "抖音已登录 ✓";
+      refreshLoginState();
+      return;
+    }
+  } catch (e) {}
+  try {
+    await bridge.douyin_qr_login();
+  } catch (e) {
+    $("douyin-qr-msg").textContent = "启动扫码登录失败：" + e;
+    return;
+  }
+  let tries = 0;
+  $("douyin-qr-tip").textContent = "正在打开抖音官方登录页…";
+  douyinPollTimer = setInterval(async () => {
+    tries++;
+    try {
+      const s = await bridge.douyin_qr_status();
+      if (s.logged_in) {
+        stopDouyinPoll();
+        $("douyin-qr-mask").textContent = "登录成功 ✓";
+        $("douyin-qr-msg").textContent = "";
+        refreshLoginState();
+        setTimeout(() => $("douyinlogin-modal").classList.add("hidden"), 900);
+        return;
+      }
+      if (s.png) {
+        const src = "data:image/png;base64," + s.png;
+        if (src !== douyinQrSrc) {
+          douyinQrSrc = src;
+          $("douyin-qr-img").src = src;
+          $("douyin-qr-tip").textContent = "用抖音 App 扫码，并在手机上确认";
+          $("douyin-qr-msg").textContent = "";
+        }
+        return;
+      }
+      if (s.error) {
+        $("douyin-qr-msg").textContent = s.error;
+        if (!s.busy) stopDouyinPoll();
+      } else {
+        $("douyin-qr-tip").textContent = "正在拉取抖音官方登录二维码…";
+      }
+      if (!s.busy && tries > 8) stopDouyinPoll();
+    } catch (e) {
+      $("douyin-qr-msg").textContent = "登录状态查询失败：" + e;
+      stopDouyinPoll();
+    }
+  }, 1500);
+  setTimeout(stopDouyinPoll, 300000);
+}
+$("btn-douyinlogin").addEventListener("click", () => {
+  $("douyinlogin-modal").classList.remove("hidden");
+  $("douyin-cookie-msg").textContent = "";
+  $("douyin-native-msg").textContent = "";
+  $("douyin-logout").classList.toggle("hidden", !state.douyinLoggedIn);
+  showDouyinTab("qr");
+});
+$("douyinlogin-close").addEventListener("click", () => {
+  $("douyinlogin-modal").classList.add("hidden");
+  stopDouyinPoll(); stopDouyinNativePoll(); cancelDouyinQR();
+});
+document.querySelectorAll(".dlt").forEach((t) => t.addEventListener("click", () => showDouyinTab(t.dataset.tab)));
+$("douyin-qr-refresh").addEventListener("click", refreshDouyinQR);
+$("douyin-native").addEventListener("click", async () => {
+  const msg = $("douyin-native-msg"), bridge = window.pywebview && window.pywebview.api;
+  if (!bridge || !bridge.douyin_login) { msg.textContent = "当前是浏览器模式，请在桌面客户端内使用"; return; }
+  msg.textContent = "已打开登录窗口，登录完成后会自动写入…";
+  cancelDouyinQR();
+  try {
+    const r = await bridge.douyin_login();
+    if (r && r.started === false) { msg.textContent = r.message || "登录窗口已经打开了"; return; }
+  } catch (e) { msg.textContent = "打开登录窗口失败：" + e; return; }
+  stopDouyinNativePoll();
+  douyinNativeTimer = setInterval(async () => {
+    try {
+      const s = await api("/api/douyin/status");
+      if (s.logged_in) {
+        stopDouyinNativePoll();
+        msg.textContent = "登录成功 ✓";
+        refreshLoginState();
+        setTimeout(() => $("douyinlogin-modal").classList.add("hidden"), 900);
+      }
+    } catch (e) {}
+  }, 1500);
+  setTimeout(stopDouyinNativePoll, 300000);
+});
+$("douyin-cookie-save").addEventListener("click", async () => {
+  const raw = $("douyin-cookie-input").value.trim();
+  if (!raw) { $("douyin-cookie-msg").textContent = "请先粘贴 Cookie"; return; }
+  try {
+    const r = await fetch("/api/douyin/manual", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ cookie: raw }),
+    });
+    const j = await r.json();
+    if (j.ok || j.logged_in) {
+      $("douyin-cookie-msg").textContent = "登录成功";
+      refreshLoginState();
+      setTimeout(() => $("douyinlogin-modal").classList.add("hidden"), 800);
+    } else {
+      $("douyin-cookie-msg").textContent = j.error || "保存失败";
+    }
+  } catch (e) { $("douyin-cookie-msg").textContent = "请求失败: " + e; }
+});
+$("douyin-logout").addEventListener("click", async () => {
+  try {
+    await fetch("/api/douyin/logout", { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
+    $("douyin-cookie-msg").textContent = "已清除 Cookie";
+    $("douyin-logout").classList.add("hidden");
     refreshLoginState();
   } catch (e) {}
 });
@@ -3240,15 +4500,16 @@ function desktopPayload() {
   // 房间模式用权威时间轴, 避免成员端本地续播污染桌面歌词。
   const c = roomClock();
   const t = s ? curPos() : 0;
+  const frozen = !!c && (c.buffered || c.status !== "playing");
   const p = {
     key: key,
     title: s ? (s.title || "") : "",
     artist: s ? (s.artist || "") : "",
     time: Number.isFinite(t) ? Math.max(0, t) : 0,
     duration: s ? ((c && c.duration) || (audio.duration && Number.isFinite(audio.duration) ? audio.duration : (s.duration || 0))) : 0,
-    playing: c ? c.playing : !!(s && audio.src && !audio.paused),
+    playing: c ? (c.status === "playing" && !c.buffered) : !!(s && audio.src && !audio.paused),
     rate: c ? c.rate : (Number.isFinite(audio.playbackRate) && audio.playbackRate > 0 ? audio.playbackRate : (settings.rate || 1)),
-    status: s ? (desktopLyrics.status || desktopStatusFor(s)) : "idle",
+    status: frozen ? (c.status_text || "同步中") : (s ? (desktopLyrics.status || desktopStatusFor(s)) : "idle"),
   };
   if (desktopLyrics.sentLineRevision !== desktopLyrics.lineRevision) {
     p.lines = desktopLyrics.lines.map((l) => ({ t: Number(l.t) || 0, text: String(l.text || "") }));
@@ -3265,12 +4526,13 @@ function desktopPush(force) {
     return;
   }
   const now = Date.now();
-  if (!force && now - desktopLyrics.lastPush < 220) {
+  const minPush = roomActive() ? 120 : 220;
+  if (!force && now - desktopLyrics.lastPush < minPush) {
     if (!desktopLyrics.pushTimer) {
       desktopLyrics.pushTimer = setTimeout(() => {
         desktopLyrics.pushTimer = null;
         desktopPush(false);
-      }, Math.max(20, 220 - (now - desktopLyrics.lastPush)));
+      }, Math.max(20, minPush - (now - desktopLyrics.lastPush)));
     }
     return;
   }
@@ -3448,6 +4710,7 @@ function renderLyric(lines) {
 function syncLyric(force) {
   if (!lyricOpen || !lyricLines.length) return;
   const c = roomClock();
+  if (c && (c.buffered || c.status === "seeking" || c.status === "reconnecting" || c.status === "preparing") && !force) return;
   const t = c ? c.pos : audio.currentTime;
   let idx = -1;
   for (let i = 0; i < lyricLines.length; i++) {
@@ -3467,7 +4730,18 @@ function syncLyric(force) {
   }
 }
 
+// 歌词缓存: LRU 上限, 防止长时间使用后无限增长导致内存上涨
 const lyricCache = new Map();
+const LYRIC_CACHE_MAX = 120;
+
+function lyricCacheSet(key, lines) {
+  if (lyricCache.has(key)) lyricCache.delete(key);
+  lyricCache.set(key, lines);
+  while (lyricCache.size > LYRIC_CACHE_MAX) {
+    const oldest = lyricCache.keys().next().value;
+    lyricCache.delete(oldest);
+  }
+}
 let lyricLoadSeq = 0;
 
 async function loadLyrics(s) {
@@ -3507,12 +4781,12 @@ async function loadLyrics(s) {
     // 歌词请求是独立异步任务: 切歌后即使旧请求晚到也不能污染桌面窗口。
     if (seq !== lyricLoadSeq || curSong() !== s) return;
     const lines = j.error ? [] : parseLRC(j.lyric);
-    lyricCache.set(key, lines);
+    lyricCacheSet(key, lines);
     renderLyric(lines);
     if (desktopLyrics.enabled) desktopSetLines(s, lines, lines.length ? "ready" : "empty");
   } catch (e) {
     if (seq !== lyricLoadSeq || curSong() !== s) return;
-    lyricCache.set(key, []);
+    lyricCacheSet(key, []);
     renderLyric([]);
     if (desktopLyrics.enabled) desktopSetLines(s, [], "empty");
   }
@@ -3611,6 +4885,109 @@ async function loadVideoSubtitle(s, seq) {
   }
 }
 
+// Windows 系统媒体提示(SMTC): 用 Media Session 把当前播放内容推给系统
+function mediaArtwork(s) {
+  const c = coverSrc(s);
+  if (!c) return [];
+  const url = new URL(c, location.href).href;
+  return [
+    { src: url, sizes: "96x96", type: "image/jpeg" },
+    { src: url, sizes: "256x256", type: "image/jpeg" },
+  ];
+}
+function mediaUpdateMetadata(s) {
+  if (!s) return;
+  mediaInfo.title = s.title || "未知歌曲";
+  mediaInfo.artist = s.artist || "—";
+  mediaInfo.album = s.album || SRC_NAME[s.source] || s.source || "MusicHub";
+  mediaInfo.artwork = mediaArtwork(s).map((a) => a.src)[0] || "";
+  mediaPush(true);
+  if (!mediaSession || !window.MediaMetadata) return;
+  try {
+    mediaSession.metadata = new MediaMetadata({
+      title: mediaInfo.title,
+      artist: mediaInfo.artist,
+      album: mediaInfo.album,
+      artwork: mediaArtwork(s),
+    });
+  } catch (e) {}
+}
+function mediaUpdateState() {
+  mediaState = audio.paused ? "paused" : "playing";
+  mediaPush(true);
+  if (!mediaSession) return;
+  try { mediaSession.playbackState = mediaState; } catch (e) {}
+}
+function mediaUpdatePosition() {
+  const c = roomClock();
+  const d = Number(c ? c.duration : 0) || Number(audio.duration) || 0;
+  const t = Number(c ? Math.min(c.pos, d || c.pos) : audio.currentTime) || 0;
+  const rate = Number(audio.playbackRate) || 1;
+  MediaPosition.duration = (d > 0 && Number.isFinite(d)) ? d : 0;
+  MediaPosition.position = Math.max(0, Math.min(t, MediaPosition.duration || t));
+  MediaPosition.rate = rate;
+  mediaPush(false);
+  if (!mediaSession || !("setPositionState" in mediaSession)) return;
+  try {
+    if (MediaPosition.duration > 0) {
+      mediaSession.setPositionState({ duration: MediaPosition.duration,
+                                      position: MediaPosition.position, playbackRate: rate });
+    } else {
+      mediaSession.setPositionState({ duration: 0, position: 0, playbackRate: rate });
+    }
+  } catch (e) {}
+}
+function mediaReset() {
+  mediaInfo.title = "未在播放";
+  mediaInfo.artist = "—";
+  mediaInfo.album = "MusicHub";
+  mediaInfo.artwork = "";
+  mediaState = "stopped";
+  MediaPosition.duration = 0;
+  MediaPosition.position = 0;
+  MediaPosition.rate = 1;
+  mediaPush(true);
+  if (!mediaSession) return;
+  try {
+    mediaSession.metadata = null;
+    mediaSession.playbackState = "none";
+    if ("setPositionState" in mediaSession) mediaSession.setPositionState({ duration: 0, position: 0, playbackRate: 1 });
+  } catch (e) {}
+}
+setupMediaActions();
+
+function setupMediaActions() {
+  if (!mediaSession) return;
+  const bind = (action, fn) => {
+    try { mediaSession.setActionHandler(action, fn); } catch (e) {}
+  };
+  bind("play", () => { audio.play().catch(() => {}); });
+  bind("pause", () => { audio.pause(); });
+  bind("previoustrack", () => { prev(); });
+  bind("nexttrack", () => { next(); });
+  bind("stop", () => { audio.pause(); });
+  bind("seekto", (e) => {
+    const t = Number(e.seekTime);
+    if (!Number.isFinite(t)) return;
+    if (roomActive() && typeof roomIntent === "function") roomIntent("seek", { time: t }, () => { audio.currentTime = t; });
+    else audio.currentTime = t;
+    mediaUpdatePosition();
+  });
+  bind("seekbackward", (e) => mediaAction("seekbackward", e));
+  bind("seekforward", (e) => mediaAction("seekforward", e));
+}
+function mediaAction(action, detail) {
+  if (!detail) detail = {};
+  if (action === "play") audio.play().catch(() => {});
+  else if (action === "pause" || action === "stop") audio.pause();
+  else if (action === "prev") prev();
+  else if (action === "next") next();
+  else if (action === "seekbackward") audio.currentTime = Math.max(0, audio.currentTime - (Number(detail.seekOffset) || 10));
+  else if (action === "seekforward") audio.currentTime = Math.min(audio.currentTime + (Number(detail.seekOffset) || 10), Number(audio.duration) || Infinity);
+  mediaUpdatePosition();
+}
+window.MusicHubMedia = { action: mediaAction, push: mediaPush };
+
 // B站视频: 静音播放并跟随音频进度
 let videoSyncTimer = null;
 function setupVideo(s) {
@@ -3658,10 +5035,14 @@ function setVideoSrc(s, qn) {
   let url = "/proxy?source=bilibili&id=" + encodeURIComponent(s.id) + "&kind=video";
   if (qn != null) url += "&qn=" + encodeURIComponent(qn);
   url += "&extra=" + encodeURIComponent(JSON.stringify(s.extra || {}));
+  // 换源即可让旧媒体(解码器/缓冲)释放, 不要在空 src 上再 load():
+  // 那会与紧随其后的新源加载竞争, 首次切换时视频可能停在空缓冲。
+  try { vel.pause(); } catch (e) {}
   vel.src = withTok(url);
   vel.muted = true;
   vel.load();
   vel.playbackRate = settings.rate || 1;
+  reclaimOnMedia();
   vel.addEventListener("loadedmetadata", function once() {
     vel.removeEventListener("loadedmetadata", once);
     vel.playbackRate = settings.rate || 1;
@@ -3682,9 +5063,10 @@ async function loadQualities(s) {
     if (!qs.length) return;
     // 从高到低排序展示
     qs.sort((a, b) => b.qn - a.qn);
-    // 保留用户保存的目标档位; 当前视频不可用时只向下回退，不覆盖目标偏好。
+    // 保留用户保存的目标档位; 未指定时按上游实际返回的档位显示
+    const picked = Number(j.picked) || 0;
     const chosen = biliQn == null
-      ? qs[0]
+      ? (qs.find((q) => q.qn === picked) || qs[0])
       : (qs.find((q) => q.qn <= biliQn) || qs[qs.length - 1]);
     qSel.innerHTML = qs.map((q) =>
       '<option value="' + q.qn + '"' + (q.qn === chosen.qn ? " selected" : "") + '>' + esc(q.desc) + '</option>').join("");
@@ -3732,9 +5114,18 @@ $("lo-part").addEventListener("change", (e) => {
     // 分P切换属于同一个 BVID 内换页: 直接替换 feed 当前项, 不新增队列项
     aq()[state.index] = newSong;
     playAt(state.index);
+    roomRoomReloadVideo();
     renderQueue();
   });
 });
+function roomRoomReloadVideo() {
+  if (!roomActive()) return;
+  const s = curSong();
+  if (!s || s.source !== "bilibili" || !lyricOpen || window.Listen.role !== "host") return;
+  Listen.loadedVideoKey = "";
+  setupVideo(s);
+  Listen.loadedVideoKey = songKey(s) + "|" + (roomClock() ? roomClock().song_rev : 0) + "|" + (biliQn || 16);
+}
 
 // ---------------- B站弹幕 ----------------
 let dmList = [];        // 已按 time 排序的弹幕
@@ -3745,6 +5136,11 @@ let dmOn = true;         // 兼容: dmMode!=="off"
 let dmMode = "full";     // full=全屏 / half=半屏(仅上半) / off=关闭
 let dmScrollLanes = []; // 滚动轨道释放时间
 let dmFixedLanes = {};  // 顶部/底部固定轨道
+// 弹幕排版参数: 轨道行高与上下留白; 全屏模式铺满整个播放区(底部避开控件条)
+const DM_LANE_H = 30;
+const DM_TOP_PAD = 10;
+const DM_BOTTOM_PAD = 76;
+const DM_SPEED = 130;   // px/s
 function stopDanmaku() {
   dmList = []; dmPtr = 0; dmLastT = -1;
   dmScrollLanes = []; dmFixedLanes = {};
@@ -3769,8 +5165,15 @@ async function loadDanmaku(s) {
 }
 function dmLaneCount() {
   const box = $("lo-video");
-  const h = dmMode === "half" ? box.clientHeight * 0.5 : box.clientHeight * 0.42;
-  return Math.max(3, Math.floor(h / 28));
+  const usable = Math.max(120, box.clientHeight - DM_TOP_PAD - DM_BOTTOM_PAD);
+  const h = dmMode === "half" ? usable * 0.5 : usable;
+  return Math.max(3, Math.floor(h / DM_LANE_H));
+}
+function ensureDmLanes(n) {
+  if (dmScrollLanes.length === n) return;
+  const next = new Array(n).fill(0);
+  for (let i = 0; i < Math.min(n, dmScrollLanes.length); i++) next[i] = dmScrollLanes[i];
+  dmScrollLanes = next;
 }
 function colorHex(n) {
   return "#" + ("000000" + (n >>> 0).toString(16)).slice(-6);
@@ -3779,51 +5182,53 @@ function spawnDanmaku(d) {
   const c = $("lo-danmaku");
   if (!c || !dmOn) return;
   const box = $("lo-video");
-  const W = box.clientWidth, H = box.clientHeight;
+  const W = box.clientWidth;
+  const now = Date.now();
+  const lanes = dmLaneCount();
+  ensureDmLanes(lanes);
   const el = document.createElement("div");
   el.className = "dm-item";
   el.textContent = d.text;
   el.style.color = (d.color && d.color !== 16777215) ? colorHex(d.color) : "#fff";
-  el.style.fontSize = Math.min(26, Math.max(16, (d.size || 25) * 0.8)) + "px";
+  // 行高 30px, 字号上限 24px, 避免大字号跨行压到相邻轨道
+  el.style.fontSize = Math.min(24, Math.max(16, (d.size || 25) * 0.8)) + "px";
   const fixed = (d.mode === 4 || d.mode === 5);  // 4=底部, 5=顶部
   if (fixed) {
     const key = d.mode === 5 ? "top" : "bottom";
-    const lanes = dmFixedLanes[key] || (dmFixedLanes[key] = {});
-    // 找空位
+    const laneMap = dmFixedLanes[key] || (dmFixedLanes[key] = {});
     let lane = 0;
-    while (lanes[lane] && lanes[lane] > Date.now()) lane++;
-    if (lane > 8) return;  // 满则丢弃
-    lanes[lane] = Date.now() + 4200;
+    while (lane < lanes && laneMap[lane] && laneMap[lane] > now) lane++;
+    if (lane >= lanes || lane > 7) return;  // 满则丢弃
+    const until = now + 4200;
+    laneMap[lane] = until;
+    // 固定弹幕占用的水平带同步禁给滚动弹幕, 否则两者必然交叉重叠
+    const idx = key === "top" ? lane : lanes - 1 - lane;
+    if (idx >= 0 && idx < lanes) dmScrollLanes[idx] = Math.max(dmScrollLanes[idx], until);
     el.style.left = "0"; el.style.right = "0"; el.style.textAlign = "center";
     el.style.transform = "none";
-    if (key === "top") el.style.top = (8 + lane * 28) + "px";
-    else el.style.bottom = (46 + lane * 28) + "px";
+    if (key === "top") el.style.top = (DM_TOP_PAD + lane * DM_LANE_H) + "px";
+    else el.style.bottom = (46 + lane * DM_LANE_H) + "px";
     el.classList.add(key === "top" ? "dm-top" : "dm-bottom");
     el.style.animationDuration = "4.2s";
     c.appendChild(el);
     setTimeout(() => el.remove(), 4400);
     return;
   }
-  // 滚动弹幕: 找释放中的空轨道
-  const lanes = dmLaneCount();
-  if (!dmScrollLanes.length || dmScrollLanes.length < lanes) {
-    const nl = new Array(lanes).fill(0);
-    for (let i = 0; i < dmScrollLanes.length; i++) nl[i] = dmScrollLanes[i];
-    dmScrollLanes = nl;
-  }
+  // 滚动弹幕: 只复用已释放的轨道, 没有空轨就丢弃(挤轨道必然重叠)
   let lane = -1;
-  for (let i = 0; i < dmScrollLanes.length; i++) {
-    if (dmScrollLanes[i] <= Date.now()) { lane = i; break; }
+  for (let i = 0; i < lanes; i++) {
+    if (dmScrollLanes[i] <= now) { lane = i; break; }
   }
-  if (lane < 0) lane = dmScrollLanes.length - 1;  // 全满挤用最下轨道
-  const speed = 130;  // px/s
-  el.style.top = (10 + lane * 28) + "px";
+  if (lane < 0) return;
+  el.style.top = (DM_TOP_PAD + lane * DM_LANE_H) + "px";
   el.classList.add("dm-scroll");
   c.appendChild(el);
-  const dur = (W + el.offsetWidth + 40) / speed;
-  el.style.setProperty("--dm-travel", (W + el.offsetWidth) + "px");
+  const w = el.offsetWidth;
+  const dur = (W + w + 40) / DM_SPEED;
+  el.style.setProperty("--dm-travel", (W + w) + "px");
   el.style.animationDuration = dur.toFixed(2) + "s";
-  dmScrollLanes[lane] = Date.now() + dur * 1000 * 0.35;
+  // 占用到"整条弹幕完全进入画面"+间距为止: 同速前进, 之后不会追尾
+  dmScrollLanes[lane] = now + ((w + 12) / DM_SPEED) * 1000;
   setTimeout(() => el.remove(), dur * 1000 + 300);
 }
 function danmakuTick() {
@@ -3903,10 +5308,11 @@ $("dm-input").addEventListener("pointerdown", (e) => e.stopPropagation());
 $("lo-quality").addEventListener("change", (e) => {
   const s = curSong();
   if (!s || s.source !== "bilibili") return;
-  biliQn = parseInt(e.target.value, 10) || null;
+  const qn = parseInt(e.target.value, 10) || null;
+  biliQn = qn;
   settings.qn = biliQn;
   saveSettings();
-  setVideoSrc(s, biliQn);
+  roomIntent("media_reload", { qn: qn || 16, reason: "quality_changed" }, () => setVideoSrc(s, qn));
 });
 // 倍速播放: 音频为主, 视频跟随
 $("lo-speed").addEventListener("change", (e) => {
@@ -4015,8 +5421,18 @@ function startVideoSync() {
   videoSyncTimer = setInterval(() => {
     if (!lyricOpen) return;
     const c = roomClock();
-    // 房间模式: 本地 #audio / #lo-video-el 不是主媒体, 只更新歌词/进度, 不驱动本地播放。
-    if (c) { syncLyric(); syncLoSeek(); return; }
+    // 房间模式: 只有房主本地可控视频跟随时间轴; 成员端远端流不可 seek, 只更新进度/歌词并明确降级。
+    if (c) {
+      syncLyric(); syncLoSeek();
+      if (window.Listen.role === "host" && !vel.hasAttribute("src")) return;
+      if (window.Listen.role === "host" && c.status === "playing" && !c.buffered) {
+        if (vel.paused) vel.play().catch(() => {});
+        if (Math.abs(vel.currentTime - c.pos) > 0.5 && vel.duration) {
+          try { vel.currentTime = c.pos; } catch (e) {}
+        }
+      } else if (window.Listen.role === "host" && !vel.paused) vel.pause();
+      return;
+    }
     // 跟随音频播放状态与进度
     if (audio.paused) { if (!vel.paused) vel.pause(); }
     else { if (vel.paused) vel.play().catch(() => {}); }
@@ -4673,6 +6089,10 @@ $("lo-cmt-list").addEventListener("scroll", (e) => {
 function openLyric() {
   const s = curSong();
   if (!s) { toast("当前没有播放中的歌曲"); return; }
+  // 打开播放器(点封面/左下角图标)同样算一次媒体操作
+  reclaimOnMedia();
+  // 抖音播放器属于全屏覆盖层: 点封面/歌词入口时回到抖音视频播放器, 而不是歌词页
+  if (s.source === "douyin") { dyPlOpen(s); return; }
   lyricOpen = true;
   const ov = $("lyric-overlay");
   ov.classList.remove("hidden");
@@ -4765,6 +6185,9 @@ async function boot() {
         $("pb-title").textContent = s.title;
         $("pb-artist").textContent = (s.artist || "—") + " · " + (SRC_NAME[s.source] || s.source) + "（已恢复，点▶播放）";
         $("pb-cover").innerHTML = coverSrc(s) ? '<img src="' + esc(coverSrc(s)) + '">' : "♪";
+        mediaUpdateMetadata(s);
+        mediaUpdateState();
+        mediaUpdatePosition();
         // 预置恢复信息, 用户点▶播放时 playAt 会读取 settings.pos
         audio.dataset.key = songKey(s);
         if (settings.pos && settings.pos.key === songKey(s) && settings.pos.time > 3) {
@@ -4788,7 +6211,10 @@ async function boot() {
     }
   } catch (e) {}
 }
-window.addEventListener("pywebviewready", desktopReadState);
+window.addEventListener("pywebviewready", () => {
+  desktopReadState();
+  mediaPush(true);
+});
 boot();
 
 // ---------------- 退出/切后台前统一 flush (新增路径, 绕过防抖等待) ----------------
@@ -4798,3 +6224,76 @@ window.addEventListener("pagehide", flushPendingSaves);
 document.addEventListener("visibilitychange", () => {
   if (document.visibilityState === "hidden") flushPendingSaves();
 });
+
+// ---------------- 主动内存回收 ----------------
+// 长时间使用(尤其无限下拉推荐流 + 大量封面)会让 JS 堆持续上涨。
+// 按绝对占用分级回收(不能用 ratio: V8 堆上限约 4GB, 比例阈值永远触发不了)。
+const MEM_SOFT_MB = 160;   // JS 堆超过 160MB: 温和回收
+const MEM_HARD_MB = 280;   // 超过 280MB: 强制回收
+
+function memUsage() {
+  const m = performance.memory;
+  if (!m || !m.jsHeapSizeLimit) return null;
+  return {
+    used: m.usedJSHeapSize,
+    limit: m.jsHeapSizeLimit,
+    usedMB: m.usedJSHeapSize / 1048576,
+    limitMB: m.jsHeapSizeLimit / 1048576,
+  };
+}
+
+function memReclaim(force, hard) {
+  const u = memUsage();
+  // 1) 歌词缓存: 强制时清一半
+  if (force || (u && u.usedMB >= MEM_SOFT_MB)) {
+    const keep = force ? Math.floor(LYRIC_CACHE_MAX / 2) : LYRIC_CACHE_MAX;
+    while (lyricCache.size > keep) lyricCache.delete(lyricCache.keys().next().value);
+  }
+  // 2) 推荐流 / 视频播放列表裁剪
+  if (force) {
+    trimDyFeed();
+    trimFeedQueue(DY_FEED_MAX);
+  }
+  // 3) 触发 V8 堆回收(WebView2 已用 --js-flags=--expose-gc 暴露 window.gc)
+  if (force && typeof window.gc === "function") {
+    try { window.gc(); } catch (e) {}
+  }
+  // 4) 通知原生层做一次 PY gc; hard=True 时同时 EmptyWorkingSet(强回收)
+  const api = window.pywebview && window.pywebview.api;
+  if (api && api.reclaim_memory) {
+    try { Promise.resolve(api.reclaim_memory(!!hard)).catch(() => {}); } catch (e) {}
+  }
+}
+
+// ---------------- 切换/打开媒体后的强回收(每 60 秒窗口 10 次) ----------------
+// 切视频、切歌、点封面/图标打开播放器都触发强回收(清缓存 + V8 gc + Python gc
+// + EmptyWorkingSet)。窗口严格跟随 60 秒定时器: 到点由定时器清空计数并独立执行
+// 一次自动回收, 间隔内的操作最多 10 次, 避免反复换出工作集造成卡顿。
+const SWITCH_RECLAIM_WINDOW = 60 * 1000;
+const SWITCH_RECLAIM_MAX = 10;
+const switchReclaim = { count: 0, lastAt: 0 };
+
+function reclaimOnMedia() {
+  const now = Date.now();
+  // 一次操作会连锁触发 playAt + setupVideo + loadQualities, 1 秒内只算一次
+  if (now - switchReclaim.lastAt < 1000) return;
+  switchReclaim.lastAt = now;
+  if (switchReclaim.count >= SWITCH_RECLAIM_MAX) return;
+  switchReclaim.count += 1;
+  memReclaim(true, true);
+}
+
+// 每 60 秒主动释放一次(与原生层定时回收同步): 回收独立执行, 不占操作配额;
+// 到点同时清空操作计数, 作为下一个窗口的起点。
+setInterval(() => {
+  switchReclaim.count = 0;
+  memReclaim(true);
+}, SWITCH_RECLAIM_WINDOW);
+
+// 收进托盘/窗口隐藏时用户看不到界面, 是最安全的强制回收时机
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "hidden") memReclaim(true);
+});
+window.MusicHubMem = { reclaim: memReclaim, usage: memUsage };
+
+

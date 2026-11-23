@@ -29,9 +29,12 @@ if IS_WINDOWS:
     if not hasattr(wt, "HCURSOR"):
         wt.HCURSOR = wt.HANDLE
 
-    user32 = ctypes.windll.user32
-    kernel32 = ctypes.windll.kernel32
-    gdi32 = ctypes.windll.gdi32
+    # 独立加载 DLL: ctypes 的 argtypes 挂在 DLL 对象上, 若与 main.py 共用
+    # ctypes.windll.user32, 后设置的原型会互相覆盖(例如 GetCursorPos 被改成
+    # POINTER(wt.POINT) 后再传本模块的 _POINT 会直接 TypeError, 拖动因此静默失效)。
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    gdi32 = ctypes.WinDLL("gdi32", use_last_error=True)
 
     HWND = wt.HWND
     HDC = wt.HDC
@@ -356,6 +359,7 @@ class DesktopLyrics:
         self._drag_moved = False
         self._ui_shown = False   # 按钮层: 点击歌词字形才唤出, 收起时整窗穿透
         self._ui_deadline = 0.0  # 按钮层自动收起的截止时刻(monotonic)
+        self._ui_just_opened = False  # 本次按下是否刚唤出按钮层(松手后应保持 5 秒)
         self._drag_origin = (0, 0)
         self._window_origin = (0, 0)
         self._timer_id = 71
@@ -369,6 +373,12 @@ class DesktopLyrics:
         self._mask_bits = None
         self._screen_dc = None
         self._last_shown = None
+        # 增量重绘状态: 已合成的列范围 / 文字宽度缓存 / 上一次的文本指纹
+        self._painted_span = None
+        self._painted_veil = None
+        self._span_key = None
+        self._span_cache = (0, 0)
+        self._last_text_key = None
         self._payload: Dict[str, Any] = {
             "key": None, "title": "", "artist": "", "lines": [],
             "time": 0.0, "playing": False, "rate": 1.0, "status": "idle",
@@ -712,7 +722,8 @@ class DesktopLyrics:
             # 全部呈现经由 UpdateLayeredWindow 原子提交, 从根本上消除闪烁。
             if not self._create_gdi():
                 return
-            user32.SetTimer(hwnd, self._timer_id, 50, None)
+            # 10 FPS 心跳(100ms): 逐像素合成整窗位图较重, 10 FPS 已足够卡拉OK平滑
+            user32.SetTimer(hwnd, self._timer_id, 100, None)
             self._ready.set()
             if self._enabled:
                 user32.ShowWindow(hwnd, _SW_SHOWNOACTIVATE)
@@ -749,12 +760,17 @@ class DesktopLyrics:
             return
         user32.ShowWindow(self._hwnd, _SW_SHOWNOACTIVATE if yes else _SW_HIDE)
         if yes:
+            # 重新显示时恢复 10 FPS 心跳(隐藏时已停掉, 不再空转重绘)
+            user32.SetTimer(self._hwnd, self._timer_id, 100, None)
             self._ui_shown = False  # 每次显示都从"纯歌词穿透"状态开始
             self._ui_deadline = 0.0
             user32.SetWindowPos(self._hwnd, _HWND_TOPMOST_PTR, 0, 0, 0, 0,
                                  _SWP_NOMOVE | _SWP_NOSIZE | _SWP_NOACTIVATE | _SWP_SHOWWINDOW)
             self._last_shown = None
             self._repaint()
+        else:
+            # 隐藏后停止心跳: 不可见窗口无需逐像素合成
+            user32.KillTimer(self._hwnd, self._timer_id)
 
     def _set_ui(self, shown: bool) -> None:
         """显隐按钮层; 唤出后 5 秒无交互自动收起(仅窗口线程调用).
@@ -850,6 +866,11 @@ class DesktopLyrics:
             self._screen_dc = user32.GetDC(None)
             self._final_bmp, self._final_dc, self._final_bits = self._make_dib()
             self._mask_bmp, self._mask_dc, self._mask_bits = self._make_dib()
+            # 新 DIB 缓冲, 之前的增量状态全部失效
+            self._painted_span = None
+            self._painted_veil = None
+            self._span_key = None
+            self._last_shown = None
             return bool(self._final_dc and self._mask_dc)
         except Exception:
             self._cleanup_gdi()
@@ -918,13 +939,37 @@ class DesktopLyrics:
         if self._locked:
             items = (("锁", "lock"),)
         else:
-            items = (("−", "minus"), ("+", "plus"), ("锁", "lock"), ("×", "close"))
+            items = (("−", "minus"), ("+", "plus"), ("居", "center"),
+                     ("锁", "lock"), ("×", "close"))
         x0 = (self.WIDTH - bw * len(items)) // 2
         out = []
         for label, key in items:
             out.append((x0, x0 + bw, label, key, f))
             x0 += bw
         return out
+
+    def _center_horizontal(self) -> None:
+        """把窗口水平移到所在显示器工作区正中(纵向位置不变)."""
+        try:
+            mon = user32.MonitorFromWindow(self._hwnd, 2)  # NEAREST
+            mi = _MONITORINFO()
+            mi.cbSize = ctypes.sizeof(_MONITORINFO)
+            if not user32.GetMonitorInfoW(mon, ctypes.byref(mi)):
+                return
+            rr = _RECT()
+            user32.GetWindowRect(self._hwnd, ctypes.byref(rr))
+            w = max(1, int(rr.right - rr.left))
+            left, right = int(mi.rcWork.left), int(mi.rcWork.right)
+            x = left + max(0, (right - left - w) // 2)
+            y = int(rr.top)
+            user32.SetWindowPos(self._hwnd, _HWND_TOPMOST_PTR, x, y, 0, 0,
+                                _SWP_NOSIZE | _SWP_NOACTIVATE | _SWP_SHOWWINDOW)
+            with self._lock:
+                self._x, self._y = x, y
+            self._save_prefs()
+            self._notify_change()
+        except Exception:
+            pass
 
     def _layout(self):
         """固定边距布局: 顶部控制条随 DPI 缩放, 歌词槽按字号排布, 底部 8px.
@@ -1005,6 +1050,56 @@ class DesktopLyrics:
         return core + (self._font_size, self._font_family, self._locked, self.WIDTH,
                        self._ui_shown, self._color)
 
+    def _numpy_view(self, bits, h: int, W: int):
+        """把 DIB 像素缓冲包成 numpy 视图(零拷贝); 不可用时返回 None."""
+        if _np is None or not bits:
+            return None
+        try:
+            arr = _np.ctypeslib.as_array(
+                ctypes.cast(bits, ctypes.POINTER(ctypes.c_uint8)),
+                shape=(h * W * 4,))
+            return arr.reshape(h, W, 4)
+        except Exception:
+            return None
+
+    def _content_span(self, st, fs: int, W: int, ui_shown: bool):
+        """本帧实际可能着墨的列范围.
+
+        歌词永远居中, 两侧大片列必然是透明的, 没必要对整窗做逐像素合成。
+        文字宽度只在本句/字体/窗口宽度变化时重新测量。
+        """
+        if st:
+            lines, idx, frac, shift = st
+            idxs = tuple(j for j in (idx - 1, idx, idx + 1) if 0 <= j < len(lines))
+            key = (fs, W, ui_shown,
+                   tuple(hash(str(lines[j].get("text") or "")) for j in idxs))
+        else:
+            idxs = ()
+            cur, nxt = self._current_next()
+            key = (fs, W, ui_shown, hash(cur), hash(nxt))
+        if self._span_key == key:
+            return self._span_cache
+        w = 0
+        if st:
+            for j in idxs:
+                txt = str(lines[j].get("text") or "")
+                if txt:
+                    w = max(w, self._text_w(self._mask_dc, txt, fs, j == idx))
+        else:
+            w = self._text_w(self._mask_dc, cur, fs, True)
+            if nxt:
+                w = max(w, self._text_w(self._mask_dc, nxt, fs, False))
+        x0 = max(8, (W - w) // 2 - 12)
+        x1 = min(W - 8, (W + w) // 2 + 12)
+        if ui_shown:
+            ctl = self._controls()
+            if ctl:
+                x0 = min(x0, ctl[0][0] - 10)
+                x1 = max(x1, ctl[-1][1] + 10)
+        self._span_key = key
+        self._span_cache = (x0, x1)
+        return x0, x1
+
     def _repaint(self) -> None:
         """在遮罩 DIB 上画文字, 按通道合成预乘 ARGB, 一次性原子提交.
 
@@ -1026,9 +1121,39 @@ class DesktopLyrics:
             other = max(self.MIN_FONT, fs - 8)
             center = y0 + pitch // 2
             st = self._scroll_state()
-            # 通道即元素身份: 纯蓝=已唱(白), 纯红=未唱/相邻行(灰), 纯绿=控件
+            kara_bx = None      # 当前句已唱/未唱分界的绝对 x
+            kara_x_start = 0
+            kara_tw = 0
+            text_key = None
             if st:
                 lines, idx, frac, shift = st
+                text_key = tuple(hash(str(lines[j].get("text") or ""))
+                                 for j in (idx - 1, idx, idx + 1) if 0 <= j < len(lines))
+                cur_txt = str(lines[idx].get("text") or "") if 0 <= idx < len(lines) else ""
+                if cur_txt:
+                    kara_tw = self._text_w(self._mask_dc, cur_txt, fs, True)
+                    kara_x_start = max(14, (W - kara_tw) // 2)
+                    kara_bx = kara_x_start + int(kara_tw * min(1.0, max(0.0, frac)))
+            # 不可见(alpha=1)命中带: 窗口按逐像素 alpha 穿透, 只画字形的话必须精确
+            # 点到笔画才能拖动/唤出按钮层, 表现为"有时候点不动"; 给歌词文字铺满命中带.
+            hit_brush = gdi32.CreateSolidBrush(0x00000100)
+            if kara_tw:
+                user32.FillRect(self._mask_dc, ctypes.byref(_RECT(
+                    max(0, kara_x_start - 12), y0,
+                    min(W, kara_x_start + kara_tw + 12), y0 + pitch)), hit_brush)
+            elif not st:
+                cur, nxt = self._current_next()
+                w = self._text_w(self._mask_dc, cur, fs, True)
+                if nxt:
+                    w = max(w, self._text_w(self._mask_dc, nxt, fs, False))
+                if w:
+                    user32.FillRect(self._mask_dc, ctypes.byref(_RECT(
+                        max(0, (W - w) // 2 - 12), center - pitch // 2,
+                        min(W, (W + w) // 2 + 12),
+                        center + pitch // 2 + (pitch if nxt else 0))), hit_brush)
+            gdi32.DeleteObject(hit_brush)
+            # 通道即元素身份: 纯蓝=已唱(白), 纯红=未唱/相邻行(灰), 纯绿=控件
+            if st:
                 shift = shift * shift * (3 - 2 * shift)  # smoothstep
                 clip = gdi32.CreateRectRgn(0, y0, W, y0 + pitch)
                 for j in (idx - 1, idx, idx + 1):
@@ -1041,9 +1166,7 @@ class DesktopLyrics:
                     r = _RECT(14, yc - pitch // 2, W - 14, yc + pitch // 2)
                     gdi32.SelectClipRgn(self._mask_dc, clip)
                     if j == idx:
-                        tw = self._text_w(self._mask_dc, txt, fs, True)
-                        x_start = max(14, (W - tw) // 2)
-                        bx = x_start + int(tw * min(1.0, max(0.0, frac)))
+                        tw, x_start, bx = kara_tw, kara_x_start, kara_bx
                         rgn = gdi32.CreateRectRgn(x_start, y0, bx, y0 + pitch)
                         gdi32.SelectClipRgn(self._mask_dc, rgn)
                         self._draw(self._mask_dc, txt, r, fs, 0x00FF0000, True, center=True)
@@ -1069,6 +1192,11 @@ class DesktopLyrics:
             bh = self._strip()
             if self._ui_shown:
                 for x0, x1, label, key, fsize in self._controls():
+                    # 命中底: 绿通道=1(alpha=1)视觉不可见, 保证整个按钮格都能点中
+                    hit_brush = gdi32.CreateSolidBrush(0x00000100)
+                    user32.FillRect(self._mask_dc, ctypes.byref(
+                        _RECT(x0, 2, x1, 2 + bh)), hit_brush)
+                    gdi32.DeleteObject(hit_brush)
                     if key == "lock":
                         # 实体底: 整个方格填充低强度灰(绿通道 70), alpha>0 保证
                         # 锁定态(无隐形底)也能在方格内任意位置命中上锁/解锁
@@ -1085,38 +1213,31 @@ class DesktopLyrics:
                     color = 0x0000FFFF if (key == "lock" and self._locked) else 0x0000FF00
                     self._draw(self._mask_dc, label, _RECT(x0, 4, x1, 4 + bh),
                                fsize, color, False, center=True)
-            veil_on = self._ui_shown and not self._locked
-            mask = ctypes.string_at(self._mask_bits, h * W * 4)
-            buf = None
-            if _np is not None:
-                try:
-                    # 通道键控: 蓝=已唱(自定义颜色) 红=未唱(灰189) 绿=按钮(灰229) 红+绿=红色元素
-                    m = _np.frombuffer(mask, dtype=_np.uint8).reshape(h, W, 4)
-                    bch = m[..., 0].astype(_np.int32)
-                    gch = m[..., 1].astype(_np.int32)
-                    rch = m[..., 2].astype(_np.int32)
-                    cR, cG, cB = self._color
-                    # 未唱 = 当前颜色稍变灰(淡化 45%), 按钮仍为固定亮灰
-                    gray_r = rch * cR * 45 // (255 * 100) + gch * 229 // 255
-                    gray_g = rch * cG * 45 // (255 * 100) + gch * 229 // 255
-                    gray_b = rch * cB * 45 // (255 * 100) + gch * 229 // 255
-                    pr = _np.clip(bch * cR // 255 + gray_r, 0, 255)
-                    pg = _np.clip(bch * cG // 255 + gray_g, 0, 255)
-                    pb = _np.clip(bch * cB // 255 + gray_b, 0, 255)
-                    red = (bch == 0) & (gch > 0) & (rch > 0)
-                    v = _np.maximum.reduce([bch, gch, rch])
-                    aa = _np.where(red, v, _np.clip(bch + rch + gch, 0, 255))
-                    if veil_on:
-                        aa = _np.where(aa > 0, aa, _BASE_ALPHA)
-                    out = _np.empty((h, W, 4), dtype=_np.uint8)
-                    out[..., 0] = _np.where(red, 0, pb)
-                    out[..., 1] = _np.where(red, 0, pg)
-                    out[..., 2] = _np.where(red, v, pr)
-                    out[..., 3] = aa
-                    buf = out.tobytes()
-                except Exception:
-                    buf = None
-            if buf is None:
+            # 按钮层显示时整窗为实体命中区(可任意位置拖动/点按钮);
+            # 隐藏时只保留歌词文字带可点, 其余穿透到桌面。
+            veil_on = self._ui_shown
+            # 增量重绘: 只有卡拉OK进度步进变化(行/位移/文本/颜色都没变)时,
+            # 真正变化的像素只在"已唱/未唱"分界附近的一条竖带内。
+            prev = self._last_shown
+            inc = None
+            if (st and kara_bx is not None and isinstance(prev, tuple)
+                    and len(prev) == len(sig) and prev[:3] == sig[:3]
+                    and prev[4:] == sig[4:] and self._last_text_key == text_key):
+                bx_prev = kara_x_start + int(kara_tw * (prev[3] / 66.0))
+                inc = (min(bx_prev, kara_bx), max(bx_prev, kara_bx))
+            self._last_text_key = text_key
+            if inc:
+                cx0 = max(0, inc[0] - 6)
+                cx1 = min(W, inc[1] + 6)
+            else:
+                cx0, cx1 = self._content_span(st, fs, W, self._ui_shown)
+            if cx1 - cx0 < 1:
+                cx0, cx1 = 0, W
+            mask_view = self._numpy_view(self._mask_bits, h, W)
+            out_view = self._numpy_view(self._final_bits, h, W)
+            if mask_view is None or out_view is None:
+                # 无 numpy 兜底: 整窗逐像素(慢, 仅异常环境)
+                mask = ctypes.string_at(self._mask_bits, h * W * 4)
                 base = bytes((0, 0, 0, _BASE_ALPHA if veil_on else 0))
                 ba = bytearray(base * (h * W))
                 lut_main = self._main_lut()
@@ -1134,8 +1255,40 @@ class DesktopLyrics:
                         ba[off:off + 4] = lut_sub[r]
                     elif g:
                         ba[off:off + 4] = lut_ctrl[g]
-                buf = bytes(ba)
-            ctypes.memmove(self._final_bits, buf, h * W * 4)
+                ctypes.memmove(self._final_bits, bytes(ba), h * W * 4)
+            else:
+                # 只合成实际着墨的列, 并直接写入最终 DIB(省掉整窗 bytes 拷贝)
+                m = mask_view[:, cx0:cx1, :]
+                bch = m[..., 0].astype(_np.int32)
+                gch = m[..., 1].astype(_np.int32)
+                rch = m[..., 2].astype(_np.int32)
+                cR, cG, cB = self._color
+                # 未唱 = 当前颜色稍变灰(淡化 45%), 按钮仍为固定亮灰
+                gray_r = rch * cR * 45 // (255 * 100) + gch * 229 // 255
+                gray_g = rch * cG * 45 // (255 * 100) + gch * 229 // 255
+                gray_b = rch * cB * 45 // (255 * 100) + gch * 229 // 255
+                pr = _np.clip(bch * cR // 255 + gray_r, 0, 255)
+                pg = _np.clip(bch * cG // 255 + gray_g, 0, 255)
+                pb = _np.clip(bch * cB // 255 + gray_b, 0, 255)
+                red = (bch == 0) & (gch > 0) & (rch > 0)
+                v = _np.maximum.reduce([bch, gch, rch])
+                aa = _np.where(red, v, _np.clip(bch + rch + gch, 0, 255))
+                if veil_on:
+                    aa = _np.where(aa > 0, aa, _BASE_ALPHA)
+                if not inc and (self._painted_span != (cx0, cx1)
+                                or self._painted_veil != veil_on):
+                    # 列范围/命中底状态变化(换句/锁定切换): 先清空整窗, 避免旧像素残留
+                    out_view[:] = 0
+                    self._painted_span = (cx0, cx1)
+                    self._painted_veil = veil_on
+                    if veil_on:
+                        # 整窗不可见命中底: 只填 alpha=1, RGB 保持 0(不增加逐像素运算)
+                        out_view[..., 3] = _BASE_ALPHA
+                dst = out_view[:, cx0:cx1, :]
+                dst[..., 0] = _np.where(red, 0, pb)
+                dst[..., 1] = _np.where(red, 0, pg)
+                dst[..., 2] = _np.where(red, v, pr)
+                dst[..., 3] = aa
             rr = _RECT()
             user32.GetWindowRect(hwnd, ctypes.byref(rr))
             if (rr.bottom - rr.top) != h or (rr.right - rr.left) != W:
@@ -1153,10 +1306,13 @@ class DesktopLyrics:
             pass
 
     def _tick(self) -> None:
-        """50ms 心跳: 先处理按钮层超时隐藏, 再按变化检测决定是否重绘。"""
+        """100ms 心跳(10 FPS): 先处理按钮层超时隐藏, 再按变化检测决定是否重绘。"""
         try:
-            if self._ui_shown and time.monotonic() >= self._ui_deadline:
-                self._set_ui(False)  # 5 秒无交互, 自动收起
+            # 关闭/隐藏后不再重绘: 逐像素合成整窗位图很贵, 不可见时继续画纯属浪费 CPU
+            if not self._enabled or not self._hwnd:
+                return
+            if self._ui_shown and not self._dragging and time.monotonic() >= self._ui_deadline:
+                self._set_ui(False)  # 5 秒无交互, 自动收起; 拖动过程中不收起按钮层
                 return
             if self._paint_sig() != self._last_shown:
                 self._repaint()
@@ -1221,11 +1377,14 @@ class DesktopLyrics:
             with self._lock:
                 locked = self._locked
             x, y = self._xy(lparam)
-            if not self._ui_shown:
-                # 按钮层隐藏时只有歌词字形像素可命中: 点击即唤出按钮层(5 秒后自动收起)
+            was_hidden = not self._ui_shown
+            self._ui_just_opened = was_hidden
+            if was_hidden:
+                # 按钮层隐藏: 这次按下唤出按钮层; 未锁定时继续走拖动, 不必松手再按第二次
                 self._set_ui(True)
-                return 0
-            hit = self._control_at(x, y)
+                if locked:
+                    return 0
+            hit = None if was_hidden else self._control_at(x, y)
             if hit == "close":
                 self._set_ui(False)
                 self.set_enabled(False)
@@ -1234,6 +1393,10 @@ class DesktopLyrics:
                 self.toggle_lock()
                 self._ui_touch()
                 self._repaint()
+                return 0
+            if hit == "center":
+                self._center_horizontal()
+                self._ui_touch()
                 return 0
             if hit in ("plus", "minus"):
                 with self._lock:
@@ -1261,8 +1424,14 @@ class DesktopLyrics:
                 self._dragging = False
                 user32.ReleaseCapture()
                 if not self._drag_moved:
-                    self._set_ui(False)  # 未拖动的轻点: 收起按钮层
+                    # 这次按下刚唤出按钮层: 松手后保持 5 秒, 不立刻收起
+                    if self._ui_just_opened:
+                        self._ui_touch()
+                    else:
+                        self._set_ui(False)  # 已显示时轻点: 收起按钮层
+                    self._ui_just_opened = False
                     return 0
+                self._ui_just_opened = False
                 rr = _RECT()
                 user32.GetWindowRect(hwnd, ctypes.byref(rr))
                 with self._lock:
