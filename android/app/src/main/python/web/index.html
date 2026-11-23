@@ -60,6 +60,7 @@
   <!-- 中栏: 搜索/结果/歌单 -->
   <main id="main">
     <header class="topbar">
+      <button id="btn-nav" class="go-btn nav-toggle" type="button" aria-label="菜单">☰</button>
       <div class="searchbox">
         <span class="search-ic"><svg viewBox="0 0 48 48" fill="none" stroke="currentColor" stroke-width="3.2" stroke-linecap="round"><circle cx="21" cy="21" r="13"/><path d="M31 31l10 10"/></svg></span>
         <input id="search-input" type="search" placeholder="搜索歌曲 / 歌手 / 视频…" autocomplete="off">
@@ -92,6 +93,9 @@
     <div class="pl-hint">长按拖动排序 · 左滑删除</div>
   </aside>
 </div>
+
+<!-- 移动端抽屉遮罩 -->
+<div id="nav-mask"></div>
 
 <!-- 底部播放条 -->
 <div id="playerbar">

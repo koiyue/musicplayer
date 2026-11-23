@@ -6297,3 +6297,34 @@ document.addEventListener("visibilitychange", () => {
 window.MusicHubMem = { reclaim: memReclaim, usage: memUsage };
 
 
+
+/* ---------- 移动端(Android WebView)抽屉交互 ---------- */
+(function bindMobileNav() {
+  const navBtn = $("btn-nav");
+  const mask = $("nav-mask");
+  const sidebar = $("sidebar");
+  if (!navBtn || !mask || !sidebar) return;
+  const isNarrow = () => window.matchMedia("(max-width: 760px)").matches;
+  const closeNav = () => {
+    sidebar.classList.remove("open");
+    mask.classList.remove("show");
+  };
+  navBtn.addEventListener("click", (e) => {
+    e.stopPropagation();
+    const open = sidebar.classList.toggle("open");
+    mask.classList.toggle("show", open);
+  });
+  mask.addEventListener("click", closeNav);
+  // 点左栏任意按钮后自动收起抽屉
+  sidebar.addEventListener("click", (e) => {
+    if (e.target.closest("button")) closeNav();
+  });
+  // 窄屏: 点播放列表面板以外区域收起队列抽屉
+  document.addEventListener("click", (e) => {
+    if (!isNarrow() || !document.body.classList.contains("show-queue")) return;
+    if (e.target.closest("#playlist-panel") || e.target.closest("#btn-queue")) return;
+    document.body.classList.remove("show-queue");
+    const q = $("btn-queue");
+    if (q) q.classList.remove("active");
+  });
+})();

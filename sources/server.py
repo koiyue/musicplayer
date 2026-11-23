@@ -23,9 +23,6 @@ from .common import UA
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 WEB_DIR = os.path.join(BASE_DIR, "web")
-# 移动端(Android)独立前端; MUSICHUB_CLIENT=android 时根路径返回该界面
-WEB_MOBILE_DIR = os.path.join(BASE_DIR, "web-android")
-MOBILE_UI = os.environ.get("MUSICHUB_CLIENT") == "android"
 # Android 等场景下代码目录只读, 通过环境变量指定可写的数据目录
 DATA_DIR = (os.path.abspath(os.path.expanduser(os.environ["MUSICHUB_DATA_DIR"]))
             if os.environ.get("MUSICHUB_DATA_DIR")
@@ -1743,7 +1740,7 @@ class Handler(BaseHTTPRequestHandler):
         # 非预期 Host(如 DNS rebinding)不返回首页, 更不注入令牌
         if not self._host_ok():
             return self._send(403, {"error": "forbidden"})
-        root = WEB_MOBILE_DIR if MOBILE_UI else WEB_DIR
+        root = WEB_DIR
         fp = os.path.join(root, "index.html")
         with open(fp, "r", encoding="utf-8") as f:
             html = f.read()
@@ -1761,10 +1758,6 @@ class Handler(BaseHTTPRequestHandler):
 
         if path in ("/", "/index.html"):
             return self._index()
-        if path.startswith("/m/"):
-            if not self._host_ok():
-                return self._send(403, {"error": "forbidden"})
-            return self._static_from(WEB_MOBILE_DIR, path[3:])
         if path.startswith("/web/"):
             if not self._host_ok():
                 return self._send(403, {"error": "forbidden"})

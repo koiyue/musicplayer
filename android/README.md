@@ -6,14 +6,12 @@
 - **WebView** 加载 `http://127.0.0.1:<port>/`，复用桌面版同一套界面与播放逻辑；
 - 服务只监听 `127.0.0.1`，并沿用服务端随机令牌，外部网络无法访问本地 API。
 
-## 两套界面，共用一套核心
+## 一套界面，自适应桌面与移动
 
-- 核心：`sources/`（音源接口、/proxy 流代理、令牌校验、数据目录）
-- 桌面界面：`web/`（完整功能：歌单、歌词、弹幕、一起听、桌面歌词等）
-- 移动界面：`web-android/`（首页卡片、搜索、底部播放条、队列面板、音源切换）
+核心与前端都只有一份：`sources/` + `web/`。
 
-`android_entry.py` 会设置 `MUSICHUB_CLIENT=android`，`sources/server.py` 据此在根路径返回
-`web-android/index.html`，静态资源走 `/m/*`；Windows 端不设置该变量，仍使用 `web/`。
+- 桌面：宽屏布局(左栏音源/右栏播放列表/底部播放条)
+- Android：同一套页面，窄屏媒体查询折叠成「左栏抽屉 + 单列内容 + 底部播放条 + 队列底部抽屉」，桌面功能与代码完全共用
 
 ## 端口占用
 
@@ -33,8 +31,7 @@ android/
 │       ├── python/
 │       │   ├── android_entry.py  # 启动本地服务并返回端口
 │       │   ├── sources/          # 由 sync_python.py 从 ../../sources 同步
-│       │   ├── web/              # 由 sync_python.py 从 ../../web 同步
-│       │   └── web-android/      # 由 sync_python.py 从 ../../web-android 同步
+│       │   └── web/              # 由 sync_python.py 从 ../../web 同步
 │       └── res/
 ├── settings.gradle.kts
 ├── build.gradle.kts

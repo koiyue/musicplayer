@@ -905,3 +905,73 @@ body:not(.show-queue) #playlist-panel { display: none; }
   padding: 16px 0 8px; text-align: center;
   color: rgba(255,255,255,.35); font-size: calc(12px * var(--font-scale));
 }
+
+/* ---------- 移动端(Android WebView)自适应: 不改结构, 只做布局折叠 ---------- */
+#btn-nav { display: none; }
+
+@media (max-width: 760px) {
+  #titlebar { display: none; }
+
+  #app {
+    grid-template-columns: 1fr;
+    margin-top: 0;
+    height: calc(100vh - 86px - env(safe-area-inset-bottom));
+  }
+  body:not(.show-queue) #app { grid-template-columns: 1fr; }
+
+  /* 左栏: 抽屉 */
+  #sidebar {
+    position: fixed; left: 0; top: 0;
+    bottom: calc(86px + env(safe-area-inset-bottom));
+    width: 78vw; max-width: 300px; z-index: 90;
+    transform: translateX(-102%);
+    transition: transform .22s ease;
+    padding-top: calc(8px + env(safe-area-inset-top));
+    box-shadow: 12px 0 32px rgba(0,0,0,.5);
+  }
+  #sidebar.open { transform: none; }
+
+  #nav-mask {
+    position: fixed; inset: 0; z-index: 80;
+    background: rgba(0,0,0,.55);
+    opacity: 0; pointer-events: none; transition: opacity .2s;
+  }
+  #nav-mask.show { opacity: 1; pointer-events: auto; }
+
+  #btn-nav { display: inline-flex; padding: 0 12px; }
+
+  .topbar { padding: calc(8px + env(safe-area-inset-top)) 12px 8px; gap: 8px; }
+  .crumb { padding: 0 12px; }
+  .content { padding: 0 6px 12px; }
+
+  /* 右栏: 底部抽屉 */
+  #playlist-panel {
+    position: fixed; left: 0; right: 0;
+    bottom: calc(86px + env(safe-area-inset-bottom));
+    max-height: 58vh; z-index: 85;
+    border-left: none; border-top: 1px solid var(--line);
+    border-radius: 16px 16px 0 0;
+    box-shadow: 0 -14px 36px rgba(0,0,0,.5);
+  }
+  body:not(.show-queue) #playlist-panel { display: none; }
+
+  /* 播放条压缩 */
+  #playerbar {
+    height: calc(86px + env(safe-area-inset-bottom));
+    padding: 0 10px env(safe-area-inset-bottom);
+  }
+  .pb-main { grid-template-columns: 1fr auto; gap: 6px; }
+  .pb-right { display: none; }
+  .pb-info { gap: 8px; }
+  .pb-cover { width: 40px; height: 40px; border-radius: 8px; }
+  .pb-controls { gap: 2px; }
+  .pb-btn { width: 38px; height: 38px; }
+  .pb-btn.play { width: 44px; height: 44px; }
+  .pb-progress { gap: 6px; }
+  .time { font-size: calc(10px * var(--font-scale)); }
+
+  .home-grid { grid-template-columns: repeat(auto-fill, minmax(104px, 1fr)); gap: 10px; }
+  .song-row { padding: 8px 6px; gap: 9px; }
+  .s-cover, .s-cover-ph { width: 40px; height: 40px; }
+  .src-btn, .mine-btn { padding-top: 10px; padding-bottom: 10px; }
+}

@@ -27,5 +27,4 @@ if __name__ == "__main__":
     os.makedirs(DST, exist_ok=True)
     sync("sources")
     sync("web")
-    sync("web-android")
     print("已同步到", DST)
