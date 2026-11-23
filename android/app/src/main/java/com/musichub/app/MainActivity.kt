@@ -142,7 +142,7 @@ class MainActivity : Activity() {
             if (resultCode == RESULT_OK && data != null) {
                 val clip = data.clipData
                 uris = if (clip != null) {
-                    Array(clip.count) { i -> clip.getItemAt(i).uri }
+                    Array(clip.itemCount) { i -> clip.getItemAt(i).uri }
                 } else {
                     data.data?.let { arrayOf(it) }
                 }
