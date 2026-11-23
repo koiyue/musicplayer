@@ -29,9 +29,7 @@ android/
 │       ├── AndroidManifest.xml
 │       ├── java/com/musichub/app/MainActivity.kt   # WebView 外壳 + Python 启动
 │       ├── python/
-│       │   ├── android_entry.py  # 启动本地服务并返回端口
-│       │   ├── sources/          # 由 sync_python.py 从 ../../sources 同步
-│       │   └── web/              # 由 sync_python.py 从 ../../web 同步
+│       │   └── android_entry.py  # 启动本地服务并返回端口
 │       └── res/
 ├── settings.gradle.kts
 ├── build.gradle.kts
@@ -85,12 +83,8 @@ sdk.dir=C\:\\Users\\<name>\\AppData\\Local\\Android\\Sdk
 
 应用启动时把 `MUSICHUB_DATA_DIR` 指向应用私有目录 `files/musichub`，队列、设置、歌单、下载与登录凭据都写在这里，卸载即清除。非 Windows 平台没有 DPAPI，凭据以明文 JSON 存在应用私有沙箱内（其他应用无法读取）。
 
-## 同步共享代码
+## 共享代码
 
-桌面版代码更新后执行：
-
-```powershell
-python android/sync_python.py
-```
-
-再重新构建即可。`app/src/main/python/sources`、`app/src/main/python/web` 是生成副本，请只在主仓库对应目录里改代码。
+Android 工程内**不再保存** `sources/`、`web/` 副本。Gradle 的 `stageSharedPython`
+任务会在每次构建时把仓库根目录的 `sources/` 与 `web/` 暂存到 `app/build/generated/python-shared/`，
+再交给 Chaquopy 打包。改代码只需改根目录那一份，重新构建即可生效。

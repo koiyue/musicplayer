@@ -50,22 +50,7 @@ if (-not $env:GRADLE_USER_HOME) {
 $localProps = Join-Path $here "local.properties"
 "sdk.dir=$($sdk -replace '\\','\\')" | Set-Content -Path $localProps -Encoding ASCII
 
-Write-Host "同步 sources/ 与 web/ ..." -ForegroundColor Cyan
-# 优先 py 启动器; 避开 WindowsApps 的 python.exe 占位程序(会弹应用商店)
-$py = $null
-$pyLauncher = Get-Command py.exe -ErrorAction SilentlyContinue
-if ($pyLauncher) {
-    $py = $pyLauncher.Source
-} else {
-    $cmd = Get-Command python.exe -ErrorAction SilentlyContinue
-    if ($cmd -and $cmd.Source -notlike "*WindowsApps*") { $py = $cmd.Source }
-}
-if (-not $py) {
-    Write-Host "未找到 Python，可手动运行: python android/sync_python.py" -ForegroundColor Yellow
-} else {
-    & $py (Join-Path $here "sync_python.py")
-    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-}
+# 共享代码由 Gradle 的 stageSharedPython 任务在构建期暂存, 无需手动同步
 
 # 优先用仓库自带的 gradlew; 否则用本机工具链里的 Gradle 8.7
 $gradle = $null
