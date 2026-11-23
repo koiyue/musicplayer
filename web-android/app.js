@@ -329,6 +329,10 @@ $("ptdur").addEventListener("click", () => {
 });
 
 /* ---------------- 启动 ---------------- */
+(function showVersion() {
+  const v = new URLSearchParams(location.search).get("v");
+  if (v) $("ver").textContent = "v" + v;
+})();
 renderSources();
 loadHome();
 

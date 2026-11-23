@@ -30,6 +30,7 @@ body { padding-bottom: calc(var(--player-h) + env(safe-area-inset-bottom)); }
   backdrop-filter: blur(8px);
 }
 #brand { font-size: 20px; font-weight: 800; letter-spacing: .5px; }
+#ver { font-size: 11px; font-weight: 500; color: var(--sub); margin-left: 6px; }
 #search-open {
   border: 1px solid var(--line); background: var(--bg2); color: var(--text);
   padding: 7px 9px; border-radius: 9px; font-size: 14px;

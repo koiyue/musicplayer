@@ -133,7 +133,15 @@ class MainActivity : Activity() {
                     .getModule("android_entry")
                     .callAttr("start", "$filesDir/musichub")
                     .toInt()
-                runOnUiThread { webView.loadUrl("http://127.0.0.1:$port/") }
+                // 把安装包版本带给前端, 用于核对当前运行的是哪一版
+                val version = try {
+                    packageManager.getPackageInfo(packageName, 0).versionName ?: ""
+                } catch (_: Exception) {
+                    ""
+                }
+                runOnUiThread {
+                    webView.loadUrl("http://127.0.0.1:$port/?v=" + Uri.encode(version))
+                }
             } catch (e: Throwable) {
                 runOnUiThread {
                     Toast.makeText(this, "后端启动失败: ${e.message}", Toast.LENGTH_LONG).show()
