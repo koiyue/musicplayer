@@ -55,17 +55,20 @@ function proxyUrl(s) {
     "&id=" + encodeURIComponent(s.id) +
     "&extra=" + encodeURIComponent(JSON.stringify(s.extra || {})));
 }
+// 可代理的图片源(与 server.IMG_HOSTS 白名单一致)
+const IMG_PROXY_HOST = /(^|\.)(music\.126\.net|gtimg\.cn|y\.qq\.com|qpic\.cn|hdslb\.com|biliimg\.com|bilibili\.com|bytecdn\.cn|byteimg\.com|douyincdn\.com|douyinpic\.com|douyinstatic\.com|ixigua\.com|pstatp\.com|snssdk\.com|iesdouyin\.com)$/i;
 function coverUrl(url) {
   let c = String(url || "").trim();
   if (!c) return "";
   if (c.startsWith("data:") || c.startsWith("blob:")) return c;
   if (c.startsWith("//")) c = "https:" + c;
   if (!/^https?:\/\//i.test(c)) return c;
-  // B站/抖音封面有防盗链, 走本地代理(由服务端补 Referer)
-  if (/hdslb\.com|biliimg\.com|byte|douyin|ixigua|pstatp|snssdk|douyinpic|byteimg/.test(c)) {
-    return withTok("/imgproxy?url=" + encodeURIComponent(c));
-  }
-  // 安卓 network_security_config 只放行本机明文, 其余封面统一升级为 https
+  // 统一走本地图片代理: 绕开安卓明文限制/防盗链/证书问题, 由后端补 UA+Referer 拉取
+  try {
+    if (IMG_PROXY_HOST.test(new URL(c).hostname)) {
+      return withTok("/imgproxy?url=" + encodeURIComponent(c));
+    }
+  } catch (e) {}
   return c.replace(/^http:\/\//i, "https://");
 }
 

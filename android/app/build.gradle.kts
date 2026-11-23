@@ -13,8 +13,8 @@ android {
         minSdk = 24
         targetSdk = 34
         // 版本基线 1.0.0, 之后每次更新递增末位小版本, versionCode 同步 +1
-        versionCode = 7
-        versionName = "1.0.6"
+        versionCode = 8
+        versionName = "1.0.3.1"
         // Chaquopy 需要为每个 ABI 打包 libpython; 只保留常见架构以减小体积
         ndk {
             abiFilters += listOf("arm64-v8a", "armeabi-v7a", "x86_64")
