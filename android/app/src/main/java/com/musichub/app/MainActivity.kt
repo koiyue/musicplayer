@@ -16,6 +16,7 @@ import android.webkit.WebViewClient
 import android.widget.FrameLayout
 import android.widget.Toast
 import com.chaquo.python.Python
+import com.chaquo.python.android.AndroidPlatform
 
 /**
  * MusicHub Android 外壳: 在本地启动 Python 后端(127.0.0.1), 再用 WebView 加载前端页面.
@@ -118,6 +119,11 @@ class MainActivity : Activity() {
                 customViewCallback?.onCustomViewHidden()
                 customViewCallback = null
             }
+        }
+
+        // Chaquopy 必须先绑定 Android 平台, 否则 getInstance() 会报 GenericPlatform
+        if (!Python.isStarted()) {
+            Python.start(AndroidPlatform(applicationContext))
         }
 
         // 后端起在后台线程: 首次启动要解压 Python 运行时, 不能阻塞主线程
