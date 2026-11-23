@@ -368,12 +368,12 @@ _HOME_TOPLIST_META = {
     27: ("巅峰榜·新歌", "https://y.gtimg.cn/music/common/upload/iphone_order_channel/20150820174831.jpg"),
     4:  ("巅峰榜·流行指数", "https://y.gtimg.cn/music/common/upload/test_order_channel_hitlist_con/1847681.png"),
     3:  ("巅峰榜·欧美", "https://y.gtimg.cn/music/common/upload/iphone_order_channel/20150122151215.jpg"),
-    5:  ("巅峰榜·内地", "https://y.gtimg.cn/music/common/upload/iphone_order_channel/20150820174759.jpg"),
-    62: ("飙升榜", "https://y.gtimg.cn/music/common/upload/iphone_order_channel/20150820174903.jpg"),
-    64: ("巅峰榜·香港", "https://y.gtimg.cn/music/common/upload/iphone_order_channel/20150820174920.jpg"),
-    65: ("巅峰榜·台湾", "https://y.gtimg.cn/music/common/upload/iphone_order_channel/20150820174937.jpg"),
-    17: ("巅峰榜·日本", "https://y.gtimg.cn/music/common/upload/iphone_order_channel/20150820174954.jpg"),
-    52: ("巅峰榜·韩国", "https://y.gtimg.cn/music/common/upload/iphone_order_channel/20150820175011.jpg"),
+    5:  ("巅峰榜·内地", "https://y.gtimg.cn/music/common/upload/iphone_order_channel/20150122151407.jpg"),
+    62: ("飙升榜", "https://y.gtimg.cn/music/common/upload/t_order_channel_hitlist_conf/1743216.png"),
+    64: ("综艺新歌榜", "https://y.gtimg.cn/music/common/upload/test_order_channel_hitlist_con/1743522.png"),
+    65: ("国风热歌榜", "https://y.gtimg.cn/music/common/upload/test_order_channel_hitlist_con/1743517.png"),
+    17: ("巅峰榜·日本", "https://y.gtimg.cn/music/common/upload/iphone_order_channel/20150122151730.jpg"),
+    52: ("腾讯音乐人原创榜", "https://y.gtimg.cn/music/common/upload/t_order_channel_hitlist_conf/141029.png"),
 }
 
 
@@ -475,19 +475,26 @@ def home(limit=30):
         playlists = (results[0] or [])[:12]
         charts = results[1] or []
         activities = results[2] or []
+        def pl_cover(i):
+            """快捷卡片借用推荐歌单封面, 避免空 cover 渲染成空白块."""
+            if not playlists:
+                return ""
+            return playlists[i % len(playlists)].get("cover") or ""
+
         quick = [
-            {"title": "每日推荐", "sub": "QQ音乐新歌速递", "cover": "", "tag": "每日更新",
+            {"title": "每日推荐", "sub": "QQ音乐新歌速递", "cover": pl_cover(0), "tag": "每日更新",
              "action": "songs", "mode": "new"},
-            {"title": "新歌速递", "sub": "最新上架歌曲", "cover": "", "tag": "新歌",
+            {"title": "新歌速递", "sub": "最新上架歌曲", "cover": pl_cover(1), "tag": "新歌",
              "action": "songs", "mode": "new"},
-            {"title": "巅峰榜·热歌", "sub": "站内播放热度", "cover": "", "tag": "榜单",
+            {"title": "巅峰榜·热歌", "sub": "站内播放热度",
+             "cover": _HOME_TOPLIST_META[26][1], "tag": "榜单",
              "action": "toplist", "topid": 26},
             {"title": "私人推荐", "sub": "根据常听风格推荐",
-             "cover": playlists[0].get("cover") if playlists else "", "tag": "个性化",
+             "cover": pl_cover(0), "tag": "个性化",
              "action": "playlist", "ref": playlists[0].get("ref") if playlists else ""},
-            {"title": "经典专区", "sub": "热门怀旧金曲", "cover": "", "tag": "精选",
+            {"title": "经典专区", "sub": "热门怀旧金曲", "cover": pl_cover(2), "tag": "精选",
              "action": "search", "keyword": "经典老歌"},
-            {"title": "听·周杰伦", "sub": "艺人歌曲精选", "cover": "", "tag": "艺人",
+            {"title": "听·周杰伦", "sub": "艺人歌曲精选", "cover": pl_cover(3), "tag": "艺人",
              "action": "search", "keyword": "周杰伦"},
         ]
         return {"quick": quick, "playlists": playlists, "charts": charts,

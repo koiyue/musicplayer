@@ -56,12 +56,17 @@ function proxyUrl(s) {
     "&extra=" + encodeURIComponent(JSON.stringify(s.extra || {})));
 }
 function coverUrl(url) {
-  const c = url || "";
+  let c = String(url || "").trim();
   if (!c) return "";
-  if (/hdslb\.com|byte|douyin|ixigua|pstatp|snssdk|douyinpic|byteimg/.test(c)) {
+  if (c.startsWith("data:") || c.startsWith("blob:")) return c;
+  if (c.startsWith("//")) c = "https:" + c;
+  if (!/^https?:\/\//i.test(c)) return c;
+  // B站/抖音封面有防盗链, 走本地代理(由服务端补 Referer)
+  if (/hdslb\.com|biliimg\.com|byte|douyin|ixigua|pstatp|snssdk|douyinpic|byteimg/.test(c)) {
     return withTok("/imgproxy?url=" + encodeURIComponent(c));
   }
-  return c;
+  // 安卓 network_security_config 只放行本机明文, 其余封面统一升级为 https
+  return c.replace(/^http:\/\//i, "https://");
 }
 
 /* ---------------- 列表渲染 ---------------- */
