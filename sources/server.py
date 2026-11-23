@@ -23,6 +23,9 @@ from .common import UA
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 WEB_DIR = os.path.join(BASE_DIR, "web")
+# 移动端(Android)独立前端; MUSICHUB_CLIENT=android 时根路径返回该界面
+WEB_MOBILE_DIR = os.path.join(BASE_DIR, "web-android")
+MOBILE_UI = os.environ.get("MUSICHUB_CLIENT") == "android"
 # Android 等场景下代码目录只读, 通过环境变量指定可写的数据目录
 DATA_DIR = (os.path.abspath(os.path.expanduser(os.environ["MUSICHUB_DATA_DIR"]))
             if os.environ.get("MUSICHUB_DATA_DIR")
@@ -1740,7 +1743,8 @@ class Handler(BaseHTTPRequestHandler):
         # 非预期 Host(如 DNS rebinding)不返回首页, 更不注入令牌
         if not self._host_ok():
             return self._send(403, {"error": "forbidden"})
-        fp = os.path.join(WEB_DIR, "index.html")
+        root = WEB_MOBILE_DIR if MOBILE_UI else WEB_DIR
+        fp = os.path.join(root, "index.html")
         with open(fp, "r", encoding="utf-8") as f:
             html = f.read()
         tag = '<meta name="mh-token" content="%s">' % TOKEN
@@ -1757,10 +1761,14 @@ class Handler(BaseHTTPRequestHandler):
 
         if path in ("/", "/index.html"):
             return self._index()
+        if path.startswith("/m/"):
+            if not self._host_ok():
+                return self._send(403, {"error": "forbidden"})
+            return self._static_from(WEB_MOBILE_DIR, path[3:])
         if path.startswith("/web/"):
             if not self._host_ok():
                 return self._send(403, {"error": "forbidden"})
-            return self._static(path[5:])
+            return self._static_from(WEB_DIR, path[5:])
         if not self._authorized(qs):
             return self._send(403, {"error": "forbidden"})
         if path == "/api/room/local":
@@ -2102,15 +2110,18 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
 
     # ---------- 业务 ----------
-    def _static(self, rel):
+    def _static_from(self, root_dir, rel):
         # 用真实路径包含关系替代字符串前缀, 拒绝 .. 与兄弟目录(如 web_backup)越界
-        root = os.path.realpath(WEB_DIR)
-        fp = os.path.realpath(os.path.join(WEB_DIR, rel))
+        root = os.path.realpath(root_dir)
+        fp = os.path.realpath(os.path.join(root_dir, rel))
         if not (fp == root or fp.startswith(root + os.sep)) or not os.path.isfile(fp):
             return self._send(404, "not found", "text/plain")
         ext = os.path.splitext(fp)[1].lower()
         with open(fp, "rb") as f:
             return self._send(200, f.read(), STATIC_TYPES.get(ext, "application/octet-stream"))
+
+    def _static(self, rel):
+        return self._static_from(WEB_DIR, rel)
 
     def _search(self, g):
         src = SRC.get(g("source"))
@@ -2554,8 +2565,17 @@ class Handler(BaseHTTPRequestHandler):
                     break
 
 
+class _ExclusiveServer(ThreadingHTTPServer):
+    """Windows 下 SO_REUSEADDR 允许两个进程绑定同一端口, 请求会被旧进程截获.
+
+    关闭地址复用(Windows 默认即独占), 让"端口被占用"能被正确检测并顺延。
+    """
+    allow_reuse_address = os.name != "nt"
+
+
 def free_port(preferred=8787):
-    for p in (preferred, 0):
+    """优先用 preferred, 被占用时在 preferred..preferred+19 内顺延, 最后退回系统分配."""
+    for p in [preferred] + [preferred + i for i in range(1, 20)] + [0]:
         try:
             s = socket.socket()
             s.bind(("127.0.0.1", p))
@@ -2567,11 +2587,32 @@ def free_port(preferred=8787):
     return 0
 
 
+def serve_auto(preferred=8787):
+    """直接绑定并启动服务(端口被占用自动顺延), 返回 (httpd, 实际端口).
+
+    与 serve() 的区别: 绑定失败会继续尝试后续端口, 避免 free_port 与 bind
+    之间的竞态; Android 入口用它拿到实际端口后再交给 WebView 加载。
+    """
+    os.makedirs(DATA_DIR, exist_ok=True)
+    common.configure_proxy(_load_settings().get("proxy"))
+    _dl_restore()
+    last = None
+    for p in [preferred] + [preferred + i for i in range(1, 20)] + [0]:
+        try:
+            httpd = _ExclusiveServer(("127.0.0.1", p), Handler)
+        except OSError as e:
+            last = e
+            continue
+        threading.Thread(target=httpd.serve_forever, daemon=True).start()
+        return httpd, httpd.server_address[1]
+    raise last or OSError("没有可用端口")
+
+
 def serve(port):
     os.makedirs(DATA_DIR, exist_ok=True)
     common.configure_proxy(_load_settings().get("proxy"))
     _dl_restore()
-    httpd = ThreadingHTTPServer(("127.0.0.1", port), Handler)
+    httpd = _ExclusiveServer(("127.0.0.1", port), Handler)
     t = threading.Thread(target=httpd.serve_forever, daemon=True)
     t.start()
     return httpd

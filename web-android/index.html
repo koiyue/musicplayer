@@ -1,0 +1,53 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>MusicHub</title>
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, maximum-scale=1, user-scalable=no">
+<link rel="stylesheet" href="/m/style.css">
+</head>
+<body>
+
+<header id="top">
+  <div id="brand">MusicHub</div>
+  <button id="search-open" type="button">搜索</button>
+</header>
+
+<nav id="sources"></nav>
+
+<main id="view"><div class="loading">加载中…</div></main>
+
+<section id="player" class="hidden">
+  <div id="pbar"><div id="pfill"></div></div>
+  <div class="prow">
+    <div id="pcover" class="ph">♪</div>
+    <div class="pmeta">
+      <div id="ptitle">未在播放</div>
+      <div id="partist">—</div>
+    </div>
+    <button id="pprev" type="button">◀◀</button>
+    <button id="ptoggle" type="button">▶</button>
+    <button id="pnext" type="button">▶▶</button>
+    <button id="pqueue" type="button">☰</button>
+  </div>
+  <div class="ptime"><span id="ptcur">0:00</span><span id="ptdur">0:00</span></div>
+</section>
+
+<div id="searchpage" class="page hidden">
+  <div class="sbar">
+    <input id="sinput" type="search" placeholder="搜索歌曲 / 歌手" autocomplete="off" enterkeyhint="search">
+    <button id="sback" type="button">取消</button>
+  </div>
+  <div id="sresults" class="list"></div>
+</div>
+
+<div id="sheet" class="sheet hidden">
+  <div class="sheet-head"><b>播放队列</b><button id="sheet-close" type="button">✕</button></div>
+  <div id="queue-list" class="list"></div>
+</div>
+
+<div id="toast" class="hidden"></div>
+<audio id="audio" preload="none"></audio>
+<script src="/m/app.js"></script>
+</body>
+</html>

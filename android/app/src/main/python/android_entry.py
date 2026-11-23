@@ -9,21 +9,24 @@ import threading
 
 _lock = threading.Lock()
 _port = 0
+_httpd = None
 
 
 def start(data_dir):
     """启动本地 HTTP 服务(幂等), 返回端口号."""
-    global _port
+    global _port, _httpd
     with _lock:
         if _port:
             return _port
         data_dir = os.path.abspath(data_dir)
         os.makedirs(data_dir, exist_ok=True)
         os.environ["MUSICHUB_DATA_DIR"] = data_dir
+        # 使用移动端专属前端(index.html 由 server 按此变量选择)
+        os.environ["MUSICHUB_CLIENT"] = "android"
 
         from sources import server  # noqa: E402  (必须在设置环境变量之后导入)
 
-        port = server.free_port(8787)
-        threading.Thread(target=server.serve, args=(port,), daemon=True).start()
+        # 端口被占用会自动顺延, 拿到实际端口再交给 WebView
+        _httpd, port = server.serve_auto(8787)
         _port = port
         return port
