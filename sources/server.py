@@ -23,7 +23,10 @@ from .common import UA
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 WEB_DIR = os.path.join(BASE_DIR, "web")
-DATA_DIR = os.path.join(BASE_DIR, "data")
+# Android 等场景下代码目录只读, 通过环境变量指定可写的数据目录
+DATA_DIR = (os.path.abspath(os.path.expanduser(os.environ["MUSICHUB_DATA_DIR"]))
+            if os.environ.get("MUSICHUB_DATA_DIR")
+            else os.path.join(BASE_DIR, "data"))
 SKIN_DIR = os.path.join(DATA_DIR, "skins")
 QUEUE_FILE = os.path.join(DATA_DIR, "queue.json")
 SETTINGS_FILE = os.path.join(DATA_DIR, "settings.json")
