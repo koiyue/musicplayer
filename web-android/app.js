@@ -191,6 +191,8 @@ function playAt(i) {
   audio.play().catch(() => toast("播放失败，可能需要先登录该音源"));
   updatePlayerBar(s);
   markRows();
+  // 视频源(B站/抖音): 打开静音画面并跟随音频
+  if (isVideoSong(s)) openVideo(s); else closeVideo();
 }
 function updatePlayerBar(s) {
   $("player").classList.remove("hidden");
@@ -329,3 +331,101 @@ $("ptdur").addEventListener("click", () => {
 /* ---------------- 启动 ---------------- */
 renderSources();
 loadHome();
+
+/* ---------------- 视频画面(B站/抖音) ---------------- */
+const vid = $("vid");
+let videoTimer = null;
+
+function isVideoSong(s) {
+  return !!s && (s.source === "bilibili" || s.source === "douyin");
+}
+function videoUrl(s) {
+  return withTok("/proxy?source=" + encodeURIComponent(s.source) +
+    "&id=" + encodeURIComponent(s.id) + "&kind=video&extra=" +
+    encodeURIComponent(JSON.stringify(s.extra || {})));
+}
+function openVideo(song) {
+  const s = song || state.queue[state.index];
+  if (!isVideoSong(s)) return;
+  $("video-title").textContent = s.title || "";
+  $("videopage").classList.remove("hidden");
+  if (vid.dataset.key !== String(s.id)) {
+    vid.dataset.key = String(s.id);
+    vid.src = videoUrl(s);
+  }
+  try { vid.currentTime = audio.currentTime || 0; } catch (e) {}
+  vid.play().catch(() => {});
+  if (videoTimer) clearInterval(videoTimer);
+  videoTimer = setInterval(syncVideo, 400);
+}
+function closeVideo() {
+  $("videopage").classList.add("hidden");
+  if (videoTimer) { clearInterval(videoTimer); videoTimer = null; }
+  try { vid.pause(); } catch (e) {}
+}
+function syncVideo() {
+  const s = state.queue[state.index];
+  if (!isVideoSong(s)) { closeVideo(); return; }
+  if (audio.paused) { if (!vid.paused) vid.pause(); }
+  else if (vid.paused) { vid.play().catch(() => {}); }
+  if (vid.duration && Math.abs(vid.currentTime - audio.currentTime) > 0.7) {
+    try { vid.currentTime = audio.currentTime; } catch (e) {}
+  }
+}
+
+/* ---------------- 登录(粘贴 Cookie) ---------------- */
+const LOGIN_SOURCES = [
+  ["netease", "网易云"], ["qq", "QQ音乐"], ["bilibili", "哔哩哔哩"], ["douyin", "抖音"],
+];
+function renderLoginList() {
+  $("login-body").innerHTML = LOGIN_SOURCES.map(([k, n]) =>
+    '<button class="login-row" data-src="' + k + '">' + esc(n) + ' <span>›</span></button>').join("") +
+    '<p style="color:var(--sub);font-size:12px;line-height:1.6;padding:12px 2px">' +
+    "在手机浏览器登录对应网站后，复制 Cookie 粘贴到下一步即可。登录状态保存在应用私有目录。</p>";
+}
+function renderLoginForm(src) {
+  const name = SRC_NAME[src] || src;
+  $("login-body").innerHTML =
+    '<div class="login-form"><div class="login-tip">粘贴 ' + esc(name) + " 的 Cookie</div>" +
+    '<textarea id="login-cookie" placeholder="SESSDATA=...; bili_jct=...; 或完整 Cookie 串"></textarea>' +
+    '<div class="login-actions"><button id="login-back" type="button">返回</button>' +
+    '<button id="login-submit" type="button" class="primary">登录</button></div>' +
+    '<div id="login-msg" class="login-msg"></div></div>';
+  $("login-back").onclick = renderLoginList;
+  $("login-submit").onclick = async () => {
+    const cookie = ($("login-cookie").value || "").trim();
+    if (!cookie) { $("login-msg").textContent = "请先粘贴 Cookie"; return; }
+    $("login-msg").textContent = "提交中…";
+    try {
+      const r = await api("/api/" + src + "/manual", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ cookie: cookie }),
+      });
+      const ok = r && (r.logged_in === true || r.ok === true || r.status === "ok");
+      $("login-msg").textContent = ok ? "登录成功" : ("结果: " + JSON.stringify(r));
+      if (ok) {
+        setTimeout(() => {
+          $("loginpage").classList.add("hidden");
+          loadHome();
+        }, 600);
+      }
+    } catch (e) {
+      $("login-msg").textContent = "登录失败: " + e;
+    }
+  };
+}
+$("login-open").addEventListener("click", () => {
+  $("loginpage").classList.remove("hidden");
+  renderLoginList();
+});
+$("login-close").addEventListener("click", () => $("loginpage").classList.add("hidden"));
+$("login-body").addEventListener("click", (e) => {
+  const row = e.target.closest(".login-row");
+  if (row) renderLoginForm(row.dataset.src);
+});
+$("video-back").addEventListener("click", closeVideo);
+$("pcover").addEventListener("click", () => {
+  const s = state.queue[state.index];
+  if (isVideoSong(s)) openVideo(s);
+});

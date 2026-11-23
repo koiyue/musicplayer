@@ -10,7 +10,10 @@
 
 <header id="top">
   <div id="brand">MusicHub</div>
-  <button id="search-open" type="button">搜索</button>
+  <div class="top-actions">
+    <button id="login-open" type="button">登录</button>
+    <button id="search-open" type="button">搜索</button>
+  </div>
 </header>
 
 <nav id="sources"></nav>
@@ -39,6 +42,20 @@
     <button id="sback" type="button">取消</button>
   </div>
   <div id="sresults" class="list"></div>
+</div>
+
+<div id="videopage" class="page hidden">
+  <div class="vtop">
+    <button id="video-back" type="button">‹ 返回</button>
+    <span id="video-title"></span>
+  </div>
+  <div class="vwrap"><video id="vid" muted playsinline></video></div>
+  <div class="vhint">画面静音同步播放，声音由播放器输出</div>
+</div>
+
+<div id="loginpage" class="sheet hidden">
+  <div class="sheet-head"><b>登录</b><button id="login-close" type="button">✕</button></div>
+  <div id="login-body" class="login-body"></div>
 </div>
 
 <div id="sheet" class="sheet hidden">
