@@ -162,13 +162,22 @@ body { padding-bottom: calc(var(--player-h) + env(safe-area-inset-bottom)); }
   border-bottom: 1px solid var(--line); color: var(--text); font-size: 15px;
 }
 .login-row span { color: var(--sub); }
-.login-form { padding-top: 12px; }
+.login-row.off { color: var(--sub); opacity: .55; }
+.login-note { color: var(--sub); font-size: 12px; line-height: 1.6; padding: 12px 2px 0; }
+.qr-panel { padding-top: 12px; }
 .login-tip { color: var(--sub); font-size: 13px; margin-bottom: 8px; }
-#login-cookie {
-  width: 100%; min-height: 110px; resize: vertical;
-  background: var(--bg); border: 1px solid var(--line); border-radius: 12px;
-  color: var(--text); padding: 10px 12px; font-size: 13px; outline: none;
+.qr-wrap {
+  position: relative; width: 240px; height: 240px; margin: 6px auto 2px;
+  display: flex; align-items: center; justify-content: center;
+  background: #fff; border-radius: 14px; overflow: hidden;
 }
+#qr-img { width: 224px; height: 224px; display: block; }
+.qr-mask {
+  position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
+  background: rgba(0,0,0,.78); color: #fff; font-size: 15px; text-align: center;
+  padding: 0 16px; line-height: 1.6;
+}
+.qr-mask.hidden { display: none; }
 .login-actions { display: flex; gap: 10px; justify-content: flex-end; margin-top: 10px; }
 .login-actions button {
   border: 1px solid var(--line); background: var(--bg2); color: var(--text);

@@ -373,56 +373,118 @@ function syncVideo() {
   }
 }
 
-/* ---------------- 登录(粘贴 Cookie) ---------------- */
-const LOGIN_SOURCES = [
-  ["netease", "网易云"], ["qq", "QQ音乐"], ["bilibili", "哔哩哔哩"], ["douyin", "抖音"],
-];
-function renderLoginList() {
-  $("login-body").innerHTML = LOGIN_SOURCES.map(([k, n]) =>
-    '<button class="login-row" data-src="' + k + '">' + esc(n) + ' <span>›</span></button>').join("") +
-    '<p style="color:var(--sub);font-size:12px;line-height:1.6;padding:12px 2px">' +
-    "在手机浏览器登录对应网站后，复制 Cookie 粘贴到下一步即可。登录状态保存在应用私有目录。</p>";
+/* ---------------- 登录(扫码) ---------------- */
+const QR_LOGIN = {
+  netease: {
+    name: "网易云", qr: "/api/netease/qr", poll: "/api/netease/poll",
+    tip: "打开网易云音乐 App 扫码登录",
+    state(j) {
+      if (j.code === 803) return ["ok", "登录成功"];
+      if (j.code === 802) return ["scanned", "已扫码，请在手机上确认"];
+      if (j.code === 800) return ["expired", "二维码已过期"];
+      if (j.code === 8821) return ["blocked", "扫码登录被网易云风控拦截，请稍后重试"];
+      if (j.error) return ["wait", "查询失败：" + j.error];
+      return ["wait", "等待扫码…"];
+    },
+  },
+  bilibili: {
+    name: "哔哩哔哩", qr: "/api/bili/qr", poll: "/api/bili/poll",
+    tip: "打开哔哩哔哩 App 扫码登录",
+    state(j) {
+      if (j.code === 0 && j.logged_in) return ["ok", "登录成功"];
+      if (j.code === 86090) return ["scanned", "已扫码，请在手机上确认"];
+      if (j.code === 86038) return ["expired", "二维码已过期"];
+      if (j.code === 0) return ["blocked", j.message || "平台未返回登录凭证"];
+      if (j.code === -1 || j.error) return ["wait", "查询失败：" + (j.message || j.error)];
+      return ["wait", "等待扫码…"];
+    },
+  },
+};
+const LOGIN_OFFLINE = [["qq", "QQ音乐"], ["douyin", "抖音"]];
+
+let qrTimer = null;
+let qrSeq = 0;
+function stopQr() {
+  if (qrTimer) { clearInterval(qrTimer); qrTimer = null; }
+  qrSeq++;
 }
-function renderLoginForm(src) {
-  const name = SRC_NAME[src] || src;
+
+function renderLoginList() {
+  stopQr();
   $("login-body").innerHTML =
-    '<div class="login-form"><div class="login-tip">粘贴 ' + esc(name) + " 的 Cookie</div>" +
-    '<textarea id="login-cookie" placeholder="SESSDATA=...; bili_jct=...; 或完整 Cookie 串"></textarea>' +
-    '<div class="login-actions"><button id="login-back" type="button">返回</button>' +
-    '<button id="login-submit" type="button" class="primary">登录</button></div>' +
-    '<div id="login-msg" class="login-msg"></div></div>';
-  $("login-back").onclick = renderLoginList;
-  $("login-submit").onclick = async () => {
-    const cookie = ($("login-cookie").value || "").trim();
-    if (!cookie) { $("login-msg").textContent = "请先粘贴 Cookie"; return; }
-    $("login-msg").textContent = "提交中…";
-    try {
-      const r = await api("/api/" + src + "/manual", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ cookie: cookie }),
-      });
-      const ok = r && (r.logged_in === true || r.ok === true || r.status === "ok");
-      $("login-msg").textContent = ok ? "登录成功" : ("结果: " + JSON.stringify(r));
-      if (ok) {
-        setTimeout(() => {
-          $("loginpage").classList.add("hidden");
-          loadHome();
-        }, 600);
-      }
-    } catch (e) {
-      $("login-msg").textContent = "登录失败: " + e;
+    Object.keys(QR_LOGIN).map((k) =>
+      '<button class="login-row" data-qr="' + k + '">' + esc(QR_LOGIN[k].name) +
+      " <span>扫码 ›</span></button>").join("") +
+    LOGIN_OFFLINE.map(([k, n]) =>
+      '<div class="login-row off">' + esc(n) + " <span>暂不支持扫码</span></div>").join("") +
+    '<p class="login-note">QQ音乐与抖音暂不支持手机端扫码，请在电脑版 MusicHub 登录后再使用。</p>';
+}
+
+function loadQrImage(cfg) {
+  stopQr();
+  const seq = qrSeq;
+  $("qr-mask").classList.add("hidden");
+  $("qr-tip").textContent = cfg.tip;
+  const img = $("qr-img");
+  img.onerror = () => { $("qr-tip").textContent = "二维码加载失败，请点「刷新二维码」重试"; };
+  img.src = withTok(cfg.qr + "?ts=" + Date.now());
+  qrTimer = setInterval(async () => {
+    if (seq !== qrSeq) return;
+    let j;
+    try { j = await api(cfg.poll); } catch (e) {
+      if (seq === qrSeq) $("qr-tip").textContent = "查询登录状态失败，请检查网络";
+      return;
     }
-  };
+    if (seq !== qrSeq) return;
+    const [kind, msg] = cfg.state(j);
+    if (kind === "ok") {
+      stopQr();
+      $("qr-mask").classList.remove("hidden");
+      $("qr-mask").textContent = "登录成功 ✓";
+      $("qr-tip").textContent = "已登录";
+      toast(cfg.name + " 登录成功");
+      setTimeout(() => {
+        $("loginpage").classList.add("hidden");
+        loadHome();
+      }, 800);
+    } else if (kind === "scanned" || kind === "wait") {
+      $("qr-tip").textContent = msg;
+    } else {
+      stopQr();
+      $("qr-mask").classList.remove("hidden");
+      $("qr-mask").textContent = msg + "，点击刷新";
+      $("qr-tip").textContent = msg;
+    }
+  }, 2000);
+}
+
+function openQr(key) {
+  const cfg = QR_LOGIN[key];
+  if (!cfg) return;
+  $("login-body").innerHTML =
+    '<div class="qr-panel"><div id="qr-tip" class="login-tip"></div>' +
+    '<div class="qr-wrap"><img id="qr-img" alt="登录二维码">' +
+    '<div id="qr-mask" class="qr-mask hidden"></div></div>' +
+    '<div class="login-actions"><button id="qr-back" type="button">返回</button>' +
+    '<button id="qr-refresh" type="button" class="primary">刷新二维码</button></div></div>';
+  $("qr-back").onclick = renderLoginList;
+  $("qr-refresh").onclick = () => loadQrImage(cfg);
+  $("qr-mask").onclick = () => loadQrImage(cfg);
+  loadQrImage(cfg);
+}
+
+function closeLogin() {
+  stopQr();
+  $("loginpage").classList.add("hidden");
 }
 $("login-open").addEventListener("click", () => {
   $("loginpage").classList.remove("hidden");
   renderLoginList();
 });
-$("login-close").addEventListener("click", () => $("loginpage").classList.add("hidden"));
+$("login-close").addEventListener("click", closeLogin);
 $("login-body").addEventListener("click", (e) => {
   const row = e.target.closest(".login-row");
-  if (row) renderLoginForm(row.dataset.src);
+  if (row && row.dataset.qr) openQr(row.dataset.qr);
 });
 $("video-back").addEventListener("click", closeVideo);
 $("pcover").addEventListener("click", () => {
