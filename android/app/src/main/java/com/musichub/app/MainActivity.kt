@@ -7,6 +7,7 @@ import android.net.Uri
 import android.os.Bundle
 import android.view.View
 import android.view.ViewGroup
+import android.webkit.JavascriptInterface
 import android.webkit.ValueCallback
 import android.webkit.WebChromeClient
 import android.webkit.WebResourceRequest
@@ -31,6 +32,17 @@ class MainActivity : Activity() {
     private var customView: View? = null
     private var customViewCallback: WebChromeClient.CustomViewCallback? = null
     private var fileCallback: ValueCallback<Array<Uri>>? = null
+    // 前端能否返回(有浮层/非首页); 由 JS 通过 MHNative 桥更新
+    @Volatile
+    private var backAvailable = false
+
+    /** 给前端用的最小桥接: 只上报「当前是否可返回」 */
+    inner class JsBridge {
+        @JavascriptInterface
+        fun setBackAvailable(available: Boolean) {
+            backAvailable = available
+        }
+    }
 
     @SuppressLint("SetJavaScriptEnabled")
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -58,6 +70,8 @@ class MainActivity : Activity() {
             setSupportZoom(false)
             mixedContentMode = WebSettings.MIXED_CONTENT_NEVER_ALLOW
         }
+
+        webView.addJavascriptInterface(JsBridge(), "MHNative")
 
         webView.webViewClient = object : WebViewClient() {
             override fun shouldOverrideUrlLoading(
@@ -174,7 +188,12 @@ class MainActivity : Activity() {
             webView.webChromeClient?.onHideCustomView()
             return
         }
-        if (webView.canGoBack()) webView.goBack() else super.onBackPressed()
+        // 返回键与全面屏侧滑返回统一交给前端处理: 先关浮层/回首页, 无处可返回时才退出
+        if (backAvailable) {
+            webView.evaluateJavascript("window.mhBack && window.mhBack()", null)
+            return
+        }
+        super.onBackPressed()
     }
 
     override fun onDestroy() {

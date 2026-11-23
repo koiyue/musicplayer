@@ -90,6 +90,7 @@ function renderList(songs, title) {
 /* ---------------- 首页 ---------------- */
 async function loadHome() {
   const view = state.view = { type: "home", src: state.source };
+  notifyBack();
   $("view").innerHTML = '<div class="loading">加载中…</div>';
   try {
     const j = await api("/api/home?source=" + encodeURIComponent(state.source) + "&limit=30");
@@ -146,6 +147,7 @@ async function openCard(c) {
 
 async function loadPlaylist(ref, title) {
   const view = state.view = { type: "playlist", src: state.source, ref: ref };
+  notifyBack();
   $("view").innerHTML = '<div class="loading">加载中…</div>';
   const j = await api("/api/playlist?source=" + encodeURIComponent(state.source) +
     "&ref=" + encodeURIComponent(ref));
@@ -155,6 +157,7 @@ async function loadPlaylist(ref, title) {
 
 async function loadRecommend(opts, title) {
   const view = state.view = { type: "recommend", src: state.source };
+  notifyBack();
   $("view").innerHTML = '<div class="loading">加载中…</div>';
   const q = new URLSearchParams(Object.assign({ source: state.source, limit: 50 }, opts || {}));
   const j = await api("/api/recommend?" + q.toString());
@@ -243,6 +246,7 @@ function openQueue() {
     : '<div class="loading">队列为空</div>';
   $("sheet").classList.remove("hidden");
   markRows();
+  notifyBack();
 }
 
 /* ---------------- 事件绑定 ---------------- */
@@ -274,8 +278,12 @@ $("view").addEventListener("click", (e) => {
 $("search-open").addEventListener("click", () => {
   $("searchpage").classList.remove("hidden");
   $("sinput").focus();
+  notifyBack();
 });
-$("sback").addEventListener("click", () => $("searchpage").classList.add("hidden"));
+$("sback").addEventListener("click", () => {
+  $("searchpage").classList.add("hidden");
+  notifyBack();
+});
 $("sinput").addEventListener("keydown", (e) => {
   if (e.key === "Enter") doSearch($("sinput").value);
 });
@@ -285,6 +293,7 @@ $("sresults").addEventListener("click", (e) => {
   state.queue = state.searchSongs.slice();
   playAt(Number(row.dataset.i));
   $("searchpage").classList.add("hidden");
+  notifyBack();
 });
 
 $("ptoggle").addEventListener("click", () => {
@@ -294,7 +303,10 @@ $("ptoggle").addEventListener("click", () => {
 $("pprev").addEventListener("click", () => playStep(-1));
 $("pnext").addEventListener("click", () => playStep(1));
 $("pqueue").addEventListener("click", openQueue);
-$("sheet-close").addEventListener("click", () => $("sheet").classList.add("hidden"));
+$("sheet-close").addEventListener("click", () => {
+  $("sheet").classList.add("hidden");
+  notifyBack();
+});
 $("queue-list").addEventListener("click", (e) => {
   const row = e.target.closest(".row");
   if (!row) return;
@@ -328,13 +340,58 @@ $("ptdur").addEventListener("click", () => {
   toast(name[state.mode], 1200);
 });
 
-/* ---------------- 启动 ---------------- */
-(function showVersion() {
-  const v = new URLSearchParams(location.search).get("v");
-  if (v) $("ver").textContent = "v" + v;
-})();
-renderSources();
-loadHome();
+/* ---------------- 返回 / 侧滑手势 ---------------- */
+const BACK_LAYERS = [
+  ["loginpage", () => closeLogin()],
+  ["videopage", () => closeVideo()],
+  ["searchpage", () => $("searchpage").classList.add("hidden")],
+  ["sheet", () => $("sheet").classList.add("hidden")],
+];
+function hasOpenLayer() {
+  return BACK_LAYERS.some(([id]) => !$(id).classList.contains("hidden"));
+}
+// 通知原生: 有可返回的内容时才拦截系统返回键, 否则交还给系统退出应用
+function notifyBack() {
+  const canBack = hasOpenLayer() || !!(state.view && state.view.type !== "home");
+  const native = window.MHNative;
+  if (native && native.setBackAvailable) {
+    try { native.setBackAvailable(canBack); } catch (e) {}
+  }
+}
+// 原生返回键/侧滑系统手势都会调到这个函数
+window.mhBack = function () {
+  for (const [id, close] of BACK_LAYERS) {
+    if (!$(id).classList.contains("hidden")) {
+      close();
+      notifyBack();
+      return true;
+    }
+  }
+  if (state.view && state.view.type !== "home") {
+    loadHome();
+    return true;
+  }
+  return false;
+};
+// 手动侧滑: 左缘右滑返回(三键导航或个别机型系统未接管时生效)
+let edgeX = null, edgeY = 0, edgeAt = 0;
+document.addEventListener("touchstart", (e) => {
+  if (e.touches.length !== 1) { edgeX = null; return; }
+  const t = e.touches[0];
+  edgeX = t.clientX <= 24 ? t.clientX : null;
+  edgeY = t.clientY;
+  edgeAt = Date.now();
+}, { passive: true });
+document.addEventListener("touchend", (e) => {
+  if (edgeX == null) return;
+  const t = e.changedTouches[0];
+  const dx = t.clientX - edgeX;
+  const dy = Math.abs(t.clientY - edgeY);
+  const ok = dx > 60 && dy < dx * 0.6 && Date.now() - edgeAt < 700;
+  edgeX = null;
+  if (ok) window.mhBack();
+}, { passive: true });
+document.addEventListener("touchcancel", () => { edgeX = null; }, { passive: true });
 
 /* ---------------- 视频画面(B站/抖音) ---------------- */
 const vid = $("vid");
@@ -361,11 +418,13 @@ function openVideo(song) {
   vid.play().catch(() => {});
   if (videoTimer) clearInterval(videoTimer);
   videoTimer = setInterval(syncVideo, 400);
+  notifyBack();
 }
 function closeVideo() {
   $("videopage").classList.add("hidden");
   if (videoTimer) { clearInterval(videoTimer); videoTimer = null; }
   try { vid.pause(); } catch (e) {}
+  notifyBack();
 }
 function syncVideo() {
   const s = state.queue[state.index];
@@ -449,6 +508,7 @@ function loadQrImage(cfg) {
       toast(cfg.name + " 登录成功");
       setTimeout(() => {
         $("loginpage").classList.add("hidden");
+        notifyBack();
         loadHome();
       }, 800);
     } else if (kind === "scanned" || kind === "wait") {
@@ -480,10 +540,12 @@ function openQr(key) {
 function closeLogin() {
   stopQr();
   $("loginpage").classList.add("hidden");
+  notifyBack();
 }
 $("login-open").addEventListener("click", () => {
   $("loginpage").classList.remove("hidden");
   renderLoginList();
+  notifyBack();
 });
 $("login-close").addEventListener("click", closeLogin);
 $("login-body").addEventListener("click", (e) => {
@@ -495,3 +557,11 @@ $("pcover").addEventListener("click", () => {
   const s = state.queue[state.index];
   if (isVideoSong(s)) openVideo(s);
 });
+
+/* ---------------- 启动 ---------------- */
+(function showVersion() {
+  const v = new URLSearchParams(location.search).get("v");
+  if (v) $("ver").textContent = "v" + v;
+})();
+renderSources();
+loadHome();
