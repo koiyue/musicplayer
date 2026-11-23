@@ -79,9 +79,15 @@ try {
     Pop-Location
 }
 
-$apk = Join-Path $here "app\build\outputs\apk\debug\app-debug.apk"
-if (Test-Path $apk) {
-    Write-Host "构建成功: $apk" -ForegroundColor Green
+$apkDir = Join-Path $here "app\build\outputs\apk\debug"
+$apk = Get-ChildItem $apkDir -Filter *.apk -ErrorAction SilentlyContinue |
+    Sort-Object LastWriteTime -Descending | Select-Object -First 1
+if ($apk) {
+    $dist = Join-Path $here "dist"
+    New-Item -ItemType Directory -Force -Path $dist | Out-Null
+    Copy-Item $apk.FullName (Join-Path $dist $apk.Name) -Force
+    Write-Host "构建成功: $($apk.FullName)" -ForegroundColor Green
+    Write-Host "已复制到: $(Join-Path $dist $apk.Name)" -ForegroundColor Green
 } else {
     Write-Host "构建结束，但未找到 APK，请检查上面的输出。" -ForegroundColor Yellow
 }

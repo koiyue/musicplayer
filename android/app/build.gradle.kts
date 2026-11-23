@@ -38,6 +38,15 @@ android {
     kotlinOptions {
         jvmTarget = "17"
     }
+
+    // 产物命名为 MusicHub-<variant>.apk, 而不是 Gradle 默认的 app-debug.apk
+    applicationVariants.all {
+        val variantName = name
+        outputs.all {
+            (this as com.android.build.gradle.internal.api.BaseVariantOutputImpl)
+                .outputFileName = "MusicHub-$variantName.apk"
+        }
+    }
 }
 
 // 构建期把仓库根目录唯一的 sources/ 与 web/ 暂存到 build 目录再交给 Chaquopy,

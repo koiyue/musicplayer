@@ -57,7 +57,7 @@ python android/sync_python.py
 cd android
 # 若仓库未带 gradle-wrapper.jar，先执行一次: gradle wrapper
 .\gradlew assembleDebug
-# 产物: android/app/build/outputs/apk/debug/app-debug.apk
+# 产物: android/app/build/outputs/apk/debug/MusicHub-debug.apk
 ```
 
 `local.properties` 需要指向 SDK（Android Studio 会自动生成）：
