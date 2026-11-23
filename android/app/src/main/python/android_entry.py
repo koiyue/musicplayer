@@ -21,6 +21,8 @@ def start(data_dir):
         data_dir = os.path.abspath(data_dir)
         os.makedirs(data_dir, exist_ok=True)
         os.environ["MUSICHUB_DATA_DIR"] = data_dir
+        # 根路径返回 web-android/ 独立界面
+        os.environ["MUSICHUB_CLIENT"] = "android"
 
         from sources import server  # noqa: E402  (必须在设置环境变量之后导入)
 

@@ -47,6 +47,7 @@ val stagedPython = layout.buildDirectory.dir("generated/python-shared")
 val stageSharedPython = tasks.register<Sync>("stageSharedPython") {
     from(rootProject.file("../sources")) { into("sources") }
     from(rootProject.file("../web")) { into("web") }
+    from(rootProject.file("../web-android")) { into("web-android") }
     into(stagedPython)
 }
 

@@ -6,12 +6,14 @@
 - **WebView** 加载 `http://127.0.0.1:<port>/`，复用桌面版同一套界面与播放逻辑；
 - 服务只监听 `127.0.0.1`，并沿用服务端随机令牌，外部网络无法访问本地 API。
 
-## 一套界面，自适应桌面与移动
+## 共享核心 + 两套界面
 
-核心与前端都只有一份：`sources/` + `web/`。
+- 核心：`sources/`（唯一一份：音源、/proxy 流代理、令牌校验、数据目录）
+- 桌面界面：`web/`（完整功能：歌单、歌词、弹幕、一起听、桌面歌词等）
+- Android 界面：`web-android/`（移动端布局：首页卡片、搜索页、底部播放条、队列面板、音源切换）
 
-- 桌面：宽屏布局(左栏音源/右栏播放列表/底部播放条)
-- Android：同一套页面，窄屏媒体查询折叠成「左栏抽屉 + 单列内容 + 底部播放条 + 队列底部抽屉」，桌面功能与代码完全共用
+`android_entry.py` 设置 `MUSICHUB_CLIENT=android`，`sources/server.py` 据此在根路径返回
+`web-android/index.html`，静态资源走 `/m/*`；Windows 不设置该变量，仍使用 `web/`。
 
 ## 端口占用
 
@@ -85,6 +87,6 @@ sdk.dir=C\:\\Users\\<name>\\AppData\\Local\\Android\\Sdk
 
 ## 共享代码
 
-Android 工程内**不再保存** `sources/`、`web/` 副本。Gradle 的 `stageSharedPython`
-任务会在每次构建时把仓库根目录的 `sources/` 与 `web/` 暂存到 `app/build/generated/python-shared/`，
-再交给 Chaquopy 打包。改代码只需改根目录那一份，重新构建即可生效。
+Android 工程内**不保存** `sources/`、`web/`、`web-android/` 副本。Gradle 的
+`stageSharedPython` 任务会在每次构建时把它们暂存到 `app/build/generated/python-shared/`，
+再交给 Chaquopy 打包。改代码只需改仓库根目录对应目录，重新构建即可生效。
