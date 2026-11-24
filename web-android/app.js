@@ -604,7 +604,15 @@ function renderSources() {
     SRC_ORDER.map((k) =>
       chipHtml(k, SRC_NAME[k], state.root !== "mine" && k === state.source)).join("");
   const on = el.querySelector(".chip.on");
-  if (on) on.scrollIntoView({ inline: "center", block: "nearest", behavior: "smooth" });
+  if (on) {
+    // 只滚动音源条本身, 避免 scrollIntoView 连带横向滚动整个页面造成抖动
+    const left = Math.max(0, on.offsetLeft - (el.clientWidth - on.offsetWidth) / 2);
+    try {
+      el.scrollTo({ left: left, behavior: "smooth" });
+    } catch (e) {
+      el.scrollLeft = left;
+    }
+  }
 }
 
 /* ---------------- 页签: 推荐 / 歌单 / 历史 ---------------- */
@@ -656,7 +664,6 @@ function renderTabs() {
   if (active && ink) {
     ink.style.left = active.offsetLeft + "px";
     ink.style.width = active.offsetWidth + "px";
-    active.scrollIntoView({ inline: "nearest", block: "nearest", behavior: "smooth" });
   }
 }
 

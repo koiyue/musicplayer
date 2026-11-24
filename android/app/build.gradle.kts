@@ -14,8 +14,8 @@ android {
         targetSdk = 34
         // 版本号从 1.0.3.1 起递增, 每段上限 99, 满 99 进位(如 1.0.3.99 -> 1.0.4.0);
         // versionCode 保持单调递增以便覆盖安装
-        versionCode = 21
-        versionName = "1.0.3.14"
+        versionCode = 22
+        versionName = "1.0.3.15"
         // Chaquopy 需要为每个 ABI 打包 libpython; 只保留常见架构以减小体积
         ndk {
             abiFilters += listOf("arm64-v8a", "armeabi-v7a", "x86_64")
