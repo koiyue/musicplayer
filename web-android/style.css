@@ -143,6 +143,23 @@ body { padding-bottom: calc(var(--player-h) + env(safe-area-inset-bottom)); }
   font-size: 12px; padding: 4px 9px; border-radius: 8px;
 }
 
+/* ---------- 每日推荐卡片 ---------- */
+.daily-card {
+  position: relative; display: block; width: 100%; height: 116px;
+  border: none; border-radius: 14px; overflow: hidden; padding: 0; text-align: left;
+  background: var(--card) center/cover no-repeat;
+}
+.daily-card .dmask {
+  position: absolute; inset: 0;
+  background: linear-gradient(90deg, rgba(0, 0, 0, .66), rgba(0, 0, 0, .12));
+}
+.daily-card .dmeta {
+  position: absolute; left: 14px; bottom: 13px;
+  display: flex; flex-direction: column; gap: 4px;
+}
+.daily-card .dtitle { color: #fff; font-size: 18px; font-weight: 700; }
+.daily-card .dsub { color: rgba(255, 255, 255, .78); font-size: 12px; }
+
 .sheet {
   position: fixed; left: 0; right: 0; bottom: 0; z-index: 50;
   max-height: 68vh; background: var(--bg2);

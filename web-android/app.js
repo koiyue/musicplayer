@@ -17,7 +17,6 @@ const state = {
   homeCards: [],
   searchSongs: [],
   login: {},          // src -> status 对象
-  dailySongs: [],     // 首页每日推荐列表
 };
 
 const audio = $("audio");
@@ -119,9 +118,9 @@ async function loadHome(nocache) {
       return;
     }
     const sections = [];
+    if (daily.length) sections.push(["每日推荐", daily, "daily"]);
     if (j.playlists && j.playlists.length) sections.push(["推荐歌单", j.playlists, "cards", true]);
     if (j.charts && j.charts.length) sections.push(["排行榜", j.charts]);
-    if (daily.length) sections.push(["每日推荐", daily, "rows"]);
     if (sections.length) { renderHome(sections); return; }
     await loadRecommend({}, "推荐");
   } catch (e) {
@@ -141,13 +140,17 @@ async function fetchDaily(src) {
 
 function renderHome(sections) {
   state.homeCards = sections;
-  state.dailySongs = [];
   $("view").innerHTML = sections.map((sec, si) => {
     const title = sec[0], cards = sec[1] || [], kind = sec[2] || "cards", refresh = !!sec[3];
-    if (kind === "rows") {
-      state.dailySongs = cards;
+    if (kind === "daily") {
+      // 每日推荐: 一张卡片入口, 点击进入歌曲列表
+      const first = cards[0] || {};
+      const cov = coverUrl(first.cover);
       return '<section class="section"><div class="sec-head"><h3>' + esc(title) + "</h3></div>" +
-        '<div class="list" data-list="daily">' + cards.map(rowHtml).join("") + "</div></section>";
+        '<button class="daily-card" type="button" data-daily="1"' +
+        (cov ? ' style="background-image:url(\'' + esc(cov) + '\')"' : "") + ">" +
+        '<span class="dmask"></span><span class="dmeta"><span class="dtitle">每日推荐</span>' +
+        '<span class="dsub">根据你的口味生成 · ' + cards.length + " 首</span></span></button></section>";
     }
     const right = refresh
       ? '<div class="sec-right"><span>' + cards.length + '</span>' +
@@ -163,6 +166,11 @@ function renderHome(sections) {
           '<div class="cap">' + esc(c.title || "未命名") + "</div></div>";
       }).join("") + "</div></section>";
   }).join("");
+}
+
+function openDaily() {
+  if (state.source === "netease") loadRecommend({ mode: "daily" }, "每日推荐");
+  else loadRecommend({}, "每日推荐");
 }
 
 async function openCard(c) {
@@ -215,12 +223,10 @@ function canPullMore() {
   return !!(state.view && state.view.type === "recommend" && state.view.src === "bilibili");
 }
 
-// B站推荐: 下拉加载下一页, 新内容排在最上方, 最多 100 条
+// B站推荐: 下拉加载下一页, 新内容排在最上方, 最多 100 条, 超出丢弃最早加载的
 async function loadMoreRecommend() {
   const v = state.view;
   if (!canPullMore()) return;
-  const total = state.queue.length;
-  if (total >= 100) { toast("最多显示 100 条推荐"); return; }
   v.pn += 1;
   const q = new URLSearchParams({ source: v.src, limit: 20, pn: v.pn });
   if (v.mode) q.set("mode", v.mode);
@@ -231,13 +237,16 @@ async function loadMoreRecommend() {
   }
   if (state.view !== v) return;
   const seen = new Set(state.queue.map(songKey));
-  const fresh = (j.songs || []).filter((s) => !seen.has(songKey(s))).slice(0, 100 - total);
+  const fresh = (j.songs || []).filter((s) => !seen.has(songKey(s)));
   if (!fresh.length) { toast("没有更多推荐了"); return; }
-  const oldIndex = state.index;
-  state.queue = fresh.concat(state.queue);
-  if (oldIndex >= 0) state.index = oldIndex + fresh.length;
+  const playingKey = state.index >= 0 ? songKey(state.queue[state.index]) : null;
+  let queue = fresh.concat(state.queue);
+  // 超过 100 时从末尾(最早加载的)开始丢弃, 保持 100 条且最新在最上
+  if (queue.length > 100) queue = queue.slice(0, 100);
+  state.queue = queue;
+  state.index = playingKey ? queue.findIndex((s) => songKey(s) === playingKey) : -1;
   const list = document.querySelector("#view .list");
-  if (list) list.innerHTML = state.queue.map(rowHtml).join("");
+  if (list) list.innerHTML = queue.map(rowHtml).join("");
   markRows();
   toast("已加载 " + fresh.length + " 条推荐");
 }
@@ -462,6 +471,7 @@ $("sources").addEventListener("click", (e) => {
 $("view").addEventListener("click", (e) => {
   if (consumeSuppress()) return;
   if (e.target.closest("[data-refresh]")) { loadHome(true); return; }
+  if (e.target.closest("[data-daily]")) { openDaily(); return; }
   const card = e.target.closest(".card");
   if (card) {
     const sec = state.homeCards[Number(card.dataset.si)];
@@ -469,15 +479,7 @@ $("view").addEventListener("click", (e) => {
     return;
   }
   const row = e.target.closest(".row");
-  if (!row || row.dataset.i == null) return;
-  const listEl = row.closest(".list");
-  if (listEl && listEl.dataset.list === "daily") {
-    // 首页「每日推荐」列表: 单独作为播放队列, 不影响卡片区
-    state.queue = (state.dailySongs || []).slice();
-    playAt(Number(row.dataset.i));
-    return;
-  }
-  playAt(Number(row.dataset.i));
+  if (row && row.dataset.i != null) playAt(Number(row.dataset.i));
 });
 
 $("search-open").addEventListener("click", () => {
@@ -555,15 +557,8 @@ bindLongPress($("view"), (el) => {
     return card ? { card: card } : null;
   }
   const i = Number(el.dataset.i);
-  const listEl = el.closest(".list");
-  const isDaily = !!(listEl && listEl.dataset.list === "daily");
-  const arr = isDaily ? (state.dailySongs || []) : state.queue;
-  const s = arr[i];
-  if (!s) return null;
-  return { song: s, play: () => {
-    if (isDaily) state.queue = (state.dailySongs || []).slice();
-    playAt(i);
-  } };
+  const s = state.queue[i];
+  return s ? { song: s, play: () => playAt(i) } : null;
 });
 bindLongPress($("sresults"), (el) => {
   const i = Number(el.dataset.i);
