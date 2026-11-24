@@ -16,6 +16,15 @@ html, body {
   background: var(--bg); color: var(--text);
   font-family: system-ui, -apple-system, "PingFang SC", "Noto Sans CJK SC", sans-serif;
   overscroll-behavior: none;
+  -webkit-user-select: none; user-select: none; -webkit-touch-callout: none;
+}
+
+input, textarea { -webkit-user-select: text; user-select: text; }
+
+.vip-tag {
+  display: inline-block; margin-left: 6px; padding: 1px 5px;
+  border-radius: 4px; background: linear-gradient(90deg, #ff9a3c, #ff6b6b);
+  color: #fff; font-size: 10px; font-weight: 700; vertical-align: 1px;
 }
 
 body { padding-bottom: calc(var(--player-h) + env(safe-area-inset-bottom)); }
@@ -192,3 +201,19 @@ body { padding-bottom: calc(var(--player-h) + env(safe-area-inset-bottom)); }
 }
 .login-actions button.primary { background: var(--acc); border-color: var(--acc); color: #fff; }
 .login-msg { color: var(--sub); font-size: 13px; margin-top: 10px; }
+
+/* ---------- 登录状态 / 长按菜单 ---------- */
+.login-left { display: flex; align-items: center; gap: 6px; }
+.login-state { color: var(--sub); font-size: 13px; }
+.login-state.on { color: #6fdc9b; }
+.on-dot {
+  width: 6px; height: 6px; border-radius: 50%;
+  background: #4cd08a; display: inline-block;
+}
+.menu-body { overflow-y: auto; padding: 0 16px calc(16px + env(safe-area-inset-bottom)); }
+.menu-item {
+  display: block; width: 100%; padding: 15px 6px; text-align: left;
+  background: none; border: none; border-bottom: 1px solid var(--line);
+  color: var(--text); font-size: 15px;
+}
+.menu-item.cancel { color: var(--sub); border-bottom: none; margin-top: 6px; }

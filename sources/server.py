@@ -1796,6 +1796,11 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, douyin.resolve_share(g("text") or g("url") or ""))
         if path == "/api/douyin/status":
             return self._send(200, douyin.status())
+        if path == "/api/douyin/history":
+            try:
+                return self._send(200, douyin.history(int(g("limit", "30") or 30)))
+            except Exception as e:
+                return self._send(200, {"songs": [], "error": str(e)})
         if path == "/api/douyin/feed":
             try:
                 return self._send(200, douyin.feed_page(
@@ -1923,6 +1928,11 @@ class Handler(BaseHTTPRequestHandler):
         # B站登录 + 视频清晰度
         if path == "/api/bili/status":
             return self._send(200, bilibili.status())
+        if path == "/api/bili/history":
+            try:
+                return self._send(200, bilibili.history(int(g("limit", "30") or 30)))
+            except Exception as e:
+                return self._send(200, {"songs": [], "error": str(e)})
         if path == "/api/bili/qr":
             try:
                 png, link = bilibili.new_qr()

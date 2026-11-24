@@ -95,6 +95,39 @@ def status():
         return {"logged_in": False, "error": str(e)}
 
 
+def history(limit=30):
+    """观看历史(需登录): 最近看过的视频, 映射为可直接播放的 song."""
+    ck = _cookie_str()
+    if not ck:
+        return {"songs": [], "error": "未登录哔哩哔哩"}
+    _ensure_buvid()
+    try:
+        j = http_get(API + "/x/web-interface/history/cursor?ps=%d&type=archive"
+                     % min(max(1, int(limit)), 30), headers=_headers())
+    except Exception as e:
+        return {"songs": [], "error": "获取观看历史失败: %s" % e}
+    items = (j.get("data") or {}).get("list") or []
+    out, seen = [], set()
+    for it in items:
+        h = it.get("history") or {}
+        bvid = h.get("bvid") or it.get("bvid") or ""
+        if not bvid or bvid in seen:
+            continue
+        seen.add(bvid)
+        cover = it.get("cover") or ""
+        if not cover and it.get("covers"):
+            cover = it["covers"][0]
+        if cover.startswith("//"):
+            cover = "https:" + cover
+        out.append(song("bilibili", bvid, it.get("title") or "",
+                        it.get("author_name") or "", "",
+                        int(it.get("duration") or 0), cover,
+                        extra={"aid": h.get("oid") or it.get("aid"),
+                               "cid": h.get("cid"),
+                               "page": h.get("page") or 1}))
+    return {"songs": out, "error": "" if out else "暂无观看历史"}
+
+
 def new_qr():
     """生成登录二维码: 返回 (png_bytes, 网页url). 官方接口直接返回图片."""
     global _qr_state

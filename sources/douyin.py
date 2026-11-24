@@ -65,6 +65,38 @@ def status():
     return {"logged_in": bool(ck), "uin": str(ck.get("uid_tt") or ck.get("sessionid") or "")[:32]}
 
 
+def history(limit=30):
+    """播放历史(需登录): 抖音网页观看记录, 尽量映射为可播放的 song."""
+    if not _load_cookie():
+        return {"songs": [], "error": "未登录抖音"}
+    params = {
+        "device_platform": "webapp", "aid": "6383", "channel": "channel_pc_web",
+        "pc_client_type": "1", "version_code": "170400", "version_name": "17.4.0",
+        "cookie_enabled": "true", "platform": "PC", "downlink": "10",
+        "count": min(max(1, int(limit)), 30), "cursor": 0,
+    }
+    url = ("https://www.douyin.com/aweme/v1/web/history/read/?"
+           + urllib.parse.urlencode(params))
+    try:
+        j = http_get(url, headers=_headers({"Referer": "https://www.douyin.com/"}),
+                     timeout=8, attempts=1)
+    except Exception as e:
+        return {"songs": [], "error": "获取播放历史失败: %s" % e}
+    if not isinstance(j, dict):
+        return {"songs": [], "error": "抖音历史接口返回异常(可能需要网页签名)"}
+    if j.get("status_code") not in (0, None):
+        return {"songs": [], "error": "抖音播放历史被风控拦截, 请稍后重试"}
+    items = j.get("aweme_list") or j.get("data") or []
+    if not isinstance(items, list):
+        items = []
+    flat = []
+    for it in items:
+        if isinstance(it, dict):
+            flat.append(it.get("aweme_detail") or it.get("aweme") or it)
+    songs = songs_from_awemes(flat, limit)
+    return {"songs": songs, "error": "" if songs else "暂无播放历史"}
+
+
 def login_cookies():
     """返回已保存的登录 Cookie, 供应用内隐藏 WebView2 注入后由页面自行签名搜索。"""
     return dict(_load_cookie())

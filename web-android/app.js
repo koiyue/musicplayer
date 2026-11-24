@@ -16,6 +16,7 @@ const state = {
   view: null,
   homeCards: [],
   searchSongs: [],
+  login: {},          // src -> status 对象
 };
 
 const audio = $("audio");
@@ -73,13 +74,16 @@ function coverUrl(url) {
 }
 
 /* ---------------- 列表渲染 ---------------- */
+function vipTag(s) {
+  return s && s.extra && s.extra.vip ? '<span class="vip-tag">VIP</span>' : "";
+}
 function rowHtml(s, i) {
   const cov = coverUrl(s.cover);
   return '<div class="row" data-i="' + i + '">' +
     '<div class="idx">' + (i + 1) + "</div>" +
     '<div class="cov"' + (cov ? ' style="background-image:url(\'' + esc(cov) + '\')"' : "") + ">" +
     (cov ? "" : "♪") + "</div>" +
-    '<div class="info"><div class="t">' + esc(s.title || "未命名") + "</div>" +
+    '<div class="info"><div class="t">' + esc(s.title || "未命名") + vipTag(s) + "</div>" +
     '<div class="s">' + esc((s.artist || "未知") + " · " + (SRC_NAME[s.source] || s.source || "")) + "</div></div>" +
     '<div class="dur">' + (s.duration ? fmt(s.duration) : "") + "</div></div>";
 }
@@ -207,7 +211,7 @@ function playAt(i) {
 }
 function updatePlayerBar(s) {
   $("player").classList.remove("hidden");
-  $("ptitle").textContent = s.title || "未在播放";
+  $("ptitle").innerHTML = esc(s.title || "未在播放") + vipTag(s);
   $("partist").textContent = (s.artist || "未知") + " · " + (SRC_NAME[s.source] || s.source || "");
   const cov = coverUrl(s.cover);
   const box = $("pcover");
@@ -257,6 +261,92 @@ function openQueue() {
   notifyBack();
 }
 
+/* ---------------- 长按操作菜单 ---------------- */
+let lpTimer = null, lpStart = null, lpMoved = false, suppressClick = false;
+let menuActions = [];
+
+function songKey(s) {
+  return (s.source || "") + ":" + s.id + ":" + JSON.stringify(s.extra || {});
+}
+function suppressNextClick() {
+  suppressClick = true;
+  setTimeout(() => { suppressClick = false; }, 800);
+}
+function consumeSuppress() {
+  if (!suppressClick) return false;
+  suppressClick = false;
+  return true;
+}
+function openMenu(title, labels, actions) {
+  menuActions = actions || [];
+  $("menu-title").textContent = title || "操作";
+  $("menu-body").innerHTML = labels.map((t, i) =>
+    '<button class="menu-item" type="button" data-mi="' + i + '">' + esc(t) + "</button>").join("") +
+    '<button class="menu-item cancel" type="button" data-cancel="1">取消</button>';
+  $("menu").classList.remove("hidden");
+  notifyBack();
+}
+function closeMenu() {
+  $("menu").classList.add("hidden");
+  notifyBack();
+}
+function queueInsert(s, where) {
+  if (!s) return;
+  const key = songKey(s);
+  const exists = state.queue.some((x) => songKey(x) === key);
+  if (!exists) {
+    if (!state.queue.length || state.index < 0) {
+      state.queue.unshift(s);
+      if (where === "next") state.index = -1;
+    } else {
+      const at = where === "next" ? Math.min(state.index + 1, state.queue.length) : state.queue.length;
+      state.queue.splice(at, 0, s);
+    }
+  }
+  if (!$("sheet").classList.contains("hidden")) openQueue();
+  toast(where === "next" ? "已设为下一首播放" : "已加入播放队列");
+}
+function openSongMenu(s, play) {
+  openMenu(s.title || "歌曲", ["立即播放", "下一首播放", "加入队列末尾"], [
+    () => { if (play) play(); },
+    () => queueInsert(s, "next"),
+    () => queueInsert(s, "end"),
+  ]);
+}
+function bindLongPress(root, resolve) {
+  if (!root) return;
+  root.addEventListener("touchstart", (e) => {
+    if (e.touches.length !== 1) return;
+    const el = e.target.closest(".row, .card");
+    if (!el) return;
+    const t = e.touches[0];
+    lpStart = { x: t.clientX, y: t.clientY };
+    lpMoved = false;
+    if (lpTimer) { clearTimeout(lpTimer); lpTimer = null; }
+    lpTimer = setTimeout(() => {
+      lpTimer = null;
+      if (lpMoved) return;
+      suppressNextClick();
+      const r = resolve(el);
+      if (!r) return;
+      if (r.song) openSongMenu(r.song, r.play);
+      else if (r.card) openMenu(r.card.title || "操作", ["打开"], [() => openCard(r.card)]);
+    }, 550);
+  }, { passive: true });
+  root.addEventListener("touchmove", (e) => {
+    if (!lpTimer || !lpStart) return;
+    const t = e.touches[0];
+    if (Math.abs(t.clientX - lpStart.x) > 10 || Math.abs(t.clientY - lpStart.y) > 10) {
+      lpMoved = true;
+      clearTimeout(lpTimer);
+      lpTimer = null;
+    }
+  }, { passive: true });
+  const stop = () => { if (lpTimer) { clearTimeout(lpTimer); lpTimer = null; } };
+  root.addEventListener("touchend", stop, { passive: true });
+  root.addEventListener("touchcancel", stop, { passive: true });
+}
+
 /* ---------------- 事件绑定 ---------------- */
 function renderSources() {
   $("sources").innerHTML = SRC_ORDER.map((k) =>
@@ -273,6 +363,7 @@ $("sources").addEventListener("click", (e) => {
 });
 
 $("view").addEventListener("click", (e) => {
+  if (consumeSuppress()) return;
   const card = e.target.closest(".card");
   if (card) {
     const sec = state.homeCards[Number(card.dataset.si)];
@@ -296,6 +387,7 @@ $("sinput").addEventListener("keydown", (e) => {
   if (e.key === "Enter") doSearch($("sinput").value);
 });
 $("sresults").addEventListener("click", (e) => {
+  if (consumeSuppress()) return;
   const row = e.target.closest(".row");
   if (!row) return;
   state.queue = state.searchSongs.slice();
@@ -316,9 +408,50 @@ $("sheet-close").addEventListener("click", () => {
   notifyBack();
 });
 $("queue-list").addEventListener("click", (e) => {
+  if (consumeSuppress()) return;
   const row = e.target.closest(".row");
   if (!row) return;
   playAt(Number(row.dataset.i));
+});
+
+$("menu-close").addEventListener("click", closeMenu);
+$("menu-body").addEventListener("click", (e) => {
+  const b = e.target.closest(".menu-item");
+  if (!b) return;
+  const idx = b.dataset.mi;
+  closeMenu();
+  if (b.dataset.cancel != null || idx == null) return;
+  const fn = menuActions[Number(idx)];
+  if (fn) fn();
+});
+// 关闭系统默认长按菜单(文字复制/图片另存)
+document.addEventListener("contextmenu", (e) => e.preventDefault());
+
+bindLongPress($("view"), (el) => {
+  if (el.classList.contains("card")) {
+    const sec = state.homeCards[Number(el.dataset.si)];
+    const card = sec && sec[1][Number(el.dataset.ci)];
+    return card ? { card: card } : null;
+  }
+  const i = Number(el.dataset.i);
+  const s = state.queue[i];
+  return s ? { song: s, play: () => playAt(i) } : null;
+});
+bindLongPress($("sresults"), (el) => {
+  const i = Number(el.dataset.i);
+  const s = state.searchSongs[i];
+  if (!s) return null;
+  return { song: s, play: () => {
+    state.queue = state.searchSongs.slice();
+    playAt(i);
+    $("searchpage").classList.add("hidden");
+    notifyBack();
+  } };
+});
+bindLongPress($("queue-list"), (el) => {
+  const i = Number(el.dataset.i);
+  const s = state.queue[i];
+  return s ? { song: s, play: () => playAt(i) } : null;
 });
 
 $("pbar").addEventListener("click", (e) => {
@@ -350,6 +483,7 @@ $("ptdur").addEventListener("click", () => {
 
 /* ---------------- 返回 / 侧滑手势 ---------------- */
 const BACK_LAYERS = [
+  ["menu", () => closeMenu()],
   ["loginpage", () => closeLogin()],
   ["videopage", () => closeVideo()],
   ["searchpage", () => $("searchpage").classList.add("hidden")],
@@ -490,16 +624,96 @@ function openWebLogin(key) {
   toast("当前环境不支持网页登录");
 }
 
+/* ---------------- 登录状态 / 我的歌单 / 播放历史 ---------------- */
+const STATUS_API = {
+  netease: "/api/netease/status", qq: "/api/qq/status",
+  bilibili: "/api/bili/status", douyin: "/api/douyin/status",
+};
+async function refreshLoginStatus() {
+  const out = {};
+  await Promise.all(Object.keys(STATUS_API).map(async (k) => {
+    try { out[k] = (await api(STATUS_API[k])) || {}; } catch (e) { out[k] = {}; }
+  }));
+  state.login = out;
+  const any = Object.keys(out).some((k) => out[k] && out[k].logged_in);
+  $("login-open").textContent = any ? "我的" : "登录";
+  return out;
+}
+function loggedIn(src) {
+  const s = state.login[src];
+  return !!(s && s.logged_in);
+}
+function loginWho(src) {
+  const s = state.login[src] || {};
+  return s.uname || s.uin || "";
+}
+
+async function openMyLists(src) {
+  src = src || state.source;
+  closeLogin();
+  const view = state.view = { type: "mylists", src: src };
+  notifyBack();
+  $("view").innerHTML = '<div class="loading">加载中…</div>';
+  const j = await api("/api/mylists?source=" + encodeURIComponent(src));
+  if (state.view !== view) return;
+  const lists = (j.playlists || []).map((p) => ({
+    title: p.name || p.title || "歌单",
+    cover: p.cover || "",
+    ref: p.id,
+    action: "playlist",
+  }));
+  if (!lists.length) {
+    $("view").innerHTML = '<div class="loading">' + esc(j.error || "没有歌单") + "</div>";
+    return;
+  }
+  renderHome([["我的歌单 · " + (SRC_NAME[src] || src), lists]]);
+}
+
+async function openHistory(src) {
+  closeLogin();
+  const view = state.view = { type: "history", src: src };
+  notifyBack();
+  $("view").innerHTML = '<div class="loading">加载中…</div>';
+  const path = src === "bilibili" ? "/api/bili/history" : "/api/douyin/history";
+  const j = await api(path + "?limit=30");
+  if (state.view !== view) return;
+  const songs = j.songs || [];
+  if (!songs.length) {
+    $("view").innerHTML = '<div class="loading">' + esc(j.error || "暂无播放历史") + "</div>";
+    return;
+  }
+  renderList(songs, (SRC_NAME[src] || src) + " · 播放历史");
+}
+
+function loginRowHtml(key, name) {
+  const ok = loggedIn(key);
+  const who = loginWho(key);
+  const right = ok ? ("已登录" + (who ? " · " + esc(who) : "")) : "未登录 ›";
+  return '<button class="login-row" data-src="' + key + '">' +
+    '<span class="login-left">' + esc(name) + (ok ? '<i class="on-dot"></i>' : "") + "</span>" +
+    '<span class="login-state' + (ok ? " on" : "") + '">' + right + "</span></button>";
+}
+
 function renderLoginList() {
   stopQr();
-  $("login-body").innerHTML =
-    Object.keys(QR_LOGIN).map((k) =>
-      '<button class="login-row" data-src="' + k + '">' + esc(QR_LOGIN[k].name) +
-      " <span>网页 / 扫码 ›</span></button>").join("") +
-    LOGIN_WEB_ONLY.map(([k, n]) =>
-      '<button class="login-row" data-src="' + k + '">' + esc(n) +
-      " <span>网页登录 ›</span></button>").join("") +
-    '<p class="login-note">扫码被风控时请用网页登录：在官方页面输入账号密码，成功后自动保存登录态。</p>';
+  let html = Object.keys(QR_LOGIN).map((k) => loginRowHtml(k, QR_LOGIN[k].name)).join("") +
+    LOGIN_WEB_ONLY.map(([k, n]) => loginRowHtml(k, n)).join("");
+  ["netease", "qq"].forEach((k) => {
+    if (loggedIn(k)) {
+      html += '<button class="login-row" data-act="mylists" data-src="' + k + '">' +
+        '<span class="login-left">我的歌单 · ' + esc(SRC_NAME[k]) + '</span>' +
+        '<span class="login-state on">查看 ›</span></button>';
+    }
+  });
+  ["bilibili", "douyin"].forEach((k) => {
+    if (loggedIn(k)) {
+      html += '<button class="login-row" data-act="history" data-src="' + k + '">' +
+        '<span class="login-left">' + esc(SRC_NAME[k]) + ' 播放历史</span>' +
+        '<span class="login-state on">查看 ›</span></button>';
+    }
+  });
+  html += '<p class="login-note">扫码被风控时请用网页登录：在官方页面输入账号密码，成功后自动保存登录态。</p>';
+  $("login-body").innerHTML = html;
 }
 
 function renderLoginSource(key) {
@@ -542,6 +756,7 @@ function loadQrImage(cfg) {
       $("qr-mask").textContent = "登录成功 ✓";
       $("qr-tip").textContent = "已登录";
       toast(cfg.name + " 登录成功");
+      refreshLoginStatus();
       setTimeout(() => {
         $("loginpage").classList.add("hidden");
         notifyBack();
@@ -584,15 +799,20 @@ function closeLogin() {
   $("loginpage").classList.add("hidden");
   notifyBack();
 }
-$("login-open").addEventListener("click", () => {
+$("login-open").addEventListener("click", async () => {
   $("loginpage").classList.remove("hidden");
-  renderLoginList();
   notifyBack();
+  $("login-body").innerHTML = '<div class="loading">读取登录状态…</div>';
+  await refreshLoginStatus();
+  renderLoginList();
 });
 $("login-close").addEventListener("click", closeLogin);
 $("login-body").addEventListener("click", (e) => {
   const row = e.target.closest(".login-row");
-  if (row && row.dataset.src) renderLoginSource(row.dataset.src);
+  if (!row) return;
+  if (row.dataset.act === "mylists") { openMyLists(row.dataset.src); return; }
+  if (row.dataset.act === "history") { openHistory(row.dataset.src); return; }
+  if (row.dataset.src) renderLoginSource(row.dataset.src);
 });
 $("video-back").addEventListener("click", closeVideo);
 $("pcover").addEventListener("click", () => {
@@ -609,7 +829,9 @@ $("pcover").addEventListener("click", () => {
 window.mhLoginDone = function () {
   closeLogin();
   toast("登录成功");
+  refreshLoginStatus();
   loadHome();
 };
 renderSources();
+refreshLoginStatus();
 loadHome();
