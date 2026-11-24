@@ -2177,7 +2177,15 @@ class Handler(BaseHTTPRequestHandler):
                                     "activities": [], "error": "该音源暂无首页"})
         try:
             limit = max(1, min(int(g("limit", "30") or 30), 50))
-            return self._send(200, fn(limit=limit))
+            kwargs = {"limit": limit}
+            # 仅对支持跳缓存的音源(网易云/QQ)透传 nocache
+            try:
+                params = inspect.signature(fn).parameters
+            except (TypeError, ValueError):
+                params = {}
+            if "nocache" in params:
+                kwargs["nocache"] = g("nocache") == "1"
+            return self._send(200, fn(**kwargs))
         except Exception as e:
             return self._send(200, {"quick": [], "playlists": [], "charts": [],
                                     "activities": [], "error": "获取首页失败: %s" % e})

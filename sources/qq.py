@@ -245,13 +245,14 @@ def _home_get(url, headers=None, raw=False):
     return j
 
 
-def _cached_home_part(key, fn, allow_empty=True):
+def _cached_home_part(key, fn, allow_empty=True, nocache=False):
     """首页片段短缓存: 避免切音源/刷新时重复请求; 空结果可下次重试."""
     now = time.monotonic()
-    with _HOME_CACHE_LOCK:
-        hit = _HOME_CACHE.get(key)
-        if hit and hit[0] > now:
-            return hit[1]
+    if not nocache:
+        with _HOME_CACHE_LOCK:
+            hit = _HOME_CACHE.get(key)
+            if hit and hit[0] > now:
+                return hit[1]
     val = fn()
     if allow_empty or val:
         with _HOME_CACHE_LOCK:
@@ -441,18 +442,18 @@ def _home_new_songs(limit=30):
     return out
 
 
-def home(limit=30):
+def home(limit=30, nocache=False):
     """QQ 首页: 各区块并行抓取, 单次请求短超时且总预算内返回."""
     token = _HOME_DEADLINE.set(time.monotonic() + _HOME_BUDGET)
     try:
         def task_playlists():
             return _cached_home_part("playlists", lambda: _home_public_playlists(limit=12),
-                                     allow_empty=False)
+                                     allow_empty=False, nocache=nocache)
 
         def task_charts():
             return _cached_home_part("charts", lambda: [
                 _home_toplist_info(tid) for tid in _HOME_TOPLIST_META],
-                                     allow_empty=False)
+                                     allow_empty=False, nocache=nocache)
 
         def task_activities():
             def load():
@@ -467,7 +468,7 @@ def home(limit=30):
                      "cover": "https://y.qq.com/music/common/upload/ocs/a784ddef0b4632a2c9fa822a16f5a6a6.jpg?max_age=2592000",
                      "sub": "QQ音乐 · 精选活动", "tag": "精选活动", "action": "album"},
                 ]
-            return _cached_home_part("activities", load, allow_empty=False)
+            return _cached_home_part("activities", load, allow_empty=False, nocache=nocache)
 
         tasks = [task_playlists, task_charts, task_activities]
         results = _parallel_map(lambda fn: fn(), tasks, limit=3)

@@ -305,13 +305,14 @@ def _home_get(url, cookie=None):
         return {}
 
 
-def _cached_home_part(key, fn, allow_empty=False):
+def _cached_home_part(key, fn, allow_empty=False, nocache=False):
     """首页片段短缓存: 新鲜值直接返回; 请求失败时允许用过期值兜底."""
     now = time.monotonic()
-    with _HOME_CACHE_LOCK:
-        hit = _HOME_CACHE.get(key)
-        if hit and hit[0] > now:
-            return hit[1]
+    if not nocache:
+        with _HOME_CACHE_LOCK:
+            hit = _HOME_CACHE.get(key)
+            if hit and hit[0] > now:
+                return hit[1]
     try:
         val = fn()
     except Exception:
@@ -388,7 +389,7 @@ def recommend(limit=30, mode=None, topid=None, albumid=None):
     return {"songs": out, "has_more": False}
 
 
-def home(limit=30):
+def home(limit=30, nocache=False):
     """网易云首页: 并行抓取各区块, 单次请求短超时且有总预算."""
     ck = _cookie_str()
     cache_key = _account_key(ck) or "anon"
@@ -402,7 +403,8 @@ def home(limit=30):
     keys = list(urls)
     results = _home_parallel([
         lambda k=k: _cached_home_part(cache_key + ":" + k,
-                                      lambda: _home_get(urls[k], ck))
+                                      lambda: _home_get(urls[k], ck),
+                                      nocache=nocache)
         for k in keys
     ])
     data = dict(zip(keys, results))

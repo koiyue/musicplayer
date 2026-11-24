@@ -17,6 +17,7 @@ const state = {
   homeCards: [],
   searchSongs: [],
   login: {},          // src -> status 对象
+  dailySongs: [],     // 首页每日推荐列表
 };
 
 const audio = $("audio");
@@ -87,45 +88,73 @@ function rowHtml(s, i) {
     '<div class="s">' + esc((s.artist || "未知") + " · " + (SRC_NAME[s.source] || s.source || "")) + "</div></div>" +
     '<div class="dur">' + (s.duration ? fmt(s.duration) : "") + "</div></div>";
 }
-function renderList(songs, title) {
+function renderList(songs, title, opts) {
   state.queue = songs || [];
   state.index = -1;
   if (!songs || !songs.length) {
     $("view").innerHTML = '<div class="loading">没有内容</div>';
     return;
   }
+  const count = opts && opts.noCount ? "" : "<span>" + songs.length + " 首</span>";
   $("view").innerHTML = '<section class="section"><div class="sec-head"><h3>' +
-    esc(title || "播放列表") + "</h3><span>" + songs.length + " 首</span></div>" +
+    esc(title || "播放列表") + "</h3>" + count + "</div>" +
     '<div class="list">' + songs.map(rowHtml).join("") + "</div></section>";
 }
 
 /* ---------------- 首页 ---------------- */
-async function loadHome() {
-  const view = state.view = { type: "home", src: state.source };
+async function loadHome(nocache) {
+  const src = state.source;
+  const view = state.view = { type: "home", src: src };
   notifyBack();
   $("view").innerHTML = '<div class="loading">加载中…</div>';
   try {
-    const j = await api("/api/home?source=" + encodeURIComponent(state.source) + "&limit=30");
+    const homeReq = api("/api/home?source=" + encodeURIComponent(src) + "&limit=30" +
+      (nocache ? "&nocache=1" : ""));
+    // 网易云/QQ 默认展示每日推荐(歌单外的歌曲列表)
+    const dailyReq = (src === "netease" || src === "qq") ? fetchDaily(src) : Promise.resolve([]);
+    const [j, daily] = await Promise.all([homeReq, dailyReq]);
     if (state.view !== view) return;
     if (Array.isArray(j.songs) && j.songs.length) {
-      renderList(j.songs, (SRC_NAME[state.source] || state.source) + " · 推荐");
+      renderList(j.songs, (SRC_NAME[src] || src) + " · 推荐");
       return;
     }
     const sections = [];
-    if (j.playlists && j.playlists.length) sections.push(["推荐歌单", j.playlists]);
+    if (j.playlists && j.playlists.length) sections.push(["推荐歌单", j.playlists, "cards", true]);
     if (j.charts && j.charts.length) sections.push(["排行榜", j.charts]);
+    if (daily.length) sections.push(["每日推荐", daily, "rows"]);
     if (sections.length) { renderHome(sections); return; }
     await loadRecommend({}, "推荐");
   } catch (e) {
     $("view").innerHTML = '<div class="loading">加载失败：' + esc(e) + "</div>";
   }
 }
+
+async function fetchDaily(src) {
+  try {
+    const mode = src === "netease" ? "&mode=daily" : "";
+    const j = await api("/api/recommend?source=" + encodeURIComponent(src) + mode + "&limit=50");
+    return (j.songs || []).slice(0, 50);
+  } catch (e) {
+    return [];
+  }
+}
+
 function renderHome(sections) {
   state.homeCards = sections;
+  state.dailySongs = [];
   $("view").innerHTML = sections.map((sec, si) => {
-    const cards = sec[1];
-    return '<section class="section"><div class="sec-head"><h3>' + esc(sec[0]) +
-      "</h3><span>" + cards.length + "</span></div><div class=\"grid\">" +
+    const title = sec[0], cards = sec[1] || [], kind = sec[2] || "cards", refresh = !!sec[3];
+    if (kind === "rows") {
+      state.dailySongs = cards;
+      return '<section class="section"><div class="sec-head"><h3>' + esc(title) + "</h3></div>" +
+        '<div class="list" data-list="daily">' + cards.map(rowHtml).join("") + "</div></section>";
+    }
+    const right = refresh
+      ? '<div class="sec-right"><span>' + cards.length + '</span>' +
+        '<button class="sec-refresh" type="button" data-refresh="1">↻ 刷新</button></div>'
+      : "<span>" + cards.length + "</span>";
+    return '<section class="section"><div class="sec-head"><h3>' + esc(title) +
+      "</h3>" + right + '</div><div class="grid">' +
       cards.map((c, ci) => {
         const cov = coverUrl(c.cover);
         return '<div class="card" data-si="' + si + '" data-ci="' + ci + '">' +
@@ -178,17 +207,20 @@ async function loadRecommend(opts, title) {
   const q = new URLSearchParams(params);
   const j = await api("/api/recommend?" + q.toString());
   if (state.view !== view) return;
-  renderList(j.songs || [], title || "推荐");
+  // B站推荐不显示条数统计
+  renderList(j.songs || [], title || "推荐", { noCount: src === "bilibili" });
 }
 
 function canPullMore() {
   return !!(state.view && state.view.type === "recommend" && state.view.src === "bilibili");
 }
 
-// B站推荐: 下拉加载下一页并追加
+// B站推荐: 下拉加载下一页, 新内容排在最上方, 最多 100 条
 async function loadMoreRecommend() {
   const v = state.view;
   if (!canPullMore()) return;
+  const total = state.queue.length;
+  if (total >= 100) { toast("最多显示 100 条推荐"); return; }
   v.pn += 1;
   const q = new URLSearchParams({ source: v.src, limit: 20, pn: v.pn });
   if (v.mode) q.set("mode", v.mode);
@@ -199,12 +231,14 @@ async function loadMoreRecommend() {
   }
   if (state.view !== v) return;
   const seen = new Set(state.queue.map(songKey));
-  const fresh = (j.songs || []).filter((s) => !seen.has(songKey(s)));
+  const fresh = (j.songs || []).filter((s) => !seen.has(songKey(s))).slice(0, 100 - total);
   if (!fresh.length) { toast("没有更多推荐了"); return; }
-  const start = state.queue.length;
-  state.queue = state.queue.concat(fresh);
+  const oldIndex = state.index;
+  state.queue = fresh.concat(state.queue);
+  if (oldIndex >= 0) state.index = oldIndex + fresh.length;
   const list = document.querySelector("#view .list");
-  if (list) list.insertAdjacentHTML("beforeend", fresh.map((s, k) => rowHtml(s, start + k)).join(""));
+  if (list) list.innerHTML = state.queue.map(rowHtml).join("");
+  markRows();
   toast("已加载 " + fresh.length + " 条推荐");
 }
 
@@ -427,6 +461,7 @@ $("sources").addEventListener("click", (e) => {
 
 $("view").addEventListener("click", (e) => {
   if (consumeSuppress()) return;
+  if (e.target.closest("[data-refresh]")) { loadHome(true); return; }
   const card = e.target.closest(".card");
   if (card) {
     const sec = state.homeCards[Number(card.dataset.si)];
@@ -434,7 +469,15 @@ $("view").addEventListener("click", (e) => {
     return;
   }
   const row = e.target.closest(".row");
-  if (row && row.dataset.i != null) playAt(Number(row.dataset.i));
+  if (!row || row.dataset.i == null) return;
+  const listEl = row.closest(".list");
+  if (listEl && listEl.dataset.list === "daily") {
+    // 首页「每日推荐」列表: 单独作为播放队列, 不影响卡片区
+    state.queue = (state.dailySongs || []).slice();
+    playAt(Number(row.dataset.i));
+    return;
+  }
+  playAt(Number(row.dataset.i));
 });
 
 $("search-open").addEventListener("click", () => {
@@ -512,8 +555,15 @@ bindLongPress($("view"), (el) => {
     return card ? { card: card } : null;
   }
   const i = Number(el.dataset.i);
-  const s = state.queue[i];
-  return s ? { song: s, play: () => playAt(i) } : null;
+  const listEl = el.closest(".list");
+  const isDaily = !!(listEl && listEl.dataset.list === "daily");
+  const arr = isDaily ? (state.dailySongs || []) : state.queue;
+  const s = arr[i];
+  if (!s) return null;
+  return { song: s, play: () => {
+    if (isDaily) state.queue = (state.dailySongs || []).slice();
+    playAt(i);
+  } };
 });
 bindLongPress($("sresults"), (el) => {
   const i = Number(el.dataset.i);
@@ -535,14 +585,14 @@ bindLongPress($("queue-list"), (el) => {
 /* ---------------- 下拉加载更多 / 刷新 ---------------- */
 let pullFrom = null, pulling = false;
 document.addEventListener("touchstart", (e) => {
-  if (e.touches.length !== 1 || hasOpenLayer()) { pullFrom = null; return; }
+  if (e.touches.length !== 1 || hasOpenLayer() || !canPullMore()) { pullFrom = null; return; }
   const t = e.touches[0];
   const el = document.scrollingElement || document.documentElement;
   pullFrom = { x: t.clientX, y: t.clientY, top: el.scrollTop };
 }, { passive: true });
 document.addEventListener("touchmove", (e) => {
   if (!pullFrom) return;
-  if (pullFrom.top > 0) { pullFrom = null; return; }
+  if (pullFrom.top > 0 || !canPullMore()) { pullFrom = null; return; }
   const t = e.touches[0];
   const dy = t.clientY - pullFrom.y;
   const dx = Math.abs(t.clientX - pullFrom.x);
@@ -550,7 +600,7 @@ document.addEventListener("touchmove", (e) => {
     if (!pulling) {
       pulling = true;
       const h = $("pullhint");
-      h.textContent = canPullMore() ? "松开加载更多推荐" : "松开刷新";
+      h.textContent = "松开加载更多推荐";
       h.classList.remove("hidden");
     }
   }
@@ -561,11 +611,9 @@ document.addEventListener("touchend", async (e) => {
   if (!pulling) return;
   pulling = false;
   $("pullhint").classList.add("hidden");
-  if (!from) return;
+  if (!from || !canPullMore()) return;
   const dy = e.changedTouches[0].clientY - from.y;
-  if (dy < 70) return;
-  if (canPullMore()) await loadMoreRecommend();
-  else if (state.view && state.view.type === "home") loadHome();
+  if (dy >= 70) await loadMoreRecommend();
 }, { passive: true });
 document.addEventListener("touchcancel", () => {
   pullFrom = null;
