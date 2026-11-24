@@ -120,8 +120,8 @@ input, textarea { -webkit-user-select: text; user-select: text; }
   backdrop-filter: blur(12px);
 }
 #pbar { position: relative; height: 3px; background: rgba(255,255,255,.12); border-radius: 2px; margin: 0 -14px 8px; }
-/* 进度条很细, 上下各扩 12px 作为拖动命中区 */
-#pbar::before { content: ""; position: absolute; left: 0; right: 0; top: -12px; bottom: -12px; }
+/* 进度条很细, 上方扩 12px / 下方扩 6px 作为拖动命中区(下方让开时间文字) */
+#pbar::before { content: ""; position: absolute; left: 0; right: 0; top: -12px; bottom: -6px; }
 #pfill { height: 100%; width: 0; background: var(--acc); border-radius: 2px; }
 .prow { display: flex; align-items: center; gap: 10px; }
 #pcover { width: 48px; height: 48px; border-radius: 10px; background: #2a2a3a center/cover no-repeat;
@@ -136,7 +136,7 @@ input, textarea { -webkit-user-select: text; user-select: text; }
 }
 #player button:active { background: rgba(255,255,255,.1); }
 #ptoggle { font-size: 20px; color: var(--acc); }
-.ptime { display: flex; justify-content: space-between; color: var(--sub); font-size: 11px; margin-top: 6px; }
+.ptime { display: flex; justify-content: space-between; color: var(--sub); font-size: 11px; margin: 0 0 6px; }
 
 .page {
   position: fixed; inset: 0; z-index: 40; background: var(--bg);
