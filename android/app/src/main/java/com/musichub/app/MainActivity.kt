@@ -1,10 +1,21 @@
 package com.musichub.app
 
+import android.Manifest
 import android.annotation.SuppressLint
 import android.app.Activity
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.PendingIntent
+import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.graphics.Color
+import android.media.MediaMetadata
+import android.media.session.MediaSession
+import android.media.session.PlaybackState
 import android.net.Uri
+import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
@@ -44,6 +55,11 @@ class MainActivity : Activity() {
     @Volatile
     private var backAvailable = false
 
+    // 系统媒体通知 / 锁屏播放信息
+    private var mediaSession: MediaSession? = null
+    private var mediaTitle = ""
+    private var mediaArtist = ""
+
     // 网页登录浮层(账号密码), 复用系统 WebView 的 CookieManager
     private var loginOverlay: LinearLayout? = null
     private var loginWebView: WebView? = null
@@ -73,6 +89,17 @@ class MainActivity : Activity() {
                 t.transliterate(text)
             } catch (_: Throwable) {
                 ""
+            }
+        }
+
+        /** 更新系统通知/锁屏上的播放信息(前端在播放、暂停、切歌、进度变化时调用). */
+        @JavascriptInterface
+        fun updateMedia(title: String, artist: String, playing: Boolean,
+                        positionMs: Double, durationMs: Double) {
+            runOnUiThread {
+                mediaTitle = title
+                mediaArtist = artist
+                publishMedia(playing, positionMs.toLong(), durationMs.toLong())
             }
         }
     }
@@ -105,6 +132,15 @@ class MainActivity : Activity() {
         }
 
         webView.addJavascriptInterface(JsBridge(), "MHNative")
+
+        setupMediaSession()
+        // Android 13+ 通知需要运行时授权
+        if (Build.VERSION.SDK_INT >= 33 &&
+            checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) !=
+            PackageManager.PERMISSION_GRANTED
+        ) {
+            requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), REQ_NOTIFY)
+        }
 
         webView.webViewClient = object : WebViewClient() {
             override fun shouldOverrideUrlLoading(
@@ -393,6 +429,109 @@ class MainActivity : Activity() {
         webView.visibility = View.VISIBLE
     }
 
+    // ---------- 系统媒体通知 / 锁屏控制 ----------
+
+    /** 在 WebView 中执行一段 JS(主线程) */
+    private fun js(code: String) {
+        runOnUiThread {
+            try { webView.evaluateJavascript(code, null) } catch (_: Throwable) {}
+        }
+    }
+
+    private fun setupMediaSession() {
+        val s = MediaSession(this, "MusicHub")
+        s.setCallback(object : MediaSession.Callback() {
+            override fun onPlay() = js("window.mhPlay && window.mhPlay()")
+            override fun onPause() = js("window.mhPause && window.mhPause()")
+            override fun onSkipToNext() = js("window.mhNext && window.mhNext()")
+            override fun onSkipToPrevious() = js("window.mhPrev && window.mhPrev()")
+            override fun onSeekTo(pos: Long) =
+                js("window.mhSeekAt && window.mhSeekAt(${pos / 1000.0})")
+        })
+        s.isActive = true
+        mediaSession = s
+    }
+
+    private fun actionIntent(action: String, code: Int): PendingIntent {
+        val i = Intent(this, MainActivity::class.java).setAction(action)
+        var flags = PendingIntent.FLAG_UPDATE_CURRENT
+        if (Build.VERSION.SDK_INT >= 23) flags = flags or PendingIntent.FLAG_IMMUTABLE
+        return PendingIntent.getActivity(this, code, i, flags)
+    }
+
+    private fun canNotify(): Boolean =
+        Build.VERSION.SDK_INT < 33 ||
+            checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) ==
+            PackageManager.PERMISSION_GRANTED
+
+    private fun ensureChannel(nm: NotificationManager) {
+        if (Build.VERSION.SDK_INT >= 26) {
+            val ch = NotificationChannel(CHANNEL_ID, "播放状态", NotificationManager.IMPORTANCE_LOW)
+            ch.setShowBadge(false)
+            nm.createNotificationChannel(ch)
+        }
+    }
+
+    /** 用 MediaSession + MediaStyle 通知展示当前歌曲, 并接管通知栏/锁屏的播放控制 */
+    private fun publishMedia(playing: Boolean, positionMs: Long, durationMs: Long) {
+        if (!canNotify()) return
+        val s = mediaSession ?: return
+        val title = mediaTitle.ifBlank { "未在播放" }
+        val artist = mediaArtist.ifBlank { "MusicHub" }
+        s.setMetadata(MediaMetadata.Builder()
+            .putString(MediaMetadata.METADATA_KEY_TITLE, title)
+            .putString(MediaMetadata.METADATA_KEY_ARTIST, artist)
+            .putString(MediaMetadata.METADATA_KEY_ALBUM, "MusicHub")
+            .putLong(MediaMetadata.METADATA_KEY_DURATION, durationMs)
+            .build())
+        val actions = PlaybackState.ACTION_PLAY or PlaybackState.ACTION_PAUSE or
+            PlaybackState.ACTION_PLAY_PAUSE or PlaybackState.ACTION_SKIP_TO_NEXT or
+            PlaybackState.ACTION_SKIP_TO_PREVIOUS or PlaybackState.ACTION_SEEK_TO
+        s.setPlaybackState(PlaybackState.Builder()
+            .setActions(actions)
+            .setState(
+                if (playing) PlaybackState.STATE_PLAYING else PlaybackState.STATE_PAUSED,
+                positionMs, if (playing) 1f else 0f)
+            .build())
+
+        val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        ensureChannel(nm)
+        val toggleIcon = if (playing) android.R.drawable.ic_media_pause
+        else android.R.drawable.ic_media_play
+        @Suppress("DEPRECATION")
+        val nb = if (Build.VERSION.SDK_INT >= 26) Notification.Builder(this, CHANNEL_ID)
+        else Notification.Builder(this)
+        val b = nb
+            .setSmallIcon(android.R.drawable.ic_media_play)
+            .setContentTitle(title)
+            .setContentText(artist)
+            .setContentIntent(actionIntent(ACT_OPEN, 1))
+            .setOngoing(playing)
+            .setOnlyAlertOnce(true)
+            .setShowWhen(false)
+            .setVisibility(Notification.VISIBILITY_PUBLIC)
+            .addAction(Notification.Action.Builder(
+                android.R.drawable.ic_media_previous, "上一首", actionIntent(ACT_PREV, 2)).build())
+            .addAction(Notification.Action.Builder(
+                toggleIcon, if (playing) "暂停" else "播放", actionIntent(ACT_TOGGLE, 3)).build())
+            .addAction(Notification.Action.Builder(
+                android.R.drawable.ic_media_next, "下一首", actionIntent(ACT_NEXT, 4)).build())
+            .setStyle(Notification.MediaStyle()
+                .setMediaSession(s.sessionToken)
+                .setShowActionsInCompactView(0, 1, 2))
+        try { nm.notify(NOTIFY_ID, b.build()) } catch (_: Throwable) {}
+    }
+
+    override fun onNewIntent(intent: Intent?) {
+        super.onNewIntent(intent)
+        when (intent?.action) {
+            ACT_PREV -> js("window.mhPrev && window.mhPrev()")
+            ACT_NEXT -> js("window.mhNext && window.mhNext()")
+            ACT_TOGGLE -> js("window.mhTogglePlay && window.mhTogglePlay()")
+            else -> {}
+        }
+    }
+
     @Deprecated("Deprecated in Java")
     override fun onBackPressed() {
         if (customView != null) {
@@ -413,6 +552,12 @@ class MainActivity : Activity() {
 
     override fun onDestroy() {
         closeWebLogin()
+        try {
+            (getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager)
+                .cancel(NOTIFY_ID)
+        } catch (_: Throwable) {}
+        mediaSession?.release()
+        mediaSession = null
         webView.destroy()
         super.onDestroy()
     }
@@ -426,6 +571,13 @@ class MainActivity : Activity() {
 
     companion object {
         private const val REQ_FILE = 1001
+        private const val REQ_NOTIFY = 1002
+        private const val CHANNEL_ID = "musichub_media"
+        private const val NOTIFY_ID = 2001
+        private const val ACT_OPEN = "com.musichub.app.OPEN"
+        private const val ACT_PREV = "com.musichub.app.PREV"
+        private const val ACT_NEXT = "com.musichub.app.NEXT"
+        private const val ACT_TOGGLE = "com.musichub.app.TOGGLE"
 
         // android.icu 的 Any-Latin 覆盖汉字->拼音、假名->罗马音、谚文->罗马字;
         // Latin-ASCII 去掉拼音声调符号, 便于跟唱

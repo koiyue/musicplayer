@@ -335,6 +335,7 @@ function updatePlayerBar(s) {
   const cov = coverUrl(s.cover);
   const box = $("pcover");
   box.innerHTML = cov ? '<img src="' + esc(cov) + '" alt="">' : "♪";
+  pushMedia(true);
 }
 function setToggleIcon() {
   $("ptoggle").textContent = audio.paused ? "▶" : "❚❚";
@@ -376,6 +377,7 @@ function restorePlayerState() {
   $("ptdur").textContent = fmt(dur);
   if (dur > 0) $("pfill").style.width = Math.min(100, (t / dur) * 100) + "%";
   audio.src = proxyUrl(s);
+  pushMedia(true);
 }
 audio.addEventListener("loadedmetadata", () => {
   if (!resumePending) return;
@@ -388,6 +390,44 @@ window.addEventListener("pagehide", () => savePlayerState(true));
 document.addEventListener("visibilitychange", () => {
   if (document.hidden) savePlayerState(true);
 });
+
+/* ---------------- 系统通知 / 锁屏播放信息 ---------------- */
+let mediaPushedAt = 0;
+function mediaBridge() {
+  const n = window.MHNative;
+  return n && typeof n.updateMedia === "function" ? n : null;
+}
+function pushMedia(force) {
+  const n = mediaBridge();
+  if (!n) return;
+  const now = Date.now();
+  if (!force && now - mediaPushedAt < 1000) return;
+  mediaPushedAt = now;
+  const s = state.index >= 0 ? state.queue[state.index] : null;
+  try {
+    n.updateMedia(
+      s ? (s.title || "未命名") : "未在播放",
+      s ? ((s.artist || "未知") + " · " + (SRC_NAME[s.source] || s.source || "")) : "",
+      !audio.paused,
+      Math.round((audio.currentTime || 0) * 1000),
+      Math.round((audio.duration || 0) * 1000));
+  } catch (e) {}
+}
+// 通知栏 / 锁屏控制回调(原生 MediaSession 与通知按钮会调用)
+window.mhPlay = () => { if (audio.src) audio.play().catch(() => {}); };
+window.mhPause = () => { if (audio.src) audio.pause(); };
+window.mhTogglePlay = () => {
+  if (!audio.src) return;
+  if (audio.paused) audio.play().catch(() => {}); else audio.pause();
+};
+window.mhNext = () => playStep(1);
+window.mhPrev = () => playStep(-1);
+window.mhSeekAt = (sec) => {
+  const d = audio.duration || 0;
+  if (!d) return;
+  const t = Math.min(Math.max(0, Number(sec) || 0), Math.max(0, d - 0.3));
+  try { audio.currentTime = t; } catch (e) {}
+};
 function markRows() {
   const cur = state.index >= 0 ? state.queue[state.index] : null;
   const key = cur ? songKey(cur) : "";
@@ -1093,8 +1133,8 @@ $("pbar").addEventListener("click", (e) => {
   seekToX(e.clientX);
 });
 
-audio.addEventListener("play", () => { state.playing = true; setToggleIcon(); });
-audio.addEventListener("pause", () => { state.playing = false; setToggleIcon(); savePlayerState(true); });
+audio.addEventListener("play", () => { state.playing = true; setToggleIcon(); pushMedia(true); });
+audio.addEventListener("pause", () => { state.playing = false; setToggleIcon(); savePlayerState(true); pushMedia(true); });
 audio.addEventListener("timeupdate", () => {
   const d = audio.duration || 0, t = audio.currentTime || 0;
   $("pfill").style.width = (d ? Math.min(1, t / d) * 100 : 0) + "%";
@@ -1102,6 +1142,7 @@ audio.addEventListener("timeupdate", () => {
   $("ptdur").textContent = fmt(d);
   syncKaraoke();
   savePlayerState();
+  pushMedia();
 });
 audio.addEventListener("ended", () => playStep(1));
 audio.addEventListener("error", () => {
@@ -1692,8 +1733,11 @@ function openNowPlaying() {
   if (isVideoSong(s)) openVideo(s);
   else openKaraoke(s);
 }
-$("pcover").addEventListener("click", openNowPlaying);
-document.querySelector("#player .pmeta").addEventListener("click", openNowPlaying);
+// 点击播放器空白处、封面、歌曲信息都进入歌词页 / 视频画面(按钮与进度条除外)
+$("player").addEventListener("click", (e) => {
+  if (e.target.closest("button") || e.target.closest("#pbar")) return;
+  openNowPlaying();
+});
 
 /* ---------------- 启动 ---------------- */
 // 页面滚动位置: 禁用横向滚动后滚动容器可能是 body, 不能只看 documentElement
