@@ -266,6 +266,13 @@ body { padding-bottom: calc(var(--player-h) + env(safe-area-inset-bottom)); }
 }
 .menu-item.cancel { color: var(--sub); border-bottom: none; margin-top: 6px; }
 
+.input-body { padding: 0 16px calc(16px + env(safe-area-inset-bottom)); }
+#input-field {
+  width: 100%; background: var(--bg); border: 1px solid var(--line);
+  border-radius: 12px; color: var(--text); padding: 12px 14px;
+  font-size: 15px; outline: none;
+}
+
 /* ---------- 下拉刷新提示 ---------- */
 #pullhint {
   position: fixed; left: 50%; top: calc(58px + env(safe-area-inset-top));
