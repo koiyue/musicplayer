@@ -56,6 +56,17 @@ body { padding-bottom: calc(var(--player-h) + env(safe-area-inset-bottom)); }
 }
 .chip.on { color: #fff; border-color: var(--acc); background: rgba(251,114,153,.16); }
 
+#tabs { display: flex; gap: 18px; padding: 0 16px 8px; }
+.tab {
+  position: relative; border: none; background: none; padding: 4px 0 8px;
+  color: var(--sub); font-size: 15px;
+}
+.tab.on { color: var(--text); font-weight: 600; }
+.tab.on::after {
+  content: ""; position: absolute; left: 0; right: 0; bottom: 2px;
+  height: 2px; border-radius: 2px; background: var(--acc);
+}
+
 #view { padding: 0 16px 18px; }
 
 .loading { color: var(--sub); text-align: center; padding: 40px 0; font-size: 14px; }

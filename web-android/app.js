@@ -17,6 +17,7 @@ const state = {
   homeCards: [],
   searchSongs: [],
   login: {},          // src -> status 对象
+  tab: "home",        // home | mylists | history
 };
 
 const audio = $("audio");
@@ -103,6 +104,8 @@ function renderList(songs, title, opts) {
 /* ---------------- 首页 ---------------- */
 async function loadHome(nocache) {
   const src = state.source;
+  state.tab = "home";
+  renderTabs();
   const view = state.view = { type: "home", src: src };
   notifyBack();
   $("view").innerHTML = '<div class="loading">加载中…</div>';
@@ -462,6 +465,39 @@ function renderSources() {
   if (on) on.scrollIntoView({ inline: "center", block: "nearest", behavior: "smooth" });
 }
 
+/* ---------------- 页签: 推荐 / 歌单 / 历史 ---------------- */
+function tabsFor(src) {
+  const tabs = [{ key: "home", label: "推荐" }];
+  if (src === "netease" || src === "qq") tabs.push({ key: "mylists", label: "歌单" });
+  if (src === "bilibili" || src === "douyin") tabs.push({ key: "history", label: "历史" });
+  return tabs;
+}
+function renderTabs() {
+  const tabs = tabsFor(state.source);
+  const el = $("tabs");
+  if (tabs.length < 2) {
+    el.classList.add("hidden");
+    el.innerHTML = "";
+    return;
+  }
+  el.classList.remove("hidden");
+  el.innerHTML = tabs.map((t) =>
+    '<button class="tab' + (t.key === (state.tab || "home") ? " on" : "") +
+    '" type="button" data-tab="' + t.key + '">' + esc(t.label) + "</button>").join("");
+}
+function switchTab(key) {
+  state.tab = key;
+  renderTabs();
+  if (key === "mylists") return loadMyListsView();
+  if (key === "history") return loadHistoryView();
+  return loadHome();
+}
+$("tabs").addEventListener("click", (e) => {
+  const b = e.target.closest(".tab");
+  if (!b || !b.dataset.tab || b.dataset.tab === state.tab) return;
+  switchTab(b.dataset.tab);
+});
+
 $("sources").addEventListener("click", (e) => {
   const b = e.target.closest(".chip");
   if (!b) return;
@@ -579,18 +615,7 @@ bindLongPress($("queue-list"), (el) => {
   return s ? { song: s, play: () => playAt(i) } : null;
 });
 
-/* ---------------- 左右滑动: 切换音源 / 返回首页 ---------------- */
-function switchSource(step) {
-  const n = SRC_ORDER.length;
-  const i = SRC_ORDER.indexOf(state.source);
-  const next = SRC_ORDER[(i + step + n) % n];
-  if (!next || next === state.source) return;
-  state.source = next;
-  renderSources();
-  toast(SRC_NAME[next] || next, 900);
-  loadHome();
-}
-
+/* ---------------- 左右滑动: 切换页签(推荐/歌单/历史) ---------------- */
 let swipeFrom = null;
 $("view").addEventListener("touchstart", (e) => {
   if (e.touches.length !== 1 || hasOpenLayer()) { swipeFrom = null; return; }
@@ -614,14 +639,13 @@ $("view").addEventListener("touchend", (e) => {
   const dy = Math.abs(t.clientY - s.y);
   if (Date.now() - s.at > 800) return;
   if (Math.abs(dx) < 80 || dy > Math.abs(dx) * 0.8) return;
-  const v = state.view || {};
-  if (v.type && v.type !== "home") {
-    // 歌单/历史等页面: 右滑返回首页
-    if (dx > 0) loadHome();
-    return;
-  }
-  // 首页: 左滑下一个音源, 右滑上一个音源
-  switchSource(dx < 0 ? 1 : -1);
+  // 左滑下一个页签, 右滑上一个页签
+  const tabs = tabsFor(state.source);
+  if (tabs.length < 2) return;
+  const cur = tabs.findIndex((x) => x.key === (state.tab || "home"));
+  const next = cur + (dx < 0 ? 1 : -1);
+  if (next < 0 || next >= tabs.length) return;
+  switchTab(tabs[next].key);
 }, { passive: true });
 $("view").addEventListener("touchcancel", () => { swipeFrom = null; }, { passive: true });
 
@@ -857,11 +881,14 @@ function loginWho(src) {
   return s.uname || s.uin || "";
 }
 
-async function openMyLists(src) {
-  src = src || state.source;
-  closeLogin();
+async function loadMyListsView() {
+  const src = state.source;
   const view = state.view = { type: "mylists", src: src };
   notifyBack();
+  if (!loggedIn(src)) {
+    $("view").innerHTML = '<div class="loading">请先登录' + esc(SRC_NAME[src] || src) + "后查看歌单</div>";
+    return;
+  }
   $("view").innerHTML = '<div class="loading">加载中…</div>';
   const j = await api("/api/mylists?source=" + encodeURIComponent(src));
   if (state.view !== view) return;
@@ -878,10 +905,14 @@ async function openMyLists(src) {
   renderHome([["我的歌单 · " + (SRC_NAME[src] || src), lists]]);
 }
 
-async function openHistory(src) {
-  closeLogin();
+async function loadHistoryView() {
+  const src = state.source;
   const view = state.view = { type: "history", src: src };
   notifyBack();
+  if (!loggedIn(src)) {
+    $("view").innerHTML = '<div class="loading">请先登录' + esc(SRC_NAME[src] || src) + "后查看播放历史</div>";
+    return;
+  }
   $("view").innerHTML = '<div class="loading">加载中…</div>';
   const path = src === "bilibili" ? "/api/bili/history" : "/api/douyin/history";
   const j = await api(path + "?limit=30");
@@ -892,6 +923,25 @@ async function openHistory(src) {
     return;
   }
   renderList(songs, (SRC_NAME[src] || src) + " · 播放历史");
+}
+
+// 从登录页跳转: 切到对应音源并打开对应页签
+async function openMyLists(src) {
+  closeLogin();
+  if (src && src !== state.source) {
+    state.source = src;
+    renderSources();
+  }
+  switchTab("mylists");
+}
+
+async function openHistory(src) {
+  closeLogin();
+  if (src && src !== state.source) {
+    state.source = src;
+    renderSources();
+  }
+  switchTab("history");
 }
 
 function loginRowHtml(key, name) {
