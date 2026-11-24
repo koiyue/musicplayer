@@ -17,7 +17,10 @@ const state = {
   homeCards: [],
   searchSongs: [],
   login: {},          // src -> status 对象
-  tab: "home",        // home | mylists | history
+  tab: "home",        // 一级为音源时的二级页签: home | mylists | history
+  root: "src",        // src | mine
+  mineTab: "mine",    // mine | netease | qq | migu
+  mineLists: [],      // 本机歌单
 };
 
 const audio = $("audio");
@@ -177,7 +180,7 @@ function openDaily() {
 }
 
 async function openCard(c) {
-  const src = state.source;
+  const src = c.src || state.source;
   try {
     if (c.action === "playlist" && c.ref) {
       if (src === "douyin") {
@@ -185,23 +188,23 @@ async function openCard(c) {
         return loadRecommend({ mode: "hot" }, c.title || "推荐");
       }
       if (src === "qq" && c.topid) return loadRecommend({ topid: c.topid }, c.title || "排行榜");
-      return loadPlaylist(c.ref, c.title);
+      return loadPlaylistOf(src, c.ref, c.title);
     }
     if (c.topid) {
       return loadRecommend({ topid: c.topid, mode: src === "netease" ? "toplist" : "" }, c.title || "排行榜");
     }
-    if (c.ref) return loadPlaylist(c.ref, c.title);
+    if (c.ref) return loadPlaylistOf(src, c.ref, c.title);
     if (c.keyword) return doSearch(c.keyword);
   } catch (e) {
     toast("打开失败：" + e);
   }
 }
 
-async function loadPlaylist(ref, title) {
-  const view = state.view = { type: "playlist", src: state.source, ref: ref };
+async function loadPlaylistOf(src, ref, title) {
+  const view = state.view = { type: "playlist", src: src, ref: ref };
   notifyBack();
   $("view").innerHTML = '<div class="loading">加载中…</div>';
-  const j = await api("/api/playlist?source=" + encodeURIComponent(state.source) +
+  const j = await api("/api/playlist?source=" + encodeURIComponent(src) +
     "&ref=" + encodeURIComponent(ref));
   if (state.view !== view) return;
   renderList(j.songs || [], title || j.title || "歌单");
@@ -457,23 +460,43 @@ function bindLongPress(root, resolve) {
 }
 
 /* ---------------- 事件绑定 ---------------- */
+function chipHtml(key, label, on, act) {
+  return '<button class="chip' + (on ? " on" : "") + '" data-src="' + key + '"' +
+    (act ? ' data-act="' + act + '"' : "") + ">" + esc(label) + "</button>";
+}
 function renderSources() {
-  $("sources").innerHTML = SRC_ORDER.map((k) =>
-    '<button class="chip' + (k === state.source ? " on" : "") + '" data-src="' + k + '">' +
-    esc(SRC_NAME[k]) + "</button>").join("");
-  const on = $("sources").querySelector(".chip.on");
+  const el = $("sources");
+  if (state.root === "mine") {
+    el.innerHTML = chipHtml("mine", "我的", true) +
+      chipHtml("recommend", "推荐", false, "recommend");
+  } else {
+    el.innerHTML = chipHtml("mine", "我的", false, "mine") +
+      SRC_ORDER.map((k) => chipHtml(k, SRC_NAME[k], k === state.source)).join("");
+  }
+  const on = el.querySelector(".chip.on");
   if (on) on.scrollIntoView({ inline: "center", block: "nearest", behavior: "smooth" });
 }
 
 /* ---------------- 页签: 推荐 / 歌单 / 历史 ---------------- */
-function tabsFor(src) {
+function tabsFor() {
+  if (state.root === "mine") {
+    return [
+      { key: "mine", label: "我的歌单" },
+      { key: "netease", label: "网易云歌单" },
+      { key: "qq", label: "QQ音乐歌单" },
+      { key: "migu", label: "咪咕歌单" },
+    ];
+  }
   const tabs = [{ key: "home", label: "推荐" }];
-  if (src === "netease" || src === "qq") tabs.push({ key: "mylists", label: "歌单" });
-  if (src === "bilibili" || src === "douyin") tabs.push({ key: "history", label: "历史" });
+  if (state.source === "netease" || state.source === "qq") tabs.push({ key: "mylists", label: "歌单" });
+  if (state.source === "bilibili" || state.source === "douyin") tabs.push({ key: "history", label: "历史" });
   return tabs;
 }
+function activeTabKey() {
+  return state.root === "mine" ? (state.mineTab || "mine") : (state.tab || "home");
+}
 function renderTabs() {
-  const tabs = tabsFor(state.source);
+  const tabs = tabsFor();
   const el = $("tabs");
   if (tabs.length < 2) {
     el.classList.add("hidden");
@@ -481,35 +504,61 @@ function renderTabs() {
     return;
   }
   el.classList.remove("hidden");
+  const active = activeTabKey();
   el.innerHTML = tabs.map((t) =>
-    '<button class="tab' + (t.key === (state.tab || "home") ? " on" : "") +
+    '<button class="tab' + (t.key === active ? " on" : "") +
     '" type="button" data-tab="' + t.key + '">' + esc(t.label) + "</button>").join("");
 }
 function switchTab(key) {
+  if (state.root === "mine") {
+    state.mineTab = key;
+    renderTabs();
+    return loadMineView(key);
+  }
   state.tab = key;
   renderTabs();
   if (key === "mylists") return loadMyListsView();
   if (key === "history") return loadHistoryView();
   return loadHome();
 }
-$("tabs").addEventListener("click", (e) => {
-  const b = e.target.closest(".tab");
-  if (!b || !b.dataset.tab || b.dataset.tab === state.tab) return;
-  switchTab(b.dataset.tab);
-});
 
+function enterMine() {
+  state.root = "mine";
+  renderSources();
+  switchTab(state.mineTab || "mine");
+}
+function exitMine() {
+  state.root = "src";
+  state.tab = "home";
+  renderSources();
+  renderTabs();
+  loadHome();
+}
 $("sources").addEventListener("click", (e) => {
   const b = e.target.closest(".chip");
   if (!b) return;
+  if (b.dataset.act === "mine") { enterMine(); return; }
+  if (b.dataset.act === "recommend") { exitMine(); return; }
+  if (b.dataset.src === "mine") return;
+  state.root = "src";
   state.source = b.dataset.src;
+  state.tab = "home";
   renderSources();
+  renderTabs();
   loadHome();
+});
+$("tabs").addEventListener("click", (e) => {
+  const b = e.target.closest(".tab");
+  if (!b || !b.dataset.tab || b.dataset.tab === activeTabKey()) return;
+  switchTab(b.dataset.tab);
 });
 
 $("view").addEventListener("click", (e) => {
   if (consumeSuppress()) return;
   if (e.target.closest("[data-refresh]")) { loadHome(true); return; }
   if (e.target.closest("[data-daily]")) { openDaily(); return; }
+  const lr = e.target.closest(".row[data-li]");
+  if (lr) { openLocalList(Number(lr.dataset.li)); return; }
   const card = e.target.closest(".card");
   if (card) {
     const sec = state.homeCards[Number(card.dataset.si)];
@@ -594,6 +643,7 @@ bindLongPress($("view"), (el) => {
     const card = sec && sec[1][Number(el.dataset.ci)];
     return card ? { card: card } : null;
   }
+  if (el.dataset.li != null) return null;  // 本机歌单行, 只支持点击
   const i = Number(el.dataset.i);
   const s = state.queue[i];
   return s ? { song: s, play: () => playAt(i) } : null;
@@ -639,10 +689,10 @@ $("view").addEventListener("touchend", (e) => {
   const dy = Math.abs(t.clientY - s.y);
   if (Date.now() - s.at > 800) return;
   if (Math.abs(dx) < 80 || dy > Math.abs(dx) * 0.8) return;
-  // 左滑下一个页签, 右滑上一个页签
-  const tabs = tabsFor(state.source);
+  // 左滑下一个页签, 右滑上一个页签(不会滑入「我的」)
+  const tabs = tabsFor();
   if (tabs.length < 2) return;
-  const cur = tabs.findIndex((x) => x.key === (state.tab || "home"));
+  const cur = tabs.findIndex((x) => x.key === activeTabKey());
   const next = cur + (dx < 0 ? 1 : -1);
   if (next < 0 || next >= tabs.length) return;
   switchTab(tabs[next].key);
@@ -741,6 +791,19 @@ window.mhBack = function () {
       notifyBack();
       return true;
     }
+  }
+  if (state.root === "mine") {
+    // 我的: 详情页先回到当前我的页签; 已在页签列表则退出到一级导航
+    if (state.view && state.view.type === "mine") {
+      if (state.mineTab !== "mine") {
+        switchTab("mine");
+        return true;
+      }
+      exitMine();
+      return true;
+    }
+    switchTab(state.mineTab || "mine");
+    return true;
   }
   if (state.view && state.view.type !== "home") {
     loadHome();
@@ -882,8 +945,11 @@ function loginWho(src) {
 }
 
 async function loadMyListsView() {
-  const src = state.source;
-  const view = state.view = { type: "mylists", src: src };
+  return loadMylistsOf(state.source, { type: "mylists", src: state.source });
+}
+
+async function loadMylistsOf(src, view) {
+  state.view = view;
   notifyBack();
   if (!loggedIn(src)) {
     $("view").innerHTML = '<div class="loading">请先登录' + esc(SRC_NAME[src] || src) + "后查看歌单</div>";
@@ -896,6 +962,7 @@ async function loadMyListsView() {
     title: p.name || p.title || "歌单",
     cover: p.cover || "",
     ref: p.id,
+    src: src,
     action: "playlist",
   }));
   if (!lists.length) {
@@ -903,6 +970,56 @@ async function loadMyListsView() {
     return;
   }
   renderHome([["我的歌单 · " + (SRC_NAME[src] || src), lists]]);
+}
+
+/* ---------------- 我的 ---------------- */
+async function loadMineView(key) {
+  if (key === "mine") {
+    return loadLocalListsView({ type: "mine", tab: "mine" });
+  }
+  if (key === "migu") {
+    state.view = { type: "mine", tab: "migu" };
+    notifyBack();
+    $("view").innerHTML = '<div class="loading">咪咕暂不支持查看账号歌单</div>';
+    return;
+  }
+  return loadMylistsOf(key, { type: "mine", tab: key, src: key });
+}
+
+async function loadLocalListsView(view) {
+  state.view = view;
+  notifyBack();
+  $("view").innerHTML = '<div class="loading">加载中…</div>';
+  const j = await api("/api/locallists");
+  if (state.view !== view) return;
+  const lists = j.lists || [];
+  state.mineLists = lists;
+  if (!lists.length) {
+    $("view").innerHTML = '<div class="loading">还没有歌单</div>';
+    return;
+  }
+  $("view").innerHTML = '<section class="section"><div class="sec-head"><h3>我的歌单</h3><span>' +
+    lists.length + ' 个</span></div><div class="list">' +
+    lists.map((p, i) => '<div class="row" data-li="' + i + '">' +
+      '<div class="cov">♪</div><div class="info"><div class="t">' + esc(p.name || "歌单") + "</div>" +
+      '<div class="s">' + (p.count || 0) + " 首</div></div></div>").join("") +
+    "</div></section>";
+}
+
+async function openLocalList(i) {
+  const p = (state.mineLists || [])[i];
+  if (!p) return;
+  const view = state.view = { type: "localpl", id: p.id };
+  notifyBack();
+  $("view").innerHTML = '<div class="loading">加载中…</div>';
+  const j = await api("/api/localplaylist?pid=" + encodeURIComponent(p.id));
+  if (state.view !== view) return;
+  const songs = j.songs || [];
+  if (!songs.length) {
+    $("view").innerHTML = '<div class="loading">' + esc(j.error || "歌单为空") + "</div>";
+    return;
+  }
+  renderList(songs, p.name || "我的歌单");
 }
 
 async function loadHistoryView() {
@@ -925,25 +1042,6 @@ async function loadHistoryView() {
   renderList(songs, (SRC_NAME[src] || src) + " · 播放历史");
 }
 
-// 从登录页跳转: 切到对应音源并打开对应页签
-async function openMyLists(src) {
-  closeLogin();
-  if (src && src !== state.source) {
-    state.source = src;
-    renderSources();
-  }
-  switchTab("mylists");
-}
-
-async function openHistory(src) {
-  closeLogin();
-  if (src && src !== state.source) {
-    state.source = src;
-    renderSources();
-  }
-  switchTab("history");
-}
-
 function loginRowHtml(key, name) {
   const ok = loggedIn(key);
   const who = loginWho(key);
@@ -955,23 +1053,9 @@ function loginRowHtml(key, name) {
 
 function renderLoginList() {
   stopQr();
-  let html = Object.keys(QR_LOGIN).map((k) => loginRowHtml(k, QR_LOGIN[k].name)).join("") +
-    LOGIN_WEB_ONLY.map(([k, n]) => loginRowHtml(k, n)).join("");
-  ["netease", "qq"].forEach((k) => {
-    if (loggedIn(k)) {
-      html += '<button class="login-row" data-act="mylists" data-src="' + k + '">' +
-        '<span class="login-left">我的歌单 · ' + esc(SRC_NAME[k]) + '</span>' +
-        '<span class="login-state on">查看 ›</span></button>';
-    }
-  });
-  ["bilibili", "douyin"].forEach((k) => {
-    if (loggedIn(k)) {
-      html += '<button class="login-row" data-act="history" data-src="' + k + '">' +
-        '<span class="login-left">' + esc(SRC_NAME[k]) + ' 播放历史</span>' +
-        '<span class="login-state on">查看 ›</span></button>';
-    }
-  });
-  html += '<p class="login-note">扫码被风控时请用网页登录：在官方页面输入账号密码，成功后自动保存登录态。</p>';
+  const html = Object.keys(QR_LOGIN).map((k) => loginRowHtml(k, QR_LOGIN[k].name)).join("") +
+    LOGIN_WEB_ONLY.map(([k, n]) => loginRowHtml(k, n)).join("") +
+    '<p class="login-note">扫码被风控时请用网页登录：在官方页面输入账号密码，成功后自动保存登录态。</p>';
   $("login-body").innerHTML = html;
 }
 
@@ -1069,8 +1153,6 @@ $("login-close").addEventListener("click", closeLogin);
 $("login-body").addEventListener("click", (e) => {
   const row = e.target.closest(".login-row");
   if (!row) return;
-  if (row.dataset.act === "mylists") { openMyLists(row.dataset.src); return; }
-  if (row.dataset.act === "history") { openHistory(row.dataset.src); return; }
   if (row.dataset.src) renderLoginSource(row.dataset.src);
 });
 $("video-back").addEventListener("click", closeVideo);
