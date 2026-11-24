@@ -493,15 +493,7 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun ensureChannel(nm: NotificationManager) {
-        if (Build.VERSION.SDK_INT >= 26) {
-            val ch = NotificationChannel(CHANNEL_ID, "播放状态", NotificationManager.IMPORTANCE_LOW)
-            ch.setShowBadge(false)
-            nm.createNotificationChannel(ch)
-        }
-    }
-
-    /** 用 MediaSession + MediaStyle 通知展示当前歌曲, 并接管通知栏/锁屏的播放控制 */
+    /** 更新 MediaSession 元数据, 并把媒体通知交给前台服务发布(部分 ROM 只显示前台服务的媒体通知) */
     private fun publishMedia(playing: Boolean, positionMs: Long, durationMs: Long) {
         val s = mediaSession ?: return
         val title = mediaTitle.ifBlank { "未在播放" }
@@ -527,34 +519,9 @@ class MainActivity : Activity() {
             tipNoNotify()
             return
         }
-
-        val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-        ensureChannel(nm)
-        val toggleIcon = if (playing) android.R.drawable.ic_media_pause
-        else android.R.drawable.ic_media_play
-        @Suppress("DEPRECATION")
-        val nb = if (Build.VERSION.SDK_INT >= 26) Notification.Builder(this, CHANNEL_ID)
-        else Notification.Builder(this)
-        val b = nb
-            .setSmallIcon(android.R.drawable.ic_media_play)
-            .setContentTitle(title)
-            .setContentText(artist)
-            .setContentIntent(actionIntent(ACT_OPEN, 1))
-            .setCategory(Notification.CATEGORY_TRANSPORT)
-            .setOngoing(playing)
-            .setOnlyAlertOnce(true)
-            .setShowWhen(false)
-            .setVisibility(Notification.VISIBILITY_PUBLIC)
-            .addAction(Notification.Action.Builder(
-                android.R.drawable.ic_media_previous, "上一首", actionIntent(ACT_PREV, 2)).build())
-            .addAction(Notification.Action.Builder(
-                toggleIcon, if (playing) "暂停" else "播放", actionIntent(ACT_TOGGLE, 3)).build())
-            .addAction(Notification.Action.Builder(
-                android.R.drawable.ic_media_next, "下一首", actionIntent(ACT_NEXT, 4)).build())
-            .setStyle(Notification.MediaStyle()
-                .setMediaSession(s.sessionToken)
-                .setShowActionsInCompactView(0, 1, 2))
-        try { nm.notify(NOTIFY_ID, b.build()) } catch (_: Throwable) {}
+        MediaPlaybackService.push(this, MediaPlaybackService.Payload(
+            title = title, artist = artist, playing = playing,
+            positionMs = positionMs, durationMs = durationMs, token = s.sessionToken))
     }
 
     override fun onNewIntent(intent: Intent?) {
@@ -587,10 +554,7 @@ class MainActivity : Activity() {
 
     override fun onDestroy() {
         closeWebLogin()
-        try {
-            (getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager)
-                .cancel(NOTIFY_ID)
-        } catch (_: Throwable) {}
+        MediaPlaybackService.stop(this)
         mediaSession?.release()
         mediaSession = null
         webView.destroy()
