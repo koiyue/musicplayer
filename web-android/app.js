@@ -1456,8 +1456,6 @@ async function refreshLoginStatus() {
     try { out[k] = (await api(STATUS_API[k])) || {}; } catch (e) { out[k] = {}; }
   }));
   state.login = out;
-  const any = Object.keys(out).some((k) => out[k] && out[k].logged_in);
-  $("login-open").textContent = any ? "我的" : "登录";
   return out;
 }
 function loggedIn(src) {
