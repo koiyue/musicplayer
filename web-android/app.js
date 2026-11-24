@@ -1692,8 +1692,9 @@ function pageScrollTop() {
 function syncPlayerSpace() {
   const p = $("player");
   if (!p) return;
-  const h = p.offsetHeight;
-  if (h) document.documentElement.style.setProperty("--player-h", h + "px");
+  // 胶囊悬浮在底部, 需要占用的高度 = 屏幕底部到播放器顶部的距离
+  const h = Math.ceil(window.innerHeight - p.getBoundingClientRect().top);
+  if (h > 0) document.documentElement.style.setProperty("--player-h", h + "px");
 }
 window.addEventListener("resize", syncPlayerSpace);
 window.addEventListener("orientationchange", () => setTimeout(syncPlayerSpace, 120));

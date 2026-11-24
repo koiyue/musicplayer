@@ -112,31 +112,48 @@ input, textarea { -webkit-user-select: text; user-select: text; }
 .row.on .t { color: var(--acc); }
 .row .dur { color: var(--sub); font-size: 12px; flex: 0 0 auto; }
 
+/* 悬浮液态玻璃胶囊播放器 */
 #player {
-  position: fixed; left: 0; right: 0; bottom: 0; z-index: 30;
-  background: rgba(24, 24, 34, .97);
-  border-top: 1px solid var(--line);
-  padding: 0 14px calc(8px + env(safe-area-inset-bottom));
-  backdrop-filter: blur(12px);
+  position: fixed; left: 50%; right: auto;
+  width: min(460px, calc(100% - 24px));
+  bottom: calc(8px + env(safe-area-inset-bottom));
+  transform: translateX(-50%);
+  z-index: 30;
+  border-radius: 26px;
+  padding: 9px 14px 10px;
+  background: linear-gradient(180deg, rgba(54, 54, 76, .55), rgba(22, 22, 34, .66));
+  border: 1px solid rgba(255,255,255,.16);
+  box-shadow: 0 12px 34px rgba(0,0,0,.5), inset 0 1px 0 rgba(255,255,255,.24);
+  -webkit-backdrop-filter: blur(26px) saturate(180%);
+  backdrop-filter: blur(26px) saturate(180%);
 }
-#pbar { position: relative; height: 3px; background: rgba(255,255,255,.12); border-radius: 2px; margin: 0 -14px 8px; }
+/* 液态玻璃高光: 左上柔光 + 右上染色 */
+#player::after {
+  content: ""; position: absolute; inset: 0; z-index: 0; pointer-events: none;
+  border-radius: inherit;
+  background:
+    radial-gradient(120% 90% at 16% -12%, rgba(255,255,255,.26), rgba(255,255,255,0) 58%),
+    radial-gradient(95% 80% at 96% 0%, rgba(251,114,153,.20), rgba(251,114,153,0) 62%);
+}
+#player > * { position: relative; z-index: 1; }
+#pbar { position: relative; height: 3px; background: rgba(255,255,255,.16); border-radius: 999px; margin: 2px 0 6px; }
 /* 进度条很细, 上方扩 12px / 下方扩 6px 作为拖动命中区(下方让开时间文字) */
 #pbar::before { content: ""; position: absolute; left: 0; right: 0; top: -12px; bottom: -6px; }
-#pfill { height: 100%; width: 0; background: var(--acc); border-radius: 2px; }
-.prow { display: flex; align-items: center; gap: 10px; }
-#pcover { width: 48px; height: 48px; border-radius: 10px; background: #2a2a3a center/cover no-repeat;
+#pfill { height: 100%; width: 0; background: var(--acc); border-radius: 999px; }
+.prow { display: flex; align-items: center; gap: 8px; }
+#pcover { width: 42px; height: 42px; border-radius: 12px; background: #2a2a3a center/cover no-repeat;
   flex: 0 0 auto; display: flex; align-items: center; justify-content: center; color: #5b6076; overflow: hidden; }
 #pcover img { width: 100%; height: 100%; object-fit: cover; }
 .pmeta { flex: 1; min-width: 0; }
-#ptitle { font-size: 15px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-#partist { font-size: 12px; color: var(--sub); margin-top: 2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+#ptitle { font-size: 14px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+#partist { font-size: 11px; color: var(--sub); margin-top: 2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 #player button {
-  border: none; background: none; color: var(--text); font-size: 16px;
-  width: 38px; height: 38px; border-radius: 10px; flex: 0 0 auto;
+  border: none; background: none; color: var(--text); font-size: 14px;
+  width: 31px; height: 31px; border-radius: 10px; flex: 0 0 auto;
 }
-#player button:active { background: rgba(255,255,255,.1); }
-#ptoggle { font-size: 20px; color: var(--acc); }
-.ptime { display: flex; justify-content: space-between; color: var(--sub); font-size: 11px; margin: 0 0 6px; }
+#player button:active { background: rgba(255,255,255,.12); }
+#ptoggle { font-size: 18px; color: var(--acc); }
+.ptime { display: flex; justify-content: space-between; color: var(--sub); font-size: 10px; margin: 0 0 5px; padding: 0 2px; }
 
 .page {
   position: fixed; inset: 0; z-index: 40; background: var(--bg);
