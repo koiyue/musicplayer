@@ -209,14 +209,46 @@ async function loadMoreRecommend() {
 }
 
 /* ---------------- 搜索 ---------------- */
-async function doSearch(kw) {
+const HISTORY_KEY = "mh.search.history";
+function loadHistory() {
+  try {
+    const arr = JSON.parse(localStorage.getItem(HISTORY_KEY) || "[]");
+    return Array.isArray(arr) ? arr.filter((x) => x && x.kw) : [];
+  } catch (e) {
+    return [];
+  }
+}
+function saveHistory(list) {
+  try { localStorage.setItem(HISTORY_KEY, JSON.stringify((list || []).slice(0, 20))); } catch (e) {}
+}
+function addHistory(kw, src) {
   kw = (kw || "").trim();
   if (!kw) return;
+  const list = loadHistory().filter((x) => !(x.kw === kw && x.source === src));
+  list.unshift({ kw: kw, source: src, ts: Date.now() });
+  saveHistory(list);
+}
+function renderHistory() {
+  const list = loadHistory();
+  if (!list.length) return '<div class="loading">输入关键词开始搜索</div>';
+  return '<section class="hist"><div class="hist-head"><h3>搜索记录</h3>' +
+    '<button id="hist-clear" type="button">清空</button></div>' +
+    list.map((h, i) => '<button class="hist-row" type="button" data-hi="' + i + '">' +
+      '<span class="hist-kw">' + esc(h.kw) + "</span>" +
+      '<span class="hist-src">' + esc(SRC_NAME[h.source] || h.source || "") + "</span></button>").join("") +
+    "</section>";
+}
+
+async function doSearch(kw, srcOverride) {
+  kw = (kw || "").trim();
+  if (!kw) return;
+  const src = srcOverride || state.source;
+  addHistory(kw, src);
   $("searchpage").classList.remove("hidden");
   $("sinput").value = kw;
   $("sresults").innerHTML = '<div class="loading">搜索中…</div>';
   try {
-    const j = await api("/api/search?source=" + encodeURIComponent(state.source) +
+    const j = await api("/api/search?source=" + encodeURIComponent(src) +
       "&keyword=" + encodeURIComponent(kw) + "&limit=40");
     const songs = j.songs || [];
     state.searchSongs = songs;
@@ -407,6 +439,10 @@ $("view").addEventListener("click", (e) => {
 
 $("search-open").addEventListener("click", () => {
   $("searchpage").classList.remove("hidden");
+  // 每次打开都清空输入与旧结果, 只保留搜索记录
+  $("sinput").value = "";
+  state.searchSongs = [];
+  $("sresults").innerHTML = renderHistory();
   $("sinput").focus();
   notifyBack();
 });
@@ -419,6 +455,17 @@ $("sinput").addEventListener("keydown", (e) => {
 });
 $("sresults").addEventListener("click", (e) => {
   if (consumeSuppress()) return;
+  if (e.target.closest("#hist-clear")) {
+    saveHistory([]);
+    $("sresults").innerHTML = renderHistory();
+    return;
+  }
+  const hb = e.target.closest(".hist-row");
+  if (hb) {
+    const h = loadHistory()[Number(hb.dataset.hi)];
+    if (h) doSearch(h.kw, h.source);
+    return;
+  }
   const row = e.target.closest(".row");
   if (!row) return;
   state.queue = state.searchSongs.slice();
