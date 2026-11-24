@@ -458,6 +458,8 @@ function renderSources() {
   $("sources").innerHTML = SRC_ORDER.map((k) =>
     '<button class="chip' + (k === state.source ? " on" : "") + '" data-src="' + k + '">' +
     esc(SRC_NAME[k]) + "</button>").join("");
+  const on = $("sources").querySelector(".chip.on");
+  if (on) on.scrollIntoView({ inline: "center", block: "nearest", behavior: "smooth" });
 }
 
 $("sources").addEventListener("click", (e) => {
@@ -576,6 +578,52 @@ bindLongPress($("queue-list"), (el) => {
   const s = state.queue[i];
   return s ? { song: s, play: () => playAt(i) } : null;
 });
+
+/* ---------------- 左右滑动: 切换音源 / 返回首页 ---------------- */
+function switchSource(step) {
+  const n = SRC_ORDER.length;
+  const i = SRC_ORDER.indexOf(state.source);
+  const next = SRC_ORDER[(i + step + n) % n];
+  if (!next || next === state.source) return;
+  state.source = next;
+  renderSources();
+  toast(SRC_NAME[next] || next, 900);
+  loadHome();
+}
+
+let swipeFrom = null;
+$("view").addEventListener("touchstart", (e) => {
+  if (e.touches.length !== 1 || hasOpenLayer()) { swipeFrom = null; return; }
+  const t = e.touches[0];
+  // 左缘滑动交给系统/返回手势, 这里只处理内容区
+  if (t.clientX <= 24) { swipeFrom = null; return; }
+  swipeFrom = { x: t.clientX, y: t.clientY, at: Date.now(), horizontal: false };
+}, { passive: true });
+$("view").addEventListener("touchmove", (e) => {
+  if (!swipeFrom) return;
+  const t = e.touches[0];
+  const dx = t.clientX - swipeFrom.x, dy = t.clientY - swipeFrom.y;
+  if (Math.abs(dx) > 12 && Math.abs(dx) > Math.abs(dy) * 1.2) swipeFrom.horizontal = true;
+}, { passive: true });
+$("view").addEventListener("touchend", (e) => {
+  const s = swipeFrom;
+  swipeFrom = null;
+  if (!s || !s.horizontal) return;
+  const t = e.changedTouches[0];
+  const dx = t.clientX - s.x;
+  const dy = Math.abs(t.clientY - s.y);
+  if (Date.now() - s.at > 800) return;
+  if (Math.abs(dx) < 80 || dy > Math.abs(dx) * 0.8) return;
+  const v = state.view || {};
+  if (v.type && v.type !== "home") {
+    // 歌单/历史等页面: 右滑返回首页
+    if (dx > 0) loadHome();
+    return;
+  }
+  // 首页: 左滑下一个音源, 右滑上一个音源
+  switchSource(dx < 0 ? 1 : -1);
+}, { passive: true });
+$("view").addEventListener("touchcancel", () => { swipeFrom = null; }, { passive: true });
 
 /* ---------------- 下拉加载更多 / 刷新 ---------------- */
 let pullFrom = null, pulling = false;
