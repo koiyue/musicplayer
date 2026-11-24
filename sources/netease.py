@@ -504,13 +504,17 @@ def get_stream(s):
 
 
 def get_lyrics(s):
-    """返回 {"lyric": LRC文本}. 经典歌词接口, 无需登录."""
+    """返回 {"lyric": LRC文本, "tlyric": 翻译LRC(可选)}. 经典歌词接口, 无需登录."""
     try:
         j = _get("https://music.163.com/api/song/lyric?id=%s&lv=-1&kv=-1&tv=-1" % s["id"],
                  cookie=_cookie_str())
         ly = (j.get("lrc") or {}).get("lyric") or ""
         if not ly or "暂无歌词" in ly:
             return {"error": "暂无歌词"}
-        return {"lyric": ly}
+        out = {"lyric": ly}
+        tl = (j.get("tlyric") or {}).get("lyric") or ""
+        if tl.strip():
+            out["tlyric"] = tl
+        return out
     except Exception as e:
         return {"error": "获取歌词失败: %s" % e}

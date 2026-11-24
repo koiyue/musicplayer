@@ -635,6 +635,16 @@ def get_lyrics(s):
             ly = raw
         if not ly.strip():
             return {"error": "暂无歌词"}
-        return {"lyric": ly}
+        out = {"lyric": ly}
+        # trans 为翻译歌词(同样 base64), 有则一并返回供卡拉OK"翻译"开关使用
+        raw_t = j.get("trans") or ""
+        if raw_t:
+            try:
+                tr = base64.b64decode(raw_t).decode("utf-8", "replace")
+            except Exception:
+                tr = raw_t
+            if tr.strip():
+                out["tlyric"] = tr
+        return out
     except Exception as e:
         return {"error": "获取歌词失败: %s" % e}

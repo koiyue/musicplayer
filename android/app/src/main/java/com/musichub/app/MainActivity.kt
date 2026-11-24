@@ -63,6 +63,18 @@ class MainActivity : Activity() {
         fun openWebLogin(source: String) {
             runOnUiThread { this@MainActivity.openWebLogin(source) }
         }
+
+        /** 音译: 汉字/假名/谚文转拉丁转写(拼音/罗马音), 并去掉声调符号. */
+        @JavascriptInterface
+        fun transliterate(text: String): String {
+            if (text.isBlank()) return ""
+            val t = latinTransliterator ?: return ""
+            return try {
+                t.transliterate(text)
+            } catch (_: Throwable) {
+                ""
+            }
+        }
     }
 
     @SuppressLint("SetJavaScriptEnabled")
@@ -414,6 +426,16 @@ class MainActivity : Activity() {
 
     companion object {
         private const val REQ_FILE = 1001
+
+        // android.icu 的 Any-Latin 覆盖汉字->拼音、假名->罗马音、谚文->罗马字;
+        // Latin-ASCII 去掉拼音声调符号, 便于跟唱
+        private val latinTransliterator: android.icu.text.Transliterator? by lazy {
+            try {
+                android.icu.text.Transliterator.getInstance("Any-Latin; Latin-ASCII")
+            } catch (_: Throwable) {
+                null
+            }
+        }
         private const val DESKTOP_UA =
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
                 "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
