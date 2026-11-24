@@ -119,12 +119,13 @@ input, textarea { -webkit-user-select: text; user-select: text; }
 /* 悬浮液态玻璃胶囊播放器: 全圆角(胶囊形) + 高透明磨砂 */
 #player {
   position: fixed; left: 50%; right: auto;
-  width: min(330px, calc(100% - 68px));
+  width: min(316px, calc(100% - 80px));
   bottom: calc(12px + env(safe-area-inset-bottom));
   transform: translateX(-50%);
   z-index: 30;
+  /* 999px 会被收敛为高度的一半, 端头是正圆弧; 高度越大胶囊感越强 */
   border-radius: 999px;
-  padding: 6px 11px 7px;
+  padding: 9px 12px 10px;
   overflow: hidden;
   background:
     linear-gradient(180deg, rgba(255,255,255,.18), rgba(255,255,255,.06)),
