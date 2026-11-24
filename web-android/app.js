@@ -1674,13 +1674,16 @@ $("login-body").addEventListener("click", (e) => {
   if (row.dataset.src) renderLoginSource(row.dataset.src);
 });
 $("video-back").addEventListener("click", closeVideo);
-$("pcover").addEventListener("click", () => {
+// 点击封面或歌曲信息进入歌词页 / 视频画面
+function openNowPlaying() {
   const s = state.queue[state.index];
   if (!s) return;
   // B站/抖音保持视频画面; 其他音源进入卡拉OK歌词页
   if (isVideoSong(s)) openVideo(s);
   else openKaraoke(s);
-});
+}
+$("pcover").addEventListener("click", openNowPlaying);
+document.querySelector("#player .pmeta").addEventListener("click", openNowPlaying);
 
 /* ---------------- 启动 ---------------- */
 // 页面滚动位置: 禁用横向滚动后滚动容器可能是 body, 不能只看 documentElement
