@@ -353,7 +353,7 @@ def recommend(limit=30, mode=None, topid=None, albumid=None):
         limit = int(limit)
     except (TypeError, ValueError):
         limit = 30
-    limit = max(1, min(100, limit))
+    limit = max(1, min(300, limit))
     ck = _cookie_str()
     if mode == "daily":
         j = _safe_get("https://music.163.com/api/v3/discovery/recommend/songs", ck)

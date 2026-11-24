@@ -217,3 +217,11 @@ body { padding-bottom: calc(var(--player-h) + env(safe-area-inset-bottom)); }
   color: var(--text); font-size: 15px;
 }
 .menu-item.cancel { color: var(--sub); border-bottom: none; margin-top: 6px; }
+
+/* ---------- 下拉刷新提示 ---------- */
+#pullhint {
+  position: fixed; left: 50%; top: calc(58px + env(safe-area-inset-top));
+  transform: translateX(-50%); z-index: 30;
+  background: rgba(0, 0, 0, .8); color: #fff; font-size: 12px;
+  padding: 6px 12px; border-radius: 999px; pointer-events: none;
+}

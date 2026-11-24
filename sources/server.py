@@ -2154,10 +2154,17 @@ class Handler(BaseHTTPRequestHandler):
         if not fn:
             return self._send(200, {"songs": [], "error": "该音源暂无推荐"})
         try:
-            limit = max(1, min(int(g("limit", "30") or 30), 50))
+            limit = max(1, min(int(g("limit", "30") or 30), 300))
             kwargs = {"limit": limit, "mode": g("mode") or None,
                       "topid": g("topid") or None,
                       "albumid": g("albumid") or None}
+            # 仅对支持分页的音源(如 B站)透传 pn, 其余音源不分页
+            try:
+                params = inspect.signature(fn).parameters
+            except (TypeError, ValueError):
+                params = {}
+            if "pn" in params:
+                kwargs["pn"] = max(1, int(g("pn", "1") or 1))
             return self._send(200, fn(**kwargs))
         except Exception as e:
             return self._send(200, {"songs": [], "error": "获取推荐失败: %s" % e})

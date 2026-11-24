@@ -543,7 +543,7 @@ def recommend(limit=30, mode=None, topid=None, albumid=None):
         limit = int(limit)
     except (TypeError, ValueError):
         limit = 30
-    limit = max(1, min(100, limit))
+    limit = max(1, min(300, limit))
     return {"songs": _home_new_songs(limit), "has_more": False}
 
 

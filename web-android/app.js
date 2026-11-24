@@ -168,13 +168,44 @@ async function loadPlaylist(ref, title) {
 }
 
 async function loadRecommend(opts, title) {
-  const view = state.view = { type: "recommend", src: state.source };
+  const src = state.source;
+  const view = state.view = Object.assign({ type: "recommend", src: src, pn: 1 }, opts || {});
   notifyBack();
   $("view").innerHTML = '<div class="loading">加载中…</div>';
-  const q = new URLSearchParams(Object.assign({ source: state.source, limit: 50 }, opts || {}));
+  // 网易云/QQ 接口支持大分页, 直接全量拉取; 其他音源按页取, 由下拉继续加载
+  const limit = (src === "netease" || src === "qq") ? 300 : 60;
+  const params = Object.assign({ source: src, limit: limit, pn: 1 }, opts || {});
+  const q = new URLSearchParams(params);
   const j = await api("/api/recommend?" + q.toString());
   if (state.view !== view) return;
   renderList(j.songs || [], title || "推荐");
+}
+
+function canPullMore() {
+  return !!(state.view && state.view.type === "recommend" && state.view.src === "bilibili");
+}
+
+// B站推荐: 下拉加载下一页并追加
+async function loadMoreRecommend() {
+  const v = state.view;
+  if (!canPullMore()) return;
+  v.pn += 1;
+  const q = new URLSearchParams({ source: v.src, limit: 20, pn: v.pn });
+  if (v.mode) q.set("mode", v.mode);
+  let j;
+  try { j = await api("/api/recommend?" + q.toString()); } catch (e) {
+    toast("加载失败：" + e);
+    return;
+  }
+  if (state.view !== v) return;
+  const seen = new Set(state.queue.map(songKey));
+  const fresh = (j.songs || []).filter((s) => !seen.has(songKey(s)));
+  if (!fresh.length) { toast("没有更多推荐了"); return; }
+  const start = state.queue.length;
+  state.queue = state.queue.concat(fresh);
+  const list = document.querySelector("#view .list");
+  if (list) list.insertAdjacentHTML("beforeend", fresh.map((s, k) => rowHtml(s, start + k)).join(""));
+  toast("已加载 " + fresh.length + " 条推荐");
 }
 
 /* ---------------- 搜索 ---------------- */
@@ -453,6 +484,46 @@ bindLongPress($("queue-list"), (el) => {
   const s = state.queue[i];
   return s ? { song: s, play: () => playAt(i) } : null;
 });
+
+/* ---------------- 下拉加载更多 / 刷新 ---------------- */
+let pullFrom = null, pulling = false;
+document.addEventListener("touchstart", (e) => {
+  if (e.touches.length !== 1 || hasOpenLayer()) { pullFrom = null; return; }
+  const t = e.touches[0];
+  const el = document.scrollingElement || document.documentElement;
+  pullFrom = { x: t.clientX, y: t.clientY, top: el.scrollTop };
+}, { passive: true });
+document.addEventListener("touchmove", (e) => {
+  if (!pullFrom) return;
+  if (pullFrom.top > 0) { pullFrom = null; return; }
+  const t = e.touches[0];
+  const dy = t.clientY - pullFrom.y;
+  const dx = Math.abs(t.clientX - pullFrom.x);
+  if (dy > 45 && dy > dx * 1.2) {
+    if (!pulling) {
+      pulling = true;
+      const h = $("pullhint");
+      h.textContent = canPullMore() ? "松开加载更多推荐" : "松开刷新";
+      h.classList.remove("hidden");
+    }
+  }
+}, { passive: true });
+document.addEventListener("touchend", async (e) => {
+  const from = pullFrom;
+  pullFrom = null;
+  if (!pulling) return;
+  pulling = false;
+  $("pullhint").classList.add("hidden");
+  if (!from) return;
+  const dy = e.changedTouches[0].clientY - from.y;
+  if (dy < 70) return;
+  if (canPullMore()) await loadMoreRecommend();
+  else if (state.view && state.view.type === "home") loadHome();
+}, { passive: true });
+document.addEventListener("touchcancel", () => {
+  pullFrom = null;
+  if (pulling) { pulling = false; $("pullhint").classList.add("hidden"); }
+}, { passive: true });
 
 $("pbar").addEventListener("click", (e) => {
   if (!audio.duration) return;
