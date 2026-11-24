@@ -19,7 +19,6 @@ const state = {
   login: {},          // src -> status 对象
   tab: "home",        // 一级为音源时的二级页签: home | mylists | history
   root: "src",        // src | mine
-  mineTab: "mine",    // mine | netease | qq | migu
   mineLists: [],      // 本机歌单
 };
 
@@ -419,12 +418,97 @@ function queueInsert(s, where) {
   toast(where === "next" ? "已设为下一首播放" : "已加入播放队列");
 }
 function openSongMenu(s, play) {
-  openMenu(s.title || "歌曲", ["立即播放", "下一首播放", "加入队列末尾"], [
+  openMenu(s.title || "歌曲", ["立即播放", "下一首播放", "加入队列末尾", "收藏到歌单"], [
     () => { if (play) play(); },
     () => queueInsert(s, "next"),
     () => queueInsert(s, "end"),
+    () => openFavMenu(s),
   ]);
 }
+
+/* ---------------- 本机歌单: 新建 / 重命名 / 删除 / 收藏 ---------------- */
+let inputCb = null;
+function askText(title, value, cb) {
+  inputCb = cb;
+  $("input-title").textContent = title || "输入";
+  $("input-field").value = value || "";
+  $("inputsheet").classList.remove("hidden");
+  notifyBack();
+  setTimeout(() => { try { $("input-field").focus(); } catch (e) {} }, 50);
+}
+function closeInput() {
+  $("inputsheet").classList.add("hidden");
+  inputCb = null;
+  notifyBack();
+}
+async function localPl(action, payload) {
+  const r = await fetch("/api/localplaylist/" + action, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "X-MH-Token": TOKEN },
+    body: JSON.stringify(payload || {}),
+  });
+  try { return await r.json(); } catch (e) { return { error: String(e) }; }
+}
+function newLocalList() {
+  askText("新建歌单", "", async (name) => {
+    const r = await localPl("create", { name: name });
+    if (r.error) { toast(r.error); return; }
+    toast("已创建歌单");
+    loadMineView();
+  });
+}
+function openLocalMenu(p) {
+  openMenu(p.name || "歌单", ["重命名", "删除"], [
+    () => askText("重命名歌单", p.name, async (name) => {
+      const r = await localPl("rename", { id: p.id, name: name });
+      if (r.error) { toast(r.error); return; }
+      toast("已重命名");
+      loadMineView();
+    }),
+    () => openMenu("删除「" + (p.name || "歌单") + "」？", ["删除", "取消"], [
+      async () => {
+        const r = await localPl("delete", { id: p.id });
+        if (r.error) { toast(r.error); return; }
+        toast("已删除");
+        loadMineView();
+      },
+      () => {},
+    ]),
+  ]);
+}
+async function openFavMenu(s) {
+  let lists = [];
+  try {
+    const j = await api("/api/locallists");
+    lists = j.lists || [];
+  } catch (e) {}
+  const labels = lists.map((p) => "收藏到：" + (p.name || "歌单"));
+  const actions = lists.map((p) => () => addToLocalList(p.id, s));
+  labels.push("＋ 新建歌单并收藏");
+  actions.push(() => askText("新建歌单", "", async (name) => {
+    const r = await localPl("create", { name: name });
+    if (r.error) { toast(r.error); return; }
+    addToLocalList(r.id, s);
+  }));
+  openMenu("收藏到歌单", labels, actions);
+}
+async function addToLocalList(pid, s) {
+  const r = await localPl("add", { id: pid, song: s });
+  if (r.error) { toast(r.error); return; }
+  toast(r.existed ? "已在歌单中" : "已收藏");
+}
+$("input-close").addEventListener("click", closeInput);
+$("input-cancel").addEventListener("click", closeInput);
+$("input-ok").addEventListener("click", () => {
+  const v = ($("input-field").value || "").trim();
+  if (!v) { toast("请输入名称"); return; }
+  const cb = inputCb;
+  closeInput();
+  if (cb) cb(v);
+});
+$("input-field").addEventListener("keydown", (e) => {
+  if (e.key === "Enter") $("input-ok").click();
+});
 function bindLongPress(root, resolve) {
   if (!root) return;
   root.addEventListener("touchstart", (e) => {
@@ -443,6 +527,7 @@ function bindLongPress(root, resolve) {
       if (!r) return;
       if (r.song) openSongMenu(r.song, r.play);
       else if (r.card) openMenu(r.card.title || "操作", ["打开"], [() => openCard(r.card)]);
+      else if (r.local) openLocalMenu(r.local);
     }, 550);
   }, { passive: true });
   root.addEventListener("touchmove", (e) => {
@@ -466,55 +551,41 @@ function chipHtml(key, label, on, act) {
 }
 function renderSources() {
   const el = $("sources");
-  if (state.root === "mine") {
-    el.innerHTML = chipHtml("mine", "我的", true) +
-      chipHtml("recommend", "推荐", false, "recommend");
-  } else {
-    el.innerHTML = chipHtml("mine", "我的", false, "mine") +
-      SRC_ORDER.map((k) => chipHtml(k, SRC_NAME[k], k === state.source)).join("");
-  }
+  // 一级导航固定: 我的 + 五个音源
+  el.innerHTML = chipHtml("mine", "我的", state.root === "mine", "mine") +
+    SRC_ORDER.map((k) =>
+      chipHtml(k, SRC_NAME[k], state.root !== "mine" && k === state.source)).join("");
   const on = el.querySelector(".chip.on");
   if (on) on.scrollIntoView({ inline: "center", block: "nearest", behavior: "smooth" });
 }
 
 /* ---------------- 页签: 推荐 / 歌单 / 历史 ---------------- */
-function tabsFor() {
-  if (state.root === "mine") {
-    return [
-      { key: "mine", label: "我的歌单" },
-      { key: "netease", label: "网易云歌单" },
-      { key: "qq", label: "QQ音乐歌单" },
-      { key: "migu", label: "咪咕歌单" },
-    ];
-  }
+function tabsForSrc(src) {
   const tabs = [{ key: "home", label: "推荐" }];
-  if (state.source === "netease" || state.source === "qq") tabs.push({ key: "mylists", label: "歌单" });
-  if (state.source === "bilibili" || state.source === "douyin") tabs.push({ key: "history", label: "历史" });
+  if (src === "netease" || src === "qq") tabs.push({ key: "mylists", label: "歌单" });
+  if (src === "bilibili" || src === "douyin") tabs.push({ key: "history", label: "历史" });
   return tabs;
 }
-function activeTabKey() {
-  return state.root === "mine" ? (state.mineTab || "mine") : (state.tab || "home");
-}
 function renderTabs() {
-  const tabs = tabsFor();
   const el = $("tabs");
+  if (state.root === "mine") {
+    el.classList.add("hidden");
+    el.innerHTML = "";
+    return;
+  }
+  const tabs = tabsForSrc(state.source);
   if (tabs.length < 2) {
     el.classList.add("hidden");
     el.innerHTML = "";
     return;
   }
   el.classList.remove("hidden");
-  const active = activeTabKey();
   el.innerHTML = tabs.map((t) =>
-    '<button class="tab' + (t.key === active ? " on" : "") +
+    '<button class="tab' + (t.key === (state.tab || "home") ? " on" : "") +
     '" type="button" data-tab="' + t.key + '">' + esc(t.label) + "</button>").join("");
 }
 function switchTab(key) {
-  if (state.root === "mine") {
-    state.mineTab = key;
-    renderTabs();
-    return loadMineView(key);
-  }
+  if (state.root === "mine") return;
   state.tab = key;
   renderTabs();
   if (key === "mylists") return loadMyListsView();
@@ -522,23 +593,56 @@ function switchTab(key) {
   return loadHome();
 }
 
-function enterMine() {
-  state.root = "mine";
-  renderSources();
-  switchTab(state.mineTab || "mine");
+/* ---------------- 全局翻页(侧滑): 我的 -> 各音源的推荐/歌单/历史 ---------------- */
+function pageList() {
+  const pages = [{ root: "mine", tab: "mine" }];
+  SRC_ORDER.forEach((src) => {
+    tabsForSrc(src).forEach((t) => pages.push({ root: "src", src: src, tab: t.key }));
+  });
+  return pages;
 }
-function exitMine() {
+function currentPageIndex() {
+  if (state.root === "mine") return 0;
+  return pageList().findIndex((p) =>
+    p.root === "src" && p.src === state.source && p.tab === (state.tab || "home"));
+}
+function openPage(p) {
+  if (!p) return;
+  if (p.root === "mine") {
+    state.root = "mine";
+    renderSources();
+    renderTabs();
+    return loadMineView();
+  }
   state.root = "src";
-  state.tab = "home";
-  renderSources();
+  if (state.source !== p.src) {
+    state.source = p.src;
+    renderSources();
+  }
+  state.tab = p.tab;
   renderTabs();
-  loadHome();
+  if (p.tab === "mylists") return loadMyListsView();
+  if (p.tab === "history") return loadHistoryView();
+  return loadHome();
 }
+function stepPage(step) {
+  const pages = pageList();
+  if (!pages.length) return;
+  let i = currentPageIndex();
+  if (i < 0) i = 0;
+  openPage(pages[(i + step + pages.length) % pages.length]);
+}
+
 $("sources").addEventListener("click", (e) => {
   const b = e.target.closest(".chip");
   if (!b) return;
-  if (b.dataset.act === "mine") { enterMine(); return; }
-  if (b.dataset.act === "recommend") { exitMine(); return; }
+  if (b.dataset.act === "mine") {
+    state.root = "mine";
+    renderSources();
+    renderTabs();
+    loadMineView();
+    return;
+  }
   if (b.dataset.src === "mine") return;
   state.root = "src";
   state.source = b.dataset.src;
@@ -549,7 +653,7 @@ $("sources").addEventListener("click", (e) => {
 });
 $("tabs").addEventListener("click", (e) => {
   const b = e.target.closest(".tab");
-  if (!b || !b.dataset.tab || b.dataset.tab === activeTabKey()) return;
+  if (!b || !b.dataset.tab || b.dataset.tab === (state.tab || "home")) return;
   switchTab(b.dataset.tab);
 });
 
@@ -557,6 +661,7 @@ $("view").addEventListener("click", (e) => {
   if (consumeSuppress()) return;
   if (e.target.closest("[data-refresh]")) { loadHome(true); return; }
   if (e.target.closest("[data-daily]")) { openDaily(); return; }
+  if (e.target.closest("[data-newpl]")) { newLocalList(); return; }
   const lr = e.target.closest(".row[data-li]");
   if (lr) { openLocalList(Number(lr.dataset.li)); return; }
   const card = e.target.closest(".card");
@@ -643,7 +748,10 @@ bindLongPress($("view"), (el) => {
     const card = sec && sec[1][Number(el.dataset.ci)];
     return card ? { card: card } : null;
   }
-  if (el.dataset.li != null) return null;  // 本机歌单行, 只支持点击
+  if (el.dataset.li != null) {
+    const p = (state.mineLists || [])[Number(el.dataset.li)];
+    return p ? { local: p } : null;
+  }
   const i = Number(el.dataset.i);
   const s = state.queue[i];
   return s ? { song: s, play: () => playAt(i) } : null;
@@ -665,22 +773,26 @@ bindLongPress($("queue-list"), (el) => {
   return s ? { song: s, play: () => playAt(i) } : null;
 });
 
-/* ---------------- 左右滑动: 切换页签(推荐/歌单/历史) ---------------- */
+/* ---------------- 左右滑动: 全局翻页(我的/各音源页签) ---------------- */
 let swipeFrom = null;
-$("view").addEventListener("touchstart", (e) => {
+document.addEventListener("touchstart", (e) => {
   if (e.touches.length !== 1 || hasOpenLayer()) { swipeFrom = null; return; }
   const t = e.touches[0];
-  // 左缘滑动交给系统/返回手势, 这里只处理内容区
+  // 左缘交给返回手势; 顶部导航与播放条自身可横向滚动/操作, 不参与翻页
   if (t.clientX <= 24) { swipeFrom = null; return; }
+  if (e.target.closest("#sources, #tabs, #player, #top, input, textarea")) {
+    swipeFrom = null;
+    return;
+  }
   swipeFrom = { x: t.clientX, y: t.clientY, at: Date.now(), horizontal: false };
 }, { passive: true });
-$("view").addEventListener("touchmove", (e) => {
+document.addEventListener("touchmove", (e) => {
   if (!swipeFrom) return;
   const t = e.touches[0];
   const dx = t.clientX - swipeFrom.x, dy = t.clientY - swipeFrom.y;
   if (Math.abs(dx) > 12 && Math.abs(dx) > Math.abs(dy) * 1.2) swipeFrom.horizontal = true;
 }, { passive: true });
-$("view").addEventListener("touchend", (e) => {
+document.addEventListener("touchend", (e) => {
   const s = swipeFrom;
   swipeFrom = null;
   if (!s || !s.horizontal) return;
@@ -689,20 +801,19 @@ $("view").addEventListener("touchend", (e) => {
   const dy = Math.abs(t.clientY - s.y);
   if (Date.now() - s.at > 800) return;
   if (Math.abs(dx) < 80 || dy > Math.abs(dx) * 0.8) return;
-  // 左滑下一个页签, 右滑上一个页签(不会滑入「我的」)
-  const tabs = tabsFor();
-  if (tabs.length < 2) return;
-  const cur = tabs.findIndex((x) => x.key === activeTabKey());
-  const next = cur + (dx < 0 ? 1 : -1);
-  if (next < 0 || next >= tabs.length) return;
-  switchTab(tabs[next].key);
+  // 左滑下一页, 右滑上一页; 空列表同样可翻(绑定在整个页面而非列表上)
+  stepPage(dx < 0 ? 1 : -1);
 }, { passive: true });
-$("view").addEventListener("touchcancel", () => { swipeFrom = null; }, { passive: true });
+document.addEventListener("touchcancel", () => { swipeFrom = null; }, { passive: true });
 
 /* ---------------- 下拉加载更多 / 刷新 ---------------- */
 let pullFrom = null, pulling = false;
 document.addEventListener("touchstart", (e) => {
   if (e.touches.length !== 1 || hasOpenLayer() || !canPullMore()) { pullFrom = null; return; }
+  if (e.target.closest("#sources, #tabs, #player, #top, input, textarea")) {
+    pullFrom = null;
+    return;
+  }
   const t = e.touches[0];
   const el = document.scrollingElement || document.documentElement;
   pullFrom = { x: t.clientX, y: t.clientY, top: el.scrollTop };
@@ -766,6 +877,7 @@ $("ptdur").addEventListener("click", () => {
 
 /* ---------------- 返回 / 侧滑手势 ---------------- */
 const BACK_LAYERS = [
+  ["inputsheet", () => closeInput()],
   ["menu", () => closeMenu()],
   ["loginpage", () => closeLogin()],
   ["videopage", () => closeVideo()],
@@ -793,16 +905,16 @@ window.mhBack = function () {
     }
   }
   if (state.root === "mine") {
-    // 我的: 详情页先回到当前我的页签; 已在页签列表则退出到一级导航
-    if (state.view && state.view.type === "mine") {
-      if (state.mineTab !== "mine") {
-        switchTab("mine");
-        return true;
-      }
-      exitMine();
+    // 我的: 歌单详情先回到我的歌单列表, 列表页再返回则回到当前音源推荐
+    if (state.view && state.view.type === "localpl") {
+      loadMineView();
       return true;
     }
-    switchTab(state.mineTab || "mine");
+    state.root = "src";
+    state.tab = "home";
+    renderSources();
+    renderTabs();
+    loadHome();
     return true;
   }
   if (state.view && state.view.type !== "home") {
@@ -973,37 +1085,28 @@ async function loadMylistsOf(src, view) {
 }
 
 /* ---------------- 我的 ---------------- */
-async function loadMineView(key) {
-  if (key === "mine") {
-    return loadLocalListsView({ type: "mine", tab: "mine" });
-  }
-  if (key === "migu") {
-    state.view = { type: "mine", tab: "migu" };
-    notifyBack();
-    $("view").innerHTML = '<div class="loading">咪咕暂不支持查看账号歌单</div>';
-    return;
-  }
-  return loadMylistsOf(key, { type: "mine", tab: key, src: key });
+function loadMineView() {
+  return loadLocalListsView();
 }
 
-async function loadLocalListsView(view) {
-  state.view = view;
+async function loadLocalListsView() {
+  const view = state.view = { type: "mine", tab: "mine" };
   notifyBack();
   $("view").innerHTML = '<div class="loading">加载中…</div>';
   const j = await api("/api/locallists");
   if (state.view !== view) return;
   const lists = j.lists || [];
   state.mineLists = lists;
-  if (!lists.length) {
-    $("view").innerHTML = '<div class="loading">还没有歌单</div>';
-    return;
-  }
-  $("view").innerHTML = '<section class="section"><div class="sec-head"><h3>我的歌单</h3><span>' +
-    lists.length + ' 个</span></div><div class="list">' +
-    lists.map((p, i) => '<div class="row" data-li="' + i + '">' +
-      '<div class="cov">♪</div><div class="info"><div class="t">' + esc(p.name || "歌单") + "</div>" +
-      '<div class="s">' + (p.count || 0) + " 首</div></div></div>").join("") +
-    "</div></section>";
+  const rows = lists.map((p, i) => '<div class="row" data-li="' + i + '">' +
+    '<div class="cov">♪</div><div class="info"><div class="t">' + esc(p.name || "歌单") + "</div>" +
+    '<div class="s">' + (p.count || 0) + " 首 · 长按可重命名/删除</div></div></div>").join("");
+  $("view").innerHTML = '<section class="section">' +
+    '<div class="sec-head"><h3>我的歌单</h3><span>' + lists.length + " 个</span></div>" +
+    '<button class="login-big primary" type="button" data-newpl="1">＋ 新建歌单</button>' +
+    (lists.length
+      ? '<div class="list">' + rows + "</div>"
+      : '<div class="loading">还没有歌单，点上方新建</div>') +
+    "</section>";
 }
 
 async function openLocalList(i) {
