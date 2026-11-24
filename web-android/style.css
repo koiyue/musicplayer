@@ -11,6 +11,10 @@
 
 * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
 
+/* 隐藏所有滚动条(内容仍可正常滚动) */
+::-webkit-scrollbar { width: 0; height: 0; display: none; }
+html, body { scrollbar-width: none; -ms-overflow-style: none; }
+
 html, body {
   margin: 0; padding: 0; height: 100%;
   background: var(--bg); color: var(--text);
