@@ -600,19 +600,27 @@ function chipHtml(key, label, on, act) {
 function renderSources() {
   const el = $("sources");
   // 一级导航固定: 我的 + 五个音源
-  el.innerHTML = chipHtml("mine", "我的", state.root === "mine", "mine") +
-    SRC_ORDER.map((k) =>
-      chipHtml(k, SRC_NAME[k], state.root !== "mine" && k === state.source)).join("");
-  const on = el.querySelector(".chip.on");
-  if (on) {
-    // 只滚动音源条本身, 避免 scrollIntoView 连带横向滚动整个页面造成抖动
-    const left = Math.max(0, on.offsetLeft - (el.clientWidth - on.offsetWidth) / 2);
-    try {
-      el.scrollTo({ left: left, behavior: "smooth" });
-    } catch (e) {
-      el.scrollLeft = left;
-    }
+  const sig = "mine|" + SRC_ORDER.join(",");
+  if (el.dataset.sig !== sig) {
+    el.innerHTML = chipHtml("mine", "我的", state.root === "mine", "mine") +
+      SRC_ORDER.map((k) =>
+        chipHtml(k, SRC_NAME[k], state.root !== "mine" && k === state.source)).join("");
+    el.dataset.sig = sig;
+  } else {
+    // 结构不变时只切换高亮, 不重建 DOM
+    el.querySelectorAll(".chip").forEach((b) => {
+      const on = b.dataset.act === "mine" ? state.root === "mine"
+        : (state.root !== "mine" && b.dataset.src === state.source);
+      b.classList.toggle("on", on);
+    });
   }
+  const on = el.querySelector(".chip.on");
+  if (!on) return;
+  // 只在选中项超出可视范围时做最小幅度滚动, 且不做平滑动画;
+  // 否则切到右侧音源(咪咕/B站/抖音)时整条导航会来回滑动, 看起来像界面左右抖动
+  const er = el.getBoundingClientRect(), cr = on.getBoundingClientRect();
+  if (cr.left < er.left) el.scrollLeft -= er.left - cr.left + 12;
+  else if (cr.right > er.right) el.scrollLeft += cr.right - er.right + 12;
 }
 
 /* ---------------- 页签: 推荐 / 歌单 / 历史 ---------------- */
@@ -949,8 +957,7 @@ document.addEventListener("touchstart", (e) => {
     return;
   }
   const t = e.touches[0];
-  const el = document.scrollingElement || document.documentElement;
-  pullFrom = { x: t.clientX, y: t.clientY, top: el.scrollTop };
+  pullFrom = { x: t.clientX, y: t.clientY, top: pageScrollTop() };
 }, { passive: true });
 document.addEventListener("touchmove", (e) => {
   if (!pullFrom) return;
@@ -1403,6 +1410,22 @@ $("pcover").addEventListener("click", () => {
 });
 
 /* ---------------- 启动 ---------------- */
+// 页面滚动位置: 禁用横向滚动后滚动容器可能是 body, 不能只看 documentElement
+function pageScrollTop() {
+  return Math.max(window.scrollY || 0, document.documentElement.scrollTop || 0,
+    document.body ? document.body.scrollTop || 0 : 0);
+}
+// 播放器常驻底部: 把实测高度写入 --player-h, 由 #view 底部内边距腾出空间
+function syncPlayerSpace() {
+  const p = $("player");
+  if (!p) return;
+  const h = p.offsetHeight;
+  if (h) document.documentElement.style.setProperty("--player-h", h + "px");
+}
+window.addEventListener("resize", syncPlayerSpace);
+window.addEventListener("orientationchange", () => setTimeout(syncPlayerSpace, 120));
+window.addEventListener("load", syncPlayerSpace);
+syncPlayerSpace();
 (function showVersion() {
   const v = new URLSearchParams(location.search).get("v");
   if (v) $("ver").textContent = "v" + v;

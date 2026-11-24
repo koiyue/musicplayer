@@ -28,7 +28,8 @@ input, textarea { -webkit-user-select: text; user-select: text; }
   color: #fff; font-size: 10px; font-weight: 700; vertical-align: 1px;
 }
 
-body { padding-bottom: calc(var(--player-h) + env(safe-area-inset-bottom)); }
+/* 播放器常驻底部, 页面底部留出实际播放器高度(#view 内边距由 JS 按实测高度同步),
+   避免最后一行内容被播放器遮挡 */
 
 .hidden { display: none !important; }
 
@@ -81,7 +82,7 @@ body { padding-bottom: calc(var(--player-h) + env(safe-area-inset-bottom)); }
   to { transform: none; opacity: 1; }
 }
 
-#view { padding: 0 16px 18px; }
+#view { padding: 0 16px calc(var(--player-h) + 24px); }
 
 .loading { color: var(--sub); text-align: center; padding: 40px 0; font-size: 14px; }
 
