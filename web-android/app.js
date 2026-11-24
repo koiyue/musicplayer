@@ -414,6 +414,7 @@ function pushMedia(force) {
   } catch (e) {}
 }
 // 通知栏 / 锁屏控制回调(原生 MediaSession 与通知按钮会调用)
+window.mhPushMedia = () => pushMedia(true);
 window.mhPlay = () => { if (audio.src) audio.play().catch(() => {}); };
 window.mhPause = () => { if (audio.src) audio.pause(); };
 window.mhTogglePlay = () => {

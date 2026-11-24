@@ -59,6 +59,7 @@ class MainActivity : Activity() {
     private var mediaSession: MediaSession? = null
     private var mediaTitle = ""
     private var mediaArtist = ""
+    private var notifyAsked = false
 
     // 网页登录浮层(账号密码), 复用系统 WebView 的 CookieManager
     private var loginOverlay: LinearLayout? = null
@@ -134,13 +135,6 @@ class MainActivity : Activity() {
         webView.addJavascriptInterface(JsBridge(), "MHNative")
 
         setupMediaSession()
-        // Android 13+ 通知需要运行时授权
-        if (Build.VERSION.SDK_INT >= 33 &&
-            checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) !=
-            PackageManager.PERMISSION_GRANTED
-        ) {
-            requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), REQ_NOTIFY)
-        }
 
         webView.webViewClient = object : WebViewClient() {
             override fun shouldOverrideUrlLoading(
@@ -440,6 +434,9 @@ class MainActivity : Activity() {
 
     private fun setupMediaSession() {
         val s = MediaSession(this, "MusicHub")
+        s.setFlags(MediaSession.FLAG_HANDLES_MEDIA_BUTTONS or
+            MediaSession.FLAG_HANDLES_TRANSPORT_CONTROLS)
+        s.setSessionActivity(actionIntent(ACT_OPEN, 1))
         s.setCallback(object : MediaSession.Callback() {
             override fun onPlay() = js("window.mhPlay && window.mhPlay()")
             override fun onPause() = js("window.mhPause && window.mhPause()")
@@ -459,10 +456,42 @@ class MainActivity : Activity() {
         return PendingIntent.getActivity(this, code, i, flags)
     }
 
-    private fun canNotify(): Boolean =
-        Build.VERSION.SDK_INT < 33 ||
-            checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) ==
+    private fun canNotify(): Boolean {
+        if (Build.VERSION.SDK_INT >= 33 &&
+            checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) !=
             PackageManager.PERMISSION_GRANTED
+        ) return false
+        // 用户在系统设置里关闭了本应用通知时 notify() 会静默失效, 这里一并判断
+        val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        return nm.areNotificationsEnabled()
+    }
+
+    // 没有通知权限时给出一次可见提示(否则用户只会觉得"没反应")
+    private var noNotifyTipAt = 0L
+    private fun tipNoNotify() {
+        val now = System.currentTimeMillis()
+        if (now - noNotifyTipAt < 15000) return
+        noNotifyTipAt = now
+        Toast.makeText(this, "通知已关闭，无法显示播放通知；请在系统设置中允许 MusicHub 的通知",
+            Toast.LENGTH_LONG).show()
+    }
+
+    override fun onResume() {
+        super.onResume()
+        if (Build.VERSION.SDK_INT >= 33 && !canNotify() && !notifyAsked) {
+            notifyAsked = true
+            requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), REQ_NOTIFY)
+        }
+    }
+
+    override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>,
+                                            grantResults: IntArray) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        // 授权后立即补发当前播放信息
+        if (requestCode == REQ_NOTIFY && canNotify()) {
+            js("window.mhPushMedia && window.mhPushMedia()")
+        }
+    }
 
     private fun ensureChannel(nm: NotificationManager) {
         if (Build.VERSION.SDK_INT >= 26) {
@@ -474,7 +503,6 @@ class MainActivity : Activity() {
 
     /** 用 MediaSession + MediaStyle 通知展示当前歌曲, 并接管通知栏/锁屏的播放控制 */
     private fun publishMedia(playing: Boolean, positionMs: Long, durationMs: Long) {
-        if (!canNotify()) return
         val s = mediaSession ?: return
         val title = mediaTitle.ifBlank { "未在播放" }
         val artist = mediaArtist.ifBlank { "MusicHub" }
@@ -494,6 +522,12 @@ class MainActivity : Activity() {
                 positionMs, if (playing) 1f else 0f)
             .build())
 
+        // 系统通知/媒体卡片需要通知权限; 没权限时给出提示而不是静默失败
+        if (!canNotify()) {
+            tipNoNotify()
+            return
+        }
+
         val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
         ensureChannel(nm)
         val toggleIcon = if (playing) android.R.drawable.ic_media_pause
@@ -506,6 +540,7 @@ class MainActivity : Activity() {
             .setContentTitle(title)
             .setContentText(artist)
             .setContentIntent(actionIntent(ACT_OPEN, 1))
+            .setCategory(Notification.CATEGORY_TRANSPORT)
             .setOngoing(playing)
             .setOnlyAlertOnce(true)
             .setShowWhen(false)
