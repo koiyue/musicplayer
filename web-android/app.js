@@ -571,21 +571,62 @@ function renderTabs() {
   if (state.root === "mine") {
     el.classList.add("hidden");
     el.innerHTML = "";
+    el.dataset.sig = "";
     return;
   }
   const tabs = tabsForSrc(state.source);
   if (tabs.length < 2) {
     el.classList.add("hidden");
     el.innerHTML = "";
+    el.dataset.sig = "";
     return;
   }
   el.classList.remove("hidden");
-  el.innerHTML = tabs.map((t) =>
-    '<button class="tab' + (t.key === (state.tab || "home") ? " on" : "") +
-    '" type="button" data-tab="' + t.key + '">' + esc(t.label) + "</button>").join("");
+  const sig = tabs.map((t) => t.key + ":" + t.label).join("|");
+  if (el.dataset.sig !== sig) {
+    el.innerHTML = tabs.map((t) => {
+      const on = t.key === (state.tab || "home");
+      return '<button class="tab' + (on ? " on" : "") + '" type="button" data-tab="' +
+        t.key + '">' + esc(t.label) + "</button>";
+    }).join("") + '<i class="tab-ink"></i>';
+    el.dataset.sig = sig;
+    // 新建页签时直接把下划线放到当前位置, 不做从 0 滑入
+    const a0 = el.querySelector(".tab.on"), k0 = el.querySelector(".tab-ink");
+    if (a0 && k0) {
+      k0.style.transition = "none";
+      k0.style.left = a0.offsetLeft + "px";
+      k0.style.width = a0.offsetWidth + "px";
+      requestAnimationFrame(() => { k0.style.transition = ""; });
+    }
+  } else {
+    el.querySelectorAll(".tab").forEach((b) =>
+      b.classList.toggle("on", b.dataset.tab === (state.tab || "home")));
+  }
+  // 下划线移动到当前页签
+  const active = el.querySelector(".tab.on");
+  const ink = el.querySelector(".tab-ink");
+  if (active && ink) {
+    ink.style.left = active.offsetLeft + "px";
+    ink.style.width = active.offsetWidth + "px";
+    active.scrollIntoView({ inline: "nearest", block: "nearest", behavior: "smooth" });
+  }
 }
+
+/* 页面切换动画: dir>0 从右侧滑入, dir<0 从左侧滑入 */
+function animateView(dir) {
+  if (!dir) return;
+  const v = $("view");
+  v.classList.remove("anim-next", "anim-prev");
+  void v.offsetWidth;
+  v.classList.add(dir > 0 ? "anim-next" : "anim-prev");
+}
+
 function switchTab(key) {
   if (state.root === "mine") return;
+  const tabs = tabsForSrc(state.source);
+  const cur = tabs.findIndex((t) => t.key === (state.tab || "home"));
+  const nxt = tabs.findIndex((t) => t.key === key);
+  animateView(nxt >= cur ? 1 : -1);
   state.tab = key;
   renderTabs();
   if (key === "mylists") return loadMyListsView();
@@ -606,8 +647,9 @@ function currentPageIndex() {
   return pageList().findIndex((p) =>
     p.root === "src" && p.src === state.source && p.tab === (state.tab || "home"));
 }
-function openPage(p) {
+function openPage(p, dir) {
   if (!p) return;
+  if (dir) animateView(dir);
   if (p.root === "mine") {
     state.root = "mine";
     renderSources();
@@ -630,13 +672,15 @@ function stepPage(step) {
   if (!pages.length) return;
   let i = currentPageIndex();
   if (i < 0) i = 0;
-  openPage(pages[(i + step + pages.length) % pages.length]);
+  openPage(pages[(i + step + pages.length) % pages.length], step);
 }
 
 $("sources").addEventListener("click", (e) => {
   const b = e.target.closest(".chip");
   if (!b) return;
   if (b.dataset.act === "mine") {
+    if (state.root === "mine") return;
+    animateView(-1);
     state.root = "mine";
     renderSources();
     renderTabs();
@@ -644,6 +688,9 @@ $("sources").addEventListener("click", (e) => {
     return;
   }
   if (b.dataset.src === "mine") return;
+  const fromIdx = state.root === "mine" ? -1 : SRC_ORDER.indexOf(state.source);
+  const toIdx = SRC_ORDER.indexOf(b.dataset.src);
+  animateView(toIdx >= fromIdx ? 1 : -1);
   state.root = "src";
   state.source = b.dataset.src;
   state.tab = "home";
