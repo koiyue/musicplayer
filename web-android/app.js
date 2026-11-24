@@ -916,7 +916,7 @@ document.addEventListener("touchmove", (e) => {
   if (!swipeFrom) return;
   const t = e.touches[0];
   const dx = t.clientX - swipeFrom.x, dy = t.clientY - swipeFrom.y;
-  if (Math.abs(dx) > 12 && Math.abs(dx) > Math.abs(dy) * 1.2) swipeFrom.horizontal = true;
+  if (Math.abs(dx) > 8 && Math.abs(dx) >= Math.abs(dy)) swipeFrom.horizontal = true;
 }, { passive: true });
 document.addEventListener("touchend", (e) => {
   const s = swipeFrom;
@@ -925,8 +925,8 @@ document.addEventListener("touchend", (e) => {
   const t = e.changedTouches[0];
   const dx = t.clientX - s.x;
   const dy = Math.abs(t.clientY - s.y);
-  if (Date.now() - s.at > 800) return;
-  if (Math.abs(dx) < 80 || dy > Math.abs(dx) * 0.8) return;
+  if (Date.now() - s.at > 1200) return;
+  if (Math.abs(dx) < 50 || dy > Math.abs(dx)) return;
   // 左滑下一页, 右滑上一页; 空列表同样可翻(绑定在整个页面而非列表上)
   stepPage(dx < 0 ? 1 : -1);
 }, { passive: true });
