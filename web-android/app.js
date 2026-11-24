@@ -1107,13 +1107,23 @@ audio.addEventListener("ended", () => playStep(1));
 audio.addEventListener("error", () => {
   if (audio.src) toast("音频加载失败，请检查网络或登录状态");
 });
-/* 切歌模式: 点时间栏循环切换 */
-$("ptdur").addEventListener("click", () => {
-  const order = ["loop", "order", "single", "shuffle"];
-  const name = { loop: "列表循环", order: "顺序播放", single: "单曲循环", shuffle: "随机播放" };
-  state.mode = order[(order.indexOf(state.mode) + 1) % order.length];
-  toast(name[state.mode], 1200);
-});
+/* 播放模式: 播放器上的模式按钮循环切换 */
+const MODE_ORDER = ["loop", "order", "single", "shuffle"];
+const MODE_NAME = { loop: "列表循环", order: "顺序播放", single: "单曲循环", shuffle: "随机播放" };
+const MODE_ICON = { loop: "↻", order: "→", single: "↻1", shuffle: "⇄" };
+function setModeIcon() {
+  const b = $("pmode");
+  if (!b) return;
+  b.textContent = MODE_ICON[state.mode] || "↻";
+  b.classList.toggle("alt", state.mode !== "loop");
+}
+function cycleMode() {
+  state.mode = MODE_ORDER[(MODE_ORDER.indexOf(state.mode) + 1) % MODE_ORDER.length];
+  setModeIcon();
+  toast(MODE_NAME[state.mode], 1200);
+}
+$("pmode").addEventListener("click", cycleMode);
+setModeIcon();
 
 /* ---------------- 返回 / 侧滑手势 ---------------- */
 const BACK_LAYERS = [

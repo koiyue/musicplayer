@@ -143,7 +143,7 @@ input, textarea { -webkit-user-select: text; user-select: text; }
 /* 进度条很细, 上方扩 12px / 下方扩 6px 作为拖动命中区(下方让开时间文字) */
 #pbar::before { content: ""; position: absolute; left: 0; right: 0; top: -12px; bottom: -6px; }
 #pfill { height: 100%; width: 0; background: var(--acc); border-radius: 999px; }
-.prow { display: flex; align-items: center; gap: 6px; }
+.prow { display: flex; align-items: center; gap: 5px; }
 #pcover { width: 40px; height: 40px; border-radius: 12px; background: #2a2a3a center/cover no-repeat;
   flex: 0 0 auto; display: flex; align-items: center; justify-content: center; color: #5b6076; overflow: hidden; }
 #pcover img { width: 100%; height: 100%; object-fit: cover; }
@@ -155,6 +155,8 @@ input, textarea { -webkit-user-select: text; user-select: text; }
   width: 28px; height: 28px; border-radius: 9px; flex: 0 0 auto;
 }
 #player button:active { background: rgba(255,255,255,.14); }
+#pmode { width: 24px; font-size: 15px; color: var(--sub); }
+#pmode.alt { color: var(--text); }
 #ptoggle { font-size: 17px; color: var(--acc); }
 .ptime { display: flex; justify-content: space-between; color: var(--sub); font-size: 9.5px; margin: 0 8px 4px; }
 
