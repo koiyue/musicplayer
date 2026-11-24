@@ -707,8 +707,9 @@ function openPage(p, dir) {
   state.root = "src";
   if (state.source !== p.src) {
     state.source = p.src;
-    renderSources();
   }
+  // 从「我的」滑回音源时 source 可能本就等于目标音源, 这里必须刷新一级导航高亮
+  renderSources();
   state.tab = p.tab;
   renderTabs();
   if (p.tab === "mylists") return loadMyListsView();
