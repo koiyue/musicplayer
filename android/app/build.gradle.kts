@@ -41,12 +41,13 @@ android {
         jvmTarget = "17"
     }
 
-    // 产物命名为 MusicHub-<variant>.apk, 而不是 Gradle 默认的 app-debug.apk
+    // 产物命名带版本号: MusicHub-<版本>-<variant>.apk, 便于区分每次更新
     applicationVariants.all {
         val variantName = name
+        val version = defaultConfig.versionName ?: "dev"
         outputs.all {
             (this as com.android.build.gradle.internal.api.BaseVariantOutputImpl)
-                .outputFileName = "MusicHub-$variantName.apk"
+                .outputFileName = "MusicHub-$version-$variantName.apk"
         }
     }
 }
