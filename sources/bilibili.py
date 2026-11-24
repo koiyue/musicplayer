@@ -10,12 +10,12 @@ import urllib.parse
 import urllib.request
 
 from . import secure_store, song
-from .common import http_get, http_post, UA
+from .common import http_get, http_post, UA, data_dir
 
 API = "https://api.bilibili.com"
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-DATA_DIR = os.path.join(BASE_DIR, "data")
+DATA_DIR = data_dir()
 COOKIE_FILE = os.path.join(DATA_DIR, "bilibili_cookie.json")
 MIXIN_TAB = [46, 47, 18, 2, 53, 8, 23, 32, 15, 50, 10, 31, 58, 3, 45, 35, 27, 43, 5,
              49, 33, 9, 42, 19, 29, 28, 14, 39, 12, 38, 41, 13, 37, 48, 7, 16, 24, 55,
@@ -93,6 +93,39 @@ def status():
                 "vip": vip, "mid": d.get("mid")}
     except Exception as e:
         return {"logged_in": False, "error": str(e)}
+
+
+def history(limit=30):
+    """观看历史(需登录): 最近看过的视频, 映射为可直接播放的 song."""
+    ck = _cookie_str()
+    if not ck:
+        return {"songs": [], "error": "未登录哔哩哔哩"}
+    _ensure_buvid()
+    try:
+        j = http_get(API + "/x/web-interface/history/cursor?ps=%d&type=archive"
+                     % min(max(1, int(limit)), 30), headers=_headers())
+    except Exception as e:
+        return {"songs": [], "error": "获取观看历史失败: %s" % e}
+    items = (j.get("data") or {}).get("list") or []
+    out, seen = [], set()
+    for it in items:
+        h = it.get("history") or {}
+        bvid = h.get("bvid") or it.get("bvid") or ""
+        if not bvid or bvid in seen:
+            continue
+        seen.add(bvid)
+        cover = it.get("cover") or ""
+        if not cover and it.get("covers"):
+            cover = it["covers"][0]
+        if cover.startswith("//"):
+            cover = "https:" + cover
+        out.append(song("bilibili", bvid, it.get("title") or "",
+                        it.get("author_name") or "", "",
+                        int(it.get("duration") or 0), cover,
+                        extra={"aid": h.get("oid") or it.get("aid"),
+                               "cid": h.get("cid"),
+                               "page": h.get("page") or 1}))
+    return {"songs": out, "error": "" if out else "暂无观看历史"}
 
 
 def new_qr():
@@ -720,6 +753,41 @@ QUALITIES = [(127, "8K"), (126, "杜比视界"), (125, "HDR"), (120, "4K"),
              (116, "1080P 60帧"), (112, "1080P 高码率"), (80, "1080P"),
              (74, "720P 60帧"), (64, "720P"), (32, "480P"),
              (16, "360P")]
+_QUALITY_DESC = dict(QUALITIES)
+
+
+def _declared_qualities(data):
+    """从 playurl 返回中解析可用清晰度档位.
+
+    部分视频(长视频/合集等)只返回 durl 渐进流, 没有 dash.video; 此时必须用
+    support_formats / accept_quality 里服务端声明的档位, 否则前端列表为空。
+    """
+    out, seen = [], set()
+    for f in data.get("support_formats") or []:
+        if not isinstance(f, dict):
+            continue
+        try:
+            q = int(f.get("quality"))
+        except (TypeError, ValueError):
+            continue
+        desc = (f.get("new_description") or f.get("display_desc")
+                or _QUALITY_DESC.get(q) or "")
+        if q > 0 and desc and q not in seen:
+            seen.add(q)
+            out.append({"qn": q, "desc": desc})
+    if out:
+        return out
+    ds = data.get("accept_description") or []
+    for i, q in enumerate(data.get("accept_quality") or []):
+        try:
+            q = int(q)
+        except (TypeError, ValueError):
+            continue
+        desc = ds[i] if i < len(ds) else _QUALITY_DESC.get(q, "")
+        if q > 0 and desc and q not in seen:
+            seen.add(q)
+            out.append({"qn": q, "desc": desc})
+    return out
 
 
 def get_video(s, qn=None, room=False):
@@ -750,7 +818,8 @@ def get_video(s, qn=None, room=False):
     def _dash_result(data, room_cap):
         vids = (data.get("dash") or {}).get("video") or []
         ids = {_vid_qn(v) for v in vids}
-        support = [{"qn": q, "desc": d} for q, d in QUALITIES if q in ids]
+        support = _declared_qualities(data) or [
+            {"qn": q, "desc": d} for q, d in QUALITIES if q in ids]
         if room:
             if vids:
                 def _avc(v):
@@ -772,6 +841,7 @@ def get_video(s, qn=None, room=False):
                 if not urls:
                     return {"error": "无可用视频流", "qualities": support}
                 return {"url": urls[0], "segments": urls, "qualities": support,
+                        "picked": data.get("quality"),
                         "headers": {"Referer": "https://www.bilibili.com/", "User-Agent": UA}}
             return {"error": "无可用视频流", "qualities": support}
         # qn 是用户的目标清晰度: 选不超过目标的最高档位。

@@ -17,10 +17,10 @@ import zlib
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from . import secure_store, song
-from .common import http_get, UA
+from .common import http_get, UA, data_dir
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-DATA_DIR = os.path.join(BASE_DIR, "data")
+DATA_DIR = data_dir()
 GUID_FILE = os.path.join(DATA_DIR, "qq_guid.txt")
 COOKIE_FILE = os.path.join(DATA_DIR, "qq_cookie.json")
 
@@ -245,13 +245,14 @@ def _home_get(url, headers=None, raw=False):
     return j
 
 
-def _cached_home_part(key, fn, allow_empty=True):
+def _cached_home_part(key, fn, allow_empty=True, nocache=False):
     """首页片段短缓存: 避免切音源/刷新时重复请求; 空结果可下次重试."""
     now = time.monotonic()
-    with _HOME_CACHE_LOCK:
-        hit = _HOME_CACHE.get(key)
-        if hit and hit[0] > now:
-            return hit[1]
+    if not nocache:
+        with _HOME_CACHE_LOCK:
+            hit = _HOME_CACHE.get(key)
+            if hit and hit[0] > now:
+                return hit[1]
     val = fn()
     if allow_empty or val:
         with _HOME_CACHE_LOCK:
@@ -368,12 +369,12 @@ _HOME_TOPLIST_META = {
     27: ("巅峰榜·新歌", "https://y.gtimg.cn/music/common/upload/iphone_order_channel/20150820174831.jpg"),
     4:  ("巅峰榜·流行指数", "https://y.gtimg.cn/music/common/upload/test_order_channel_hitlist_con/1847681.png"),
     3:  ("巅峰榜·欧美", "https://y.gtimg.cn/music/common/upload/iphone_order_channel/20150122151215.jpg"),
-    5:  ("巅峰榜·内地", "https://y.gtimg.cn/music/common/upload/iphone_order_channel/20150820174759.jpg"),
-    62: ("飙升榜", "https://y.gtimg.cn/music/common/upload/iphone_order_channel/20150820174903.jpg"),
-    64: ("巅峰榜·香港", "https://y.gtimg.cn/music/common/upload/iphone_order_channel/20150820174920.jpg"),
-    65: ("巅峰榜·台湾", "https://y.gtimg.cn/music/common/upload/iphone_order_channel/20150820174937.jpg"),
-    17: ("巅峰榜·日本", "https://y.gtimg.cn/music/common/upload/iphone_order_channel/20150820174954.jpg"),
-    52: ("巅峰榜·韩国", "https://y.gtimg.cn/music/common/upload/iphone_order_channel/20150820175011.jpg"),
+    5:  ("巅峰榜·内地", "https://y.gtimg.cn/music/common/upload/iphone_order_channel/20150122151407.jpg"),
+    62: ("飙升榜", "https://y.gtimg.cn/music/common/upload/t_order_channel_hitlist_conf/1743216.png"),
+    64: ("综艺新歌榜", "https://y.gtimg.cn/music/common/upload/test_order_channel_hitlist_con/1743522.png"),
+    65: ("国风热歌榜", "https://y.gtimg.cn/music/common/upload/test_order_channel_hitlist_con/1743517.png"),
+    17: ("巅峰榜·日本", "https://y.gtimg.cn/music/common/upload/iphone_order_channel/20150122151730.jpg"),
+    52: ("腾讯音乐人原创榜", "https://y.gtimg.cn/music/common/upload/t_order_channel_hitlist_conf/141029.png"),
 }
 
 
@@ -441,18 +442,18 @@ def _home_new_songs(limit=30):
     return out
 
 
-def home(limit=30):
+def home(limit=30, nocache=False):
     """QQ 首页: 各区块并行抓取, 单次请求短超时且总预算内返回."""
     token = _HOME_DEADLINE.set(time.monotonic() + _HOME_BUDGET)
     try:
         def task_playlists():
             return _cached_home_part("playlists", lambda: _home_public_playlists(limit=12),
-                                     allow_empty=False)
+                                     allow_empty=False, nocache=nocache)
 
         def task_charts():
             return _cached_home_part("charts", lambda: [
                 _home_toplist_info(tid) for tid in _HOME_TOPLIST_META],
-                                     allow_empty=False)
+                                     allow_empty=False, nocache=nocache)
 
         def task_activities():
             def load():
@@ -467,7 +468,7 @@ def home(limit=30):
                      "cover": "https://y.qq.com/music/common/upload/ocs/a784ddef0b4632a2c9fa822a16f5a6a6.jpg?max_age=2592000",
                      "sub": "QQ音乐 · 精选活动", "tag": "精选活动", "action": "album"},
                 ]
-            return _cached_home_part("activities", load, allow_empty=False)
+            return _cached_home_part("activities", load, allow_empty=False, nocache=nocache)
 
         tasks = [task_playlists, task_charts, task_activities]
         results = _parallel_map(lambda fn: fn(), tasks, limit=3)
@@ -475,19 +476,26 @@ def home(limit=30):
         playlists = (results[0] or [])[:12]
         charts = results[1] or []
         activities = results[2] or []
+        def pl_cover(i):
+            """快捷卡片借用推荐歌单封面, 避免空 cover 渲染成空白块."""
+            if not playlists:
+                return ""
+            return playlists[i % len(playlists)].get("cover") or ""
+
         quick = [
-            {"title": "每日推荐", "sub": "QQ音乐新歌速递", "cover": "", "tag": "每日更新",
+            {"title": "每日推荐", "sub": "QQ音乐新歌速递", "cover": pl_cover(0), "tag": "每日更新",
              "action": "songs", "mode": "new"},
-            {"title": "新歌速递", "sub": "最新上架歌曲", "cover": "", "tag": "新歌",
+            {"title": "新歌速递", "sub": "最新上架歌曲", "cover": pl_cover(1), "tag": "新歌",
              "action": "songs", "mode": "new"},
-            {"title": "巅峰榜·热歌", "sub": "站内播放热度", "cover": "", "tag": "榜单",
+            {"title": "巅峰榜·热歌", "sub": "站内播放热度",
+             "cover": _HOME_TOPLIST_META[26][1], "tag": "榜单",
              "action": "toplist", "topid": 26},
             {"title": "私人推荐", "sub": "根据常听风格推荐",
-             "cover": playlists[0].get("cover") if playlists else "", "tag": "个性化",
+             "cover": pl_cover(0), "tag": "个性化",
              "action": "playlist", "ref": playlists[0].get("ref") if playlists else ""},
-            {"title": "经典专区", "sub": "热门怀旧金曲", "cover": "", "tag": "精选",
+            {"title": "经典专区", "sub": "热门怀旧金曲", "cover": pl_cover(2), "tag": "精选",
              "action": "search", "keyword": "经典老歌"},
-            {"title": "听·周杰伦", "sub": "艺人歌曲精选", "cover": "", "tag": "艺人",
+            {"title": "听·周杰伦", "sub": "艺人歌曲精选", "cover": pl_cover(3), "tag": "艺人",
              "action": "search", "keyword": "周杰伦"},
         ]
         return {"quick": quick, "playlists": playlists, "charts": charts,
@@ -536,7 +544,7 @@ def recommend(limit=30, mode=None, topid=None, albumid=None):
         limit = int(limit)
     except (TypeError, ValueError):
         limit = 30
-    limit = max(1, min(100, limit))
+    limit = max(1, min(300, limit))
     return {"songs": _home_new_songs(limit), "has_more": False}
 
 
@@ -627,6 +635,16 @@ def get_lyrics(s):
             ly = raw
         if not ly.strip():
             return {"error": "暂无歌词"}
-        return {"lyric": ly}
+        out = {"lyric": ly}
+        # trans 为翻译歌词(同样 base64), 有则一并返回供卡拉OK"翻译"开关使用
+        raw_t = j.get("trans") or ""
+        if raw_t:
+            try:
+                tr = base64.b64decode(raw_t).decode("utf-8", "replace")
+            except Exception:
+                tr = raw_t
+            if tr.strip():
+                out["tlyric"] = tr
+        return out
     except Exception as e:
         return {"error": "获取歌词失败: %s" % e}

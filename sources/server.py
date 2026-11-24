@@ -18,18 +18,23 @@ import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from sources import netease, qq, migu, bilibili
-from sources import common
-from sources.common import UA
-import asr
+from . import netease, qq, migu, bilibili, douyin, asr, common
+from .common import UA
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 WEB_DIR = os.path.join(BASE_DIR, "web")
-DATA_DIR = os.path.join(BASE_DIR, "data")
+# Android 独立前端; MUSICHUB_CLIENT=android 时根路径返回该界面
+WEB_ANDROID_DIR = os.path.join(BASE_DIR, "web-android")
+MOBILE_UI = os.environ.get("MUSICHUB_CLIENT") == "android"
+# Android 等场景下代码目录只读, 通过环境变量指定可写的数据目录
+DATA_DIR = (os.path.abspath(os.path.expanduser(os.environ["MUSICHUB_DATA_DIR"]))
+            if os.environ.get("MUSICHUB_DATA_DIR")
+            else os.path.join(BASE_DIR, "data"))
 SKIN_DIR = os.path.join(DATA_DIR, "skins")
 QUEUE_FILE = os.path.join(DATA_DIR, "queue.json")
 SETTINGS_FILE = os.path.join(DATA_DIR, "settings.json")
 PLAYLISTS_FILE = os.path.join(DATA_DIR, "playlists.json")
+DY_FAVORITES_PID = "dy_favorites"
 DL_DIR = os.path.join(DATA_DIR, "downloads")
 DL_FILE = os.path.join(DL_DIR, "index.json")
 DL_TASKS_FILE = os.path.join(DL_DIR, "tasks.json")
@@ -51,7 +56,10 @@ TOKEN = secrets.token_urlsafe(24)
 # 图片代理白名单(B站封面防盗链); 只允许这些域名及其子域
 IMG_HOSTS = ("hdslb.com", "biliimg.com", "bilibili.com",
              "music.126.net", "p1.music.126.net", "p2.music.126.net",
-             "gtimg.cn", "y.gtimg.cn", "qpic.cn", "y.qq.com")
+             "gtimg.cn", "y.gtimg.cn", "qpic.cn", "y.qq.com",
+             "bytecdn.cn", "byteimg.com", "douyincdn.com", "douyinpic.com",
+             "douyinstatic.com", "ixigua.com",
+             "pstatp.com", "snssdk.com", "iesdouyin.com")
 IMG_MAX = 10 * 1024 * 1024
 
 SRC = {
@@ -59,6 +67,7 @@ SRC = {
     "qq": qq,
     "migu": migu,
     "bilibili": bilibili,
+    "douyin": douyin,
 }
 
 _queue_lock = threading.Lock()
@@ -143,7 +152,7 @@ def _save_pls(obj):
 
 
 # ---------- 写接口业务校验 ----------
-_QUEUE_SOURCES = ("netease", "qq", "migu", "bilibili", "local")
+_QUEUE_SOURCES = ("netease", "qq", "migu", "bilibili", "douyin", "local")
 _MAX_QUEUE_SONGS = 2000
 _MAX_SONG_ID_LEN = 300
 _MAX_PL_NAME_LEN = 120
@@ -1115,12 +1124,37 @@ def _room_commit(body):
         room = _room_state
         if room is None:
             return {"ok": False, "error": "房间不存在"}
+        # 陈旧状态守卫: 旧歌曲版本、旧状态序号或旧墙钟锚点不得覆盖权威状态。
+        prev = room.state if isinstance(room.state, dict) else {}
+        try:
+            cur_rev = int(prev.get("song_rev") or 0)
+            cur_seq = int(prev.get("state_seq") or room.seq)
+            cur_wall = int(prev.get("anchor_wall_ms") or 0)
+            in_rev = int(state.get("song_rev") or ev_in.get("song_rev") or cur_rev)
+            in_seq = int(state.get("state_seq") or ev_in.get("state_seq") or cur_seq)
+            in_wall = int(state.get("anchor_wall_ms") or ev_in.get("anchor_wall_ms") or 0)
+        except (TypeError, ValueError):
+            cur_rev = cur_seq = cur_wall = 0
+            in_rev, in_seq, in_wall = cur_rev, cur_seq, 0
+        if in_rev < cur_rev or (in_rev == cur_rev and in_seq < cur_seq) or \
+                (in_rev == cur_rev and in_seq == cur_seq and in_wall and cur_wall and in_wall < cur_wall):
+            return {"ok": False, "error": "陈旧状态已丢弃"}
+        state["song_rev"] = in_rev
+        state["state_seq"] = in_seq
+        state["anchor_wall_ms"] = in_wall or int(time.time() * 1000)
+        state.setdefault("server_time_ms", int(time.time() * 1000))
+        ev_in["song_key"] = state.get("song_key") or ev_in.get("song_key") or ""
+        ev_in["song_rev"] = in_rev
+        ev_in["state_seq"] = in_seq
+        ev_in["status"] = state.get("status") or ev_in.get("status") or "playing"
+        ev_in["anchor_wall_ms"] = state["anchor_wall_ms"]
+        ev_in["server_time_ms"] = state["server_time_ms"]
         try:
             want = int(ev_in.get("seq") or 0)
         except (TypeError, ValueError):
             want = 0
         if ev_in.get("type") == "anchor":
-            # 心跳只刷新权威快照, 不增加事件序号, 否则 WebRTC/HTTP 成员会不断请求 resync。
+            # 心跳只刷新同一歌曲版本的权威快照, 不增加事件序号。
             ev = copy.deepcopy(ev_in)
             ev["seq"] = room.seq
             ev["rev"] = room.rev
@@ -1417,7 +1451,8 @@ class RoomHandler(BaseHTTPRequestHandler):
                                "seq": room.seq, "rev": room.rev,
                                "state": copy.deepcopy(room.state),
                                "members": copy.deepcopy(room.members),
-                               "chat_tail": copy.deepcopy(room.chat_tail)}
+                               "chat_tail": copy.deepcopy(room.chat_tail),
+                               "server_time": time.time()}
                         break
                     rem = deadline - time.monotonic()
                     if rem > 0:
@@ -1708,7 +1743,8 @@ class Handler(BaseHTTPRequestHandler):
         # 非预期 Host(如 DNS rebinding)不返回首页, 更不注入令牌
         if not self._host_ok():
             return self._send(403, {"error": "forbidden"})
-        fp = os.path.join(WEB_DIR, "index.html")
+        root = WEB_ANDROID_DIR if MOBILE_UI else WEB_DIR
+        fp = os.path.join(root, "index.html")
         with open(fp, "r", encoding="utf-8") as f:
             html = f.read()
         tag = '<meta name="mh-token" content="%s">' % TOKEN
@@ -1725,10 +1761,14 @@ class Handler(BaseHTTPRequestHandler):
 
         if path in ("/", "/index.html"):
             return self._index()
+        if path.startswith("/m/"):
+            if not self._host_ok():
+                return self._send(403, {"error": "forbidden"})
+            return self._static_from(WEB_ANDROID_DIR, path[3:])
         if path.startswith("/web/"):
             if not self._host_ok():
                 return self._send(403, {"error": "forbidden"})
-            return self._static(path[5:])
+            return self._static_from(WEB_DIR, path[5:])
         if not self._authorized(qs):
             return self._send(403, {"error": "forbidden"})
         if path == "/api/room/local":
@@ -1752,6 +1792,32 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, _room_proposals(since, g("wait", "0")))
         if path == "/api/room/state":
             return self._send(200, _room_debug_state())
+        if path == "/api/douyin/resolve":
+            return self._send(200, douyin.resolve_share(g("text") or g("url") or ""))
+        if path == "/api/douyin/status":
+            return self._send(200, douyin.status())
+        if path == "/api/douyin/history":
+            try:
+                return self._send(200, douyin.history(int(g("limit", "30") or 30)))
+            except Exception as e:
+                return self._send(200, {"songs": [], "error": str(e)})
+        if path == "/api/douyin/feed":
+            try:
+                return self._send(200, douyin.feed_page(
+                    int(g("limit", "20") or 20), int(g("index", "1") or 1)))
+            except Exception as e:
+                return self._send(200, {"songs": [], "has_more": False, "error": str(e)})
+        if path == "/api/douyin/comments":
+            try:
+                return self._send(200, douyin.comments(
+                    g("id") or "", g("cursor") or 0, g("count") or 20))
+            except Exception as e:
+                return self._send(200, {"comments": [], "cursor": 0,
+                                        "has_more": False, "total": 0, "error": str(e)})
+        if path == "/api/douyin/qr":
+            return self._send(200, {"code": 0, "message": "扫码登录在桌面客户端内运行；浏览器模式请使用应用内登录或粘贴 Cookie"})
+        if path == "/api/douyin/poll":
+            return self._send(200, {"code": 0, "message": "扫码状态由桌面客户端监控"})
         if path == "/api/sources":
             return self._send(200, {"sources": list(SRC.keys())})
         if path == "/api/fonts":
@@ -1786,12 +1852,18 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, {"lists": [
                 {"id": l.get("id"), "name": l.get("name"),
                  "icon": l.get("icon") or "",
+                 # 未自定义封面时, 默认取第一首歌的封面
+                 "cover": (l.get("icon") or
+                           ((l.get("songs") or [{}])[0].get("cover") or "")),
                  "count": len(l.get("songs") or [])}
                 for l in d["lists"]]})
         if path == "/api/localplaylist":
             with _pl_lock:
                 d = _load_pls()
             pl = next((l for l in d["lists"] if l.get("id") == g("pid")), None)
+            if not pl and g("pid") == DY_FAVORITES_PID:
+                pl = {"id": DY_FAVORITES_PID, "name": "抖音收藏",
+                      "created": 0, "songs": []}
             if not pl:
                 return self._send(200, {"error": "歌单不存在"})
             return self._send(200, {"id": pl.get("id"), "name": pl.get("name"),
@@ -1859,6 +1931,11 @@ class Handler(BaseHTTPRequestHandler):
         # B站登录 + 视频清晰度
         if path == "/api/bili/status":
             return self._send(200, bilibili.status())
+        if path == "/api/bili/history":
+            try:
+                return self._send(200, bilibili.history(int(g("limit", "30") or 30)))
+            except Exception as e:
+                return self._send(200, {"songs": [], "error": str(e)})
         if path == "/api/bili/qr":
             try:
                 png, link = bilibili.new_qr()
@@ -1961,6 +2038,10 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, bilibili.logout())
         if path == "/api/bili/manual":
             return self._send(200, bilibili.manual_cookie(body.get("cookie", "")))
+        if path == "/api/douyin/manual":
+            return self._send(200, douyin.manual_cookie(body.get("cookie", "")))
+        if path == "/api/douyin/logout":
+            return self._send(200, douyin.logout())
         if path == "/api/bili/send_dm":
             try:
                 s = {"id": body.get("id"), "extra": body.get("extra") or {}}
@@ -2042,15 +2123,18 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
 
     # ---------- 业务 ----------
-    def _static(self, rel):
+    def _static_from(self, root_dir, rel):
         # 用真实路径包含关系替代字符串前缀, 拒绝 .. 与兄弟目录(如 web_backup)越界
-        root = os.path.realpath(WEB_DIR)
-        fp = os.path.realpath(os.path.join(WEB_DIR, rel))
+        root = os.path.realpath(root_dir)
+        fp = os.path.realpath(os.path.join(root_dir, rel))
         if not (fp == root or fp.startswith(root + os.sep)) or not os.path.isfile(fp):
             return self._send(404, "not found", "text/plain")
         ext = os.path.splitext(fp)[1].lower()
         with open(fp, "rb") as f:
             return self._send(200, f.read(), STATIC_TYPES.get(ext, "application/octet-stream"))
+
+    def _static(self, rel):
+        return self._static_from(WEB_DIR, rel)
 
     def _search(self, g):
         src = SRC.get(g("source"))
@@ -2073,10 +2157,17 @@ class Handler(BaseHTTPRequestHandler):
         if not fn:
             return self._send(200, {"songs": [], "error": "该音源暂无推荐"})
         try:
-            limit = max(1, min(int(g("limit", "30") or 30), 50))
+            limit = max(1, min(int(g("limit", "30") or 30), 300))
             kwargs = {"limit": limit, "mode": g("mode") or None,
                       "topid": g("topid") or None,
                       "albumid": g("albumid") or None}
+            # 仅对支持分页的音源(如 B站)透传 pn, 其余音源不分页
+            try:
+                params = inspect.signature(fn).parameters
+            except (TypeError, ValueError):
+                params = {}
+            if "pn" in params:
+                kwargs["pn"] = max(1, int(g("pn", "1") or 1))
             return self._send(200, fn(**kwargs))
         except Exception as e:
             return self._send(200, {"songs": [], "error": "获取推荐失败: %s" % e})
@@ -2089,7 +2180,15 @@ class Handler(BaseHTTPRequestHandler):
                                     "activities": [], "error": "该音源暂无首页"})
         try:
             limit = max(1, min(int(g("limit", "30") or 30), 50))
-            return self._send(200, fn(limit=limit))
+            kwargs = {"limit": limit}
+            # 仅对支持跳缓存的音源(网易云/QQ)透传 nocache
+            try:
+                params = inspect.signature(fn).parameters
+            except (TypeError, ValueError):
+                params = {}
+            if "nocache" in params:
+                kwargs["nocache"] = g("nocache") == "1"
+            return self._send(200, fn(**kwargs))
         except Exception as e:
             return self._send(200, {"quick": [], "playlists": [], "charts": [],
                                     "activities": [], "error": "获取首页失败: %s" % e})
@@ -2165,6 +2264,10 @@ class Handler(BaseHTTPRequestHandler):
                 pid = body.get("id")
                 s = body.get("song") or {}
                 pl = next((l for l in lists if l.get("id") == pid), None)
+                if not pl and pid == DY_FAVORITES_PID and action == "add":
+                    pl = {"id": DY_FAVORITES_PID, "name": "抖音收藏",
+                          "created": int(_t.time()), "songs": []}
+                    lists.append(pl)
                 if not pl:
                     return self._send(200, {"error": "歌单不存在"})
 
@@ -2391,6 +2494,8 @@ class Handler(BaseHTTPRequestHandler):
             referer = "https://music.163.com/"
         elif "gtimg.cn" in host or "qpic.cn" in host or host == "y.qq.com":
             referer = "https://y.qq.com/"
+        elif any(x in host for x in ("bytecdn", "byteimg", "douyin", "iesdouyin", "ixigua", "pstatp", "snssdk")):
+            referer = "https://www.douyin.com/"
         headers = {"User-Agent": UA, "Referer": referer}
         try:
             req = urllib.request.Request(url, headers=headers)
@@ -2488,8 +2593,17 @@ class Handler(BaseHTTPRequestHandler):
                     break
 
 
+class _ExclusiveServer(ThreadingHTTPServer):
+    """Windows 下 SO_REUSEADDR 允许两个进程绑定同一端口, 请求会被旧进程截获.
+
+    关闭地址复用(Windows 默认即独占), 让"端口被占用"能被正确检测并顺延。
+    """
+    allow_reuse_address = os.name != "nt"
+
+
 def free_port(preferred=8787):
-    for p in (preferred, 0):
+    """优先用 preferred, 被占用时在 preferred..preferred+19 内顺延, 最后退回系统分配."""
+    for p in [preferred] + [preferred + i for i in range(1, 20)] + [0]:
         try:
             s = socket.socket()
             s.bind(("127.0.0.1", p))
@@ -2501,11 +2615,32 @@ def free_port(preferred=8787):
     return 0
 
 
+def serve_auto(preferred=8787):
+    """直接绑定并启动服务(端口被占用自动顺延), 返回 (httpd, 实际端口).
+
+    与 serve() 的区别: 绑定失败会继续尝试后续端口, 避免 free_port 与 bind
+    之间的竞态; Android 入口用它拿到实际端口后再交给 WebView 加载。
+    """
+    os.makedirs(DATA_DIR, exist_ok=True)
+    common.configure_proxy(_load_settings().get("proxy"))
+    _dl_restore()
+    last = None
+    for p in [preferred] + [preferred + i for i in range(1, 20)] + [0]:
+        try:
+            httpd = _ExclusiveServer(("127.0.0.1", p), Handler)
+        except OSError as e:
+            last = e
+            continue
+        threading.Thread(target=httpd.serve_forever, daemon=True).start()
+        return httpd, httpd.server_address[1]
+    raise last or OSError("没有可用端口")
+
+
 def serve(port):
     os.makedirs(DATA_DIR, exist_ok=True)
     common.configure_proxy(_load_settings().get("proxy"))
     _dl_restore()
-    httpd = ThreadingHTTPServer(("127.0.0.1", port), Handler)
+    httpd = _ExclusiveServer(("127.0.0.1", port), Handler)
     t = threading.Thread(target=httpd.serve_forever, daemon=True)
     t.start()
     return httpd

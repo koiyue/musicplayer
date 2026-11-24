@@ -6,6 +6,7 @@
 保留原诊断片段. 成功路径(含 raw=True / JSONP 剥离 / utf-8 replace 解码)逐字节保持原样.
 """
 import json
+import os
 import random
 import time
 import urllib.error
@@ -14,6 +15,15 @@ import urllib.parse
 
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+
+
+def data_dir():
+    """可写数据目录: Android 用 MUSICHUB_DATA_DIR 指向应用沙箱, 桌面回退仓库 data/."""
+    env = os.environ.get("MUSICHUB_DATA_DIR")
+    if env:
+        return os.path.abspath(os.path.expanduser(env))
+    base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(base, "data")
 
 # 仅这些 HTTP 状态码触发重试; 其余 4xx / 3xx / 解析失败一律不重试.
 _RETRY_STATUS = frozenset({429, 500, 502, 503, 504})

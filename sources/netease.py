@@ -8,10 +8,10 @@ import urllib.parse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from . import secure_store, song
-from .common import http_get, http_post, UA
+from .common import http_get, http_post, UA, data_dir
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-DATA_DIR = os.path.join(BASE_DIR, "data")
+DATA_DIR = data_dir()
 COOKIE_FILE = os.path.join(DATA_DIR, "netease_cookie.json")
 
 NE_HEADERS = {
@@ -77,6 +77,18 @@ def _parse_cookie(raw):
     return ck
 
 
+def _all_cookies(raw):
+    """不过滤地解析一份 Cookie 串(二维码会话需要 NMTID/_ntes_nuid 等降低风控)."""
+    ck = {}
+    for seg in (raw or "").replace(",", ";").split(";"):
+        if "=" in seg:
+            k, v = seg.split("=", 1)
+            k = k.strip()
+            if k and v.strip():
+                ck[k] = v.strip()
+    return ck
+
+
 def _save_cookie(ck):
     if not ck.get("MUSIC_U"):
         return False
@@ -97,7 +109,8 @@ def new_qr():
             with urllib.request.urlopen(req, timeout=10) as resp:
                 ck = {}
                 for line in (resp.headers.get_all("Set-Cookie") or []):
-                    ck.update(_parse_cookie(line.split(";")[0]))
+                    # 保留完整会话字段(NMTID/_ntes_nuid/__csrf 等), 显著降低二维码 8821 风控
+                    ck.update(_all_cookies(line.split(";")[0]))
                 if ck:
                     _session = "; ".join("%s=%s" % (k, v) for k, v in ck.items())
         except Exception:
@@ -128,13 +141,18 @@ def poll():
         key = _unikey
     if not key:
         return {"code": 800}
-    j = _get("https://music.163.com/api/login/qrcode/client/login?key=%s&type=1" % key,
-             cookie=_session)
+    # 带上会话 Cookie 与扫码页 Referer, 与官方网页扫码口径一致
+    h = _headers(_session)
+    h["Referer"] = "https://music.163.com/login?codekey=%s" % key
+    try:
+        j = http_get("https://music.163.com/api/login/qrcode/client/login?key=%s&type=1" % key,
+                     headers=h, timeout=12)
+    except Exception as e:
+        return {"code": 801, "error": "轮询失败: %s" % e}
     code = j.get("code")
     if code == 8821:
         return {"code": 8821,
-                "error": "网易云风控拦截(8821 需行为验证码)，"
-                         "请点下方「扫码被风控？在应用内登录」"}
+                "error": "网易云风控拦截(8821 需行为验证码)，请改用网页登录"}
     if code == 803:
         ck = _parse_cookie(j.get("cookie"))
         if not ck.get("MUSIC_U"):
@@ -145,7 +163,7 @@ def poll():
             except Exception:
                 pass
         if not _save_cookie(ck):
-            return {"code": 803, "error": "登录成功但未取到 cookie, 请改用手动粘贴 Cookie"}
+            return {"code": 803, "error": "登录成功但未取到 cookie, 请改用网页登录"}
         _reset_uid_cache()
     return {"code": code}
 
@@ -287,13 +305,14 @@ def _home_get(url, cookie=None):
         return {}
 
 
-def _cached_home_part(key, fn, allow_empty=False):
+def _cached_home_part(key, fn, allow_empty=False, nocache=False):
     """首页片段短缓存: 新鲜值直接返回; 请求失败时允许用过期值兜底."""
     now = time.monotonic()
-    with _HOME_CACHE_LOCK:
-        hit = _HOME_CACHE.get(key)
-        if hit and hit[0] > now:
-            return hit[1]
+    if not nocache:
+        with _HOME_CACHE_LOCK:
+            hit = _HOME_CACHE.get(key)
+            if hit and hit[0] > now:
+                return hit[1]
     try:
         val = fn()
     except Exception:
@@ -335,7 +354,7 @@ def recommend(limit=30, mode=None, topid=None, albumid=None):
         limit = int(limit)
     except (TypeError, ValueError):
         limit = 30
-    limit = max(1, min(100, limit))
+    limit = max(1, min(300, limit))
     ck = _cookie_str()
     if mode == "daily":
         j = _safe_get("https://music.163.com/api/v3/discovery/recommend/songs", ck)
@@ -370,7 +389,7 @@ def recommend(limit=30, mode=None, topid=None, albumid=None):
     return {"songs": out, "has_more": False}
 
 
-def home(limit=30):
+def home(limit=30, nocache=False):
     """网易云首页: 并行抓取各区块, 单次请求短超时且有总预算."""
     ck = _cookie_str()
     cache_key = _account_key(ck) or "anon"
@@ -384,7 +403,8 @@ def home(limit=30):
     keys = list(urls)
     results = _home_parallel([
         lambda k=k: _cached_home_part(cache_key + ":" + k,
-                                      lambda: _home_get(urls[k], ck))
+                                      lambda: _home_get(urls[k], ck),
+                                      nocache=nocache)
         for k in keys
     ])
     data = dict(zip(keys, results))
@@ -484,13 +504,17 @@ def get_stream(s):
 
 
 def get_lyrics(s):
-    """返回 {"lyric": LRC文本}. 经典歌词接口, 无需登录."""
+    """返回 {"lyric": LRC文本, "tlyric": 翻译LRC(可选)}. 经典歌词接口, 无需登录."""
     try:
         j = _get("https://music.163.com/api/song/lyric?id=%s&lv=-1&kv=-1&tv=-1" % s["id"],
                  cookie=_cookie_str())
         ly = (j.get("lrc") or {}).get("lyric") or ""
         if not ly or "暂无歌词" in ly:
             return {"error": "暂无歌词"}
-        return {"lyric": ly}
+        out = {"lyric": ly}
+        tl = (j.get("tlyric") or {}).get("lyric") or ""
+        if tl.strip():
+            out["tlyric"] = tl
+        return out
     except Exception as e:
         return {"error": "获取歌词失败: %s" % e}

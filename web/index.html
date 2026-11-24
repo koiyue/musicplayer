@@ -37,6 +37,7 @@
       <div class="src-row"><button class="src-btn" data-source="qq"><span class="dot" style="background:#31c27c"></span>QQ音乐</button><button class="src-pl" data-source="qq" title="QQ歌单"><img class="src-ic" src="/web/img/qq.png" alt=""></button></div>
       <div class="src-row"><button class="src-btn" data-source="migu"><span class="dot" style="background:#ff5b77"></span>咪咕音乐</button><button class="src-pl" data-source="migu" title="咪咕歌单"><img class="src-ic" src="/web/img/migu.png" alt=""></button></div>
       <div class="src-row"><button class="src-btn" data-source="bilibili"><span class="dot" style="background:#fb7299"></span>哔哩哔哩</button><button class="src-pl" data-source="bilibili" title="B站歌单"><img class="src-ic" src="/web/img/bilibili.png" alt=""></button></div>
+      <div class="src-row"><button class="src-btn" data-source="douyin"><span class="dot" style="background:#000"></span>抖音</button><button class="src-pl" data-source="douyin" title="抖音歌单"><img class="src-ic" src="/web/img/douyin.png" alt="抖音"></button></div>
     </nav>
     <nav class="mine">
       <div class="nav-title">我的</div>
@@ -51,6 +52,7 @@
         <button class="acct-btn" id="btn-login" title="网易云账号"><img class="src-ic" src="/web/img/netease.png" alt=""></button>
         <button class="acct-btn" id="btn-qqlogin" title="QQ音乐账号"><img class="src-ic" src="/web/img/qq.png" alt=""></button>
         <button class="acct-btn" id="btn-bililogin" title="哔哩哔哩账号"><img class="src-ic" src="/web/img/bilibili.png" alt=""></button>
+        <button class="acct-btn" id="btn-douyinlogin" title="抖音 Cookie"><img class="src-ic" src="/web/img/douyin.png" alt="抖音"></button>
       </div>
     </div>
   </aside>
@@ -58,6 +60,7 @@
   <!-- 中栏: 搜索/结果/歌单 -->
   <main id="main">
     <header class="topbar">
+      <button id="btn-nav" class="go-btn nav-toggle" type="button" aria-label="菜单">☰</button>
       <div class="searchbox">
         <span class="search-ic"><svg viewBox="0 0 48 48" fill="none" stroke="currentColor" stroke-width="3.2" stroke-linecap="round"><circle cx="21" cy="21" r="13"/><path d="M31 31l10 10"/></svg></span>
         <input id="search-input" type="search" placeholder="搜索歌曲 / 歌手 / 视频…" autocomplete="off">
@@ -90,6 +93,9 @@
     <div class="pl-hint">长按拖动排序 · 左滑删除</div>
   </aside>
 </div>
+
+<!-- 移动端抽屉遮罩 -->
+<div id="nav-mask"></div>
 
 <!-- 底部播放条 -->
 <div id="playerbar">
@@ -341,6 +347,23 @@
       </div>
     </div>
 
+    <div class="set-group">
+      <h4>运行状态</h4>
+      <div class="set-row">
+        <label>应用内存</label>
+        <span class="set-val" id="set-mem-total">—</span>
+      </div>
+      <div class="set-row">
+        <label>进程数</label>
+        <span class="set-val" id="set-mem-procs">—</span>
+      </div>
+      <div class="set-row">
+        <label>主动回收</label>
+        <span class="set-val" id="set-mem-reclaims">—</span>
+      </div>
+      <p class="set-hint">合计主进程与 WebView2 子进程（浏览器/GPU/渲染等），口径为私有工作集，与任务管理器一致。</p>
+    </div>
+
     <div class="set-msg" id="set-msg"></div>
     <div class="set-actions">
       <button class="go-btn ghost" id="settings-reset">恢复默认</button>
@@ -432,6 +455,54 @@
   </div>
 </div>
 
+<!-- 抖音专用视频播放器 -->
+<div id="dy-player" class="dy-player hidden">
+  <video id="dy-video" muted playsinline preload="auto"></video>
+  <div class="dy-top">
+    <span class="dy-tag">抖音</span>
+    <button class="dy-close" id="dy-close" title="关闭">✕</button>
+  </div>
+  <button class="dy-bigplay" id="dy-bigplay" title="播放">
+    <svg viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z"/></svg>
+  </button>
+  <div class="dy-rail" id="dy-rail">
+    <div class="dy-avatar hidden" id="dy-avatar">
+      <img id="dy-avatar-img" alt="">
+    </div>
+    <button class="dy-act" id="dy-like" title="点赞">
+      <svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 21s-7.5-4.7-9.7-9A5.6 5.6 0 0 1 12 5.6 5.6 5.6 0 0 1 21.7 12C19.5 16.3 12 21 12 21z"/></svg>
+      <span id="dy-like-n">0</span>
+    </button>
+    <button class="dy-act" id="dy-cmt" title="评论">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"><path d="M21 6a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h2v4l4.5-4H19a2 2 0 0 0 2-2V6Z"/></svg>
+      <span id="dy-cmt-n">0</span>
+    </button>
+    <button class="dy-act" id="dy-collect" title="收藏">
+      <svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 2.6l2.9 5.9 6.5.9-4.7 4.6 1.1 6.4-5.8-3-5.8 3 1.1-6.4L2.6 9.4l6.5-.9z"/></svg>
+      <span id="dy-collect-n">0</span>
+    </button>
+    <button class="dy-act" id="dy-share" title="分享">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M4 12v7a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-7"/><path d="M12 16V3M7 8l5-5 5 5"/></svg>
+      <span id="dy-share-n">0</span>
+    </button>
+  </div>
+  <div class="dy-bottom">
+    <div class="dy-author" id="dy-author"></div>
+    <div class="dy-desc" id="dy-desc"></div>
+    <div class="dy-bar" id="dy-bar"><div class="dy-fill" id="dy-fill"><span class="knob"></span></div></div>
+    <div class="dy-time" id="dy-time">0:00 / 0:00</div>
+    <div class="dy-pop hidden" id="dy-pop"></div>
+  </div>
+  <div class="dy-hint">↑↓ / 上下滑动切换视频，左右拖动画面快进快退</div>
+  <div class="dy-cmt-panel hidden" id="dy-cmt-panel">
+    <div class="dy-cmt-head">
+      <span id="dy-cmt-title">评论</span>
+      <button class="dy-cmt-close" id="dy-cmt-close" title="关闭">✕</button>
+    </div>
+    <div class="dy-cmt-list scroll-y" id="dy-cmt-list"></div>
+  </div>
+</div>
+
 <audio id="audio" preload="auto"></audio>
 <audio id="room-fallback-audio" preload="auto"></audio>
 
@@ -442,6 +513,7 @@
     <h3>P2P 一起听</h3>
     <div id="room-landing">
       <p class="set-hint">优先 WebRTC 音视频直连；失败后自动使用房主自动开放的 LAN HTTP 回退。邀请码包含短期房间凭据，请勿公开分享。</p>
+      <p class="set-hint">已确认支持局域网连接，非局域网 P2P 能力待验证。</p>
       <div class="set-row">
         <label for="room-nick">昵称</label>
         <input id="room-nick" type="text" maxlength="20" placeholder="房主 / 成员">
@@ -454,6 +526,7 @@
 
     <div id="room-host" class="hidden">
       <div class="room-status" id="room-host-status"></div>
+      <div class="room-sync" id="room-sync-host"></div>
       <div class="room-slots" id="room-slots"></div>
       <div class="room-chat" id="room-chat"></div>
       <div class="room-chat-input">
@@ -467,7 +540,8 @@
     </div>
 
     <div id="room-join" class="hidden">
-      <p class="set-hint">粘贴房主生成的邀请码，生成应答码后发回房主。</p>
+      <p class="set-hint">粘贴房主生成的邀请码，生成应答码后发回房主。已确认支持局域网连接，非局域网 P2P 能力待验证。</p>
+      <div class="room-sync" id="room-sync-member"></div>
       <textarea id="room-invite" class="room-code" spellcheck="false" placeholder="粘贴 MH1. 开头的邀请码"></textarea>
       <div class="set-actions">
         <button class="go-btn" id="room-join-go">生成应答码</button>
@@ -483,6 +557,38 @@
         <button class="go-btn" id="room-member-chat-send">发送</button>
       </div>
     </div>
+  </div>
+</div>
+
+<!-- 抖音登录弹窗 -->
+<div id="douyinlogin-modal" class="modal hidden">
+  <div class="modal-box">
+    <button class="modal-close" id="douyinlogin-close">✕</button>
+    <h3>抖音登录</h3>
+    <div class="login-tabs">
+      <button class="dlt active" data-tab="qr">扫码登录</button>
+      <button class="dlt" data-tab="inapp">应用内登录</button>
+      <button class="dlt" data-tab="cookie">粘贴 Cookie</button>
+    </div>
+    <div class="login-pane" id="douyin-pane-qr">
+      <div class="qr-wrap"><img id="douyin-qr-img" alt="抖音登录二维码"><div class="qr-mask" id="douyin-qr-mask"></div></div>
+      <p class="qr-tip" id="douyin-qr-tip">用抖音 App 扫码登录</p>
+      <button class="wide-btn" id="douyin-qr-refresh">刷新二维码</button>
+      <p class="qr-tip">二维码来自抖音官方登录页；扫码确认后会自动写入登录态。也可以切到「应用内登录」或「粘贴 Cookie」。</p>
+      <p class="qr-tip err" id="douyin-qr-msg"></p>
+    </div>
+    <div class="login-pane hidden" id="douyin-pane-inapp">
+      <button class="wide-btn" id="douyin-native">在应用内打开抖音登录页（推荐）</button>
+      <p class="qr-tip">在独立 WebView2 窗口中完成抖音登录/验证码；成功后自动回收 Cookie。浏览器模式下不可用。</p>
+      <p class="qr-tip err" id="douyin-native-msg"></p>
+    </div>
+    <div class="login-pane hidden" id="douyin-pane-cookie">
+      <p class="qr-tip">在电脑浏览器登录 douyin.com 后复制请求头 Cookie；分享链接解析通常无需 Cookie。</p>
+      <textarea id="douyin-cookie-input" rows="4" placeholder="sessionid=...; ttwid=...; msToken=..."></textarea>
+      <button class="wide-btn" id="douyin-cookie-save">保存 Cookie</button>
+      <p class="qr-tip err" id="douyin-cookie-msg"></p>
+    </div>
+    <button class="wide-btn hidden" id="douyin-logout" style="margin-top:8px">退出登录</button>
   </div>
 </div>
 

@@ -10,8 +10,8 @@ import subprocess
 import sys
 import time
 
-HERE = os.path.dirname(os.path.abspath(__file__))
-MAIN = os.path.normcase(os.path.normpath(os.path.join(HERE, "main.py")))
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+MAIN = os.path.normcase(os.path.normpath(os.path.join(BASE_DIR, "main.py")))
 
 
 def _ps_query():
@@ -46,6 +46,47 @@ def kill_pids(pids):
                        capture_output=True, creationflags=0x08000000)
 
 
+def _start_via_wmi(pythonw):
+    """用 WMI 创建进程: 不受当前终端/作业对象生命周期影响, 关掉终端也不会带走应用。
+
+    返回 (return_value, pid); 失败时 pid 为 None。
+    """
+    ps = (
+        "$r = Invoke-CimMethod -ClassName Win32_Process -MethodName Create "
+        "-Arguments @{CommandLine='\"%s\" \"%s\"'; CurrentDirectory='%s'}; "
+        "Write-Output (\"{0} {1}\" -f $r.ReturnValue, $r.ProcessId)"
+        % (pythonw, MAIN, BASE_DIR)
+    )
+    try:
+        out = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", ps],
+            capture_output=True, text=True, creationflags=0x08000000,
+        )
+    except Exception as e:
+        return -1, None, str(e)
+    text = (out.stdout or "").strip() or (out.stderr or "").strip()
+    parts = text.split()
+    if len(parts) >= 2 and parts[0].isdigit():
+        rv = int(parts[0])
+        pid = int(parts[1]) if parts[1].isdigit() else None
+        return rv, pid, text
+    return -1, None, text
+
+
+def start(pythonw):
+    rv, pid, detail = _start_via_wmi(pythonw)
+    if rv == 0 and pid:
+        print("started via WMI, pid:", pid)
+        return pid
+    print("WMI 启动失败(ReturnValue=%s): %s" % (rv, detail))
+    proc = subprocess.Popen(
+        [pythonw, MAIN], cwd=BASE_DIR,
+        creationflags=0x08000000,  # CREATE_NO_WINDOW
+    )
+    print("started via Popen, pid:", proc.pid)
+    return proc.pid
+
+
 def main():
     pids = find_pids()
     if pids:
@@ -68,11 +109,14 @@ def main():
         pythonw = os.path.join(os.path.dirname(py), "pythonw.exe")
         if not os.path.exists(pythonw):
             pythonw = py
-    proc = subprocess.Popen(
-        [pythonw, MAIN], cwd=HERE,
-        creationflags=0x08000000,  # CREATE_NO_WINDOW
-    )
-    print("started pid:", proc.pid)
+    pid = start(pythonw)
+    # 等待进程真正起来, 避免"启动了但立刻退出"被误报成功
+    for _ in range(20):
+        time.sleep(0.3)
+        if find_pids():
+            print("running pids:", find_pids())
+            return
+    print("警告: 进程未存活, pid:", pid)
 
 
 if __name__ == "__main__":
