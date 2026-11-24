@@ -1852,6 +1852,9 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, {"lists": [
                 {"id": l.get("id"), "name": l.get("name"),
                  "icon": l.get("icon") or "",
+                 # 未自定义封面时, 默认取第一首歌的封面
+                 "cover": (l.get("icon") or
+                           ((l.get("songs") or [{}])[0].get("cover") or "")),
                  "count": len(l.get("songs") or [])}
                 for l in d["lists"]]})
         if path == "/api/localplaylist":

@@ -454,17 +454,65 @@ function newLocalList() {
     const r = await localPl("create", { name: name });
     if (r.error) { toast(r.error); return; }
     toast("已创建歌单");
-    loadMineView();
+    await loadMineView();
+    const p = (state.mineLists || []).find((x) => x.id === r.id);
+    // 创建后可选自定义封面; 不设置则默认用第一首歌的封面
+    openMenu("设置歌单封面", ["选择图片", "跳过（用第一首歌封面）"], [
+      () => p && pickPlaylistCover(p),
+      () => {},
+    ]);
   });
 }
+
+/* 自定义歌单封面: 选图 -> 压到 512px 内 -> seticon */
+function resizeImage(src, max, cb) {
+  const img = new Image();
+  img.onload = () => {
+    const scale = Math.min(1, max / Math.max(img.width, img.height));
+    const w = Math.max(1, Math.round(img.width * scale));
+    const h = Math.max(1, Math.round(img.height * scale));
+    const cv = document.createElement("canvas");
+    cv.width = w;
+    cv.height = h;
+    cv.getContext("2d").drawImage(img, 0, 0, w, h);
+    cb(cv.toDataURL("image/jpeg", 0.85));
+  };
+  img.onerror = () => cb(src);
+  img.src = src;
+}
+function pickPlaylistCover(p) {
+  if (!p) return;
+  const inp = document.createElement("input");
+  inp.type = "file";
+  inp.accept = "image/*";
+  inp.onchange = () => {
+    const f = inp.files && inp.files[0];
+    if (!f) return;
+    const fr = new FileReader();
+    fr.onload = () => {
+      resizeImage(String(fr.result || ""), 512, async (dataUrl) => {
+        const r = await localPl("seticon", { id: p.id, icon: dataUrl });
+        if (r.error) { toast(r.error); return; }
+        toast("封面已更新");
+        loadMineView();
+      });
+    };
+    fr.readAsDataURL(f);
+  };
+  inp.click();
+}
+function openMineCreateMenu() {
+  openMenu("我的歌单", ["新建歌单"], [newLocalList]);
+}
 function openLocalMenu(p) {
-  openMenu(p.name || "歌单", ["重命名", "删除"], [
+  openMenu(p.name || "歌单", ["重命名", "修改封面", "删除"], [
     () => askText("重命名歌单", p.name, async (name) => {
       const r = await localPl("rename", { id: p.id, name: name });
       if (r.error) { toast(r.error); return; }
       toast("已重命名");
       loadMineView();
     }),
+    () => pickPlaylistCover(p),
     () => openMenu("删除「" + (p.name || "歌单") + "」？", ["删除", "取消"], [
       async () => {
         const r = await localPl("delete", { id: p.id });
@@ -708,7 +756,6 @@ $("view").addEventListener("click", (e) => {
   if (consumeSuppress()) return;
   if (e.target.closest("[data-refresh]")) { loadHome(true); return; }
   if (e.target.closest("[data-daily]")) { openDaily(); return; }
-  if (e.target.closest("[data-newpl]")) { newLocalList(); return; }
   const lr = e.target.closest(".row[data-li]");
   if (lr) { openLocalList(Number(lr.dataset.li)); return; }
   const card = e.target.closest(".card");
@@ -819,6 +866,38 @@ bindLongPress($("queue-list"), (el) => {
   const s = state.queue[i];
   return s ? { song: s, play: () => playAt(i) } : null;
 });
+
+/* ---------------- 我的歌单: 长按空白处新建 ---------------- */
+let mineLpTimer = null, mineLpStart = null, mineLpMoved = false;
+$("view").addEventListener("touchstart", (e) => {
+  if (e.touches.length !== 1) return;
+  if (!(state.view && state.view.type === "mine")) return;
+  if (!e.target.closest("[data-mine]")) return;
+  if (e.target.closest(".row, .card")) return;
+  const t = e.touches[0];
+  mineLpStart = { x: t.clientX, y: t.clientY };
+  mineLpMoved = false;
+  if (mineLpTimer) clearTimeout(mineLpTimer);
+  mineLpTimer = setTimeout(() => {
+    mineLpTimer = null;
+    if (mineLpMoved) return;
+    suppressNextClick();
+    openMineCreateMenu();
+  }, 550);
+}, { passive: true });
+$("view").addEventListener("touchmove", (e) => {
+  if (!mineLpTimer || !mineLpStart) return;
+  const t = e.touches[0];
+  if (Math.abs(t.clientX - mineLpStart.x) > 10 || Math.abs(t.clientY - mineLpStart.y) > 10) {
+    mineLpMoved = true;
+    clearTimeout(mineLpTimer);
+    mineLpTimer = null;
+  }
+}, { passive: true });
+["touchend", "touchcancel"].forEach((ev) =>
+  $("view").addEventListener(ev, () => {
+    if (mineLpTimer) { clearTimeout(mineLpTimer); mineLpTimer = null; }
+  }, { passive: true }));
 
 /* ---------------- 左右滑动: 全局翻页(我的/各音源页签) ---------------- */
 let swipeFrom = null;
@@ -1144,15 +1223,19 @@ async function loadLocalListsView() {
   if (state.view !== view) return;
   const lists = j.lists || [];
   state.mineLists = lists;
-  const rows = lists.map((p, i) => '<div class="row" data-li="' + i + '">' +
-    '<div class="cov">♪</div><div class="info"><div class="t">' + esc(p.name || "歌单") + "</div>" +
-    '<div class="s">' + (p.count || 0) + " 首 · 长按可重命名/删除</div></div></div>").join("");
-  $("view").innerHTML = '<section class="section">' +
+  const rows = lists.map((p, i) => {
+    const cov = coverUrl(p.cover || p.icon || "");
+    return '<div class="row" data-li="' + i + '">' +
+      '<div class="cov"' + (cov ? ' style="background-image:url(\'' + esc(cov) + '\')"' : "") + ">" +
+      (cov ? "" : "♪") + "</div>" +
+      '<div class="info"><div class="t">' + esc(p.name || "歌单") + "</div>" +
+      '<div class="s">' + (p.count || 0) + " 首 · 长按编辑</div></div></div>";
+  }).join("");
+  $("view").innerHTML = '<section class="section" data-mine="1">' +
     '<div class="sec-head"><h3>我的歌单</h3><span>' + lists.length + " 个</span></div>" +
-    '<button class="login-big primary" type="button" data-newpl="1">＋ 新建歌单</button>' +
     (lists.length
-      ? '<div class="list">' + rows + "</div>"
-      : '<div class="loading">还没有歌单，点上方新建</div>') +
+      ? '<div class="list">' + rows + '</div><div class="loading" style="padding:14px 0">长按空白处新建歌单</div>'
+      : '<div class="loading">还没有歌单，长按空白处新建</div>') +
     "</section>";
 }
 
